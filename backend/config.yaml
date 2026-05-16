@@ -1,0 +1,37 @@
+# Subtitle Assistant Configuration
+# Model paths (relative to backend/ or absolute)
+model:
+  onnx_path: "../sensevoice-small/model.onnx"
+  tokens_path: "../sensevoice-small/tokens.json"
+  config_path: "../sensevoice-small/config.yaml"
+  # Note: paths resolved relative to backend/ -> ../sensevoice-small = <project_root>/sensevoice-small
+
+# Audio preprocessing
+audio:
+  cmvn_file: "../sensevoice-small/am.mvn"
+  sample_rate: 16000
+  n_mels: 80
+  frame_length: 25      # ms
+  frame_shift: 10       # ms
+  lfr_m: 7              # low frame rate factor
+  lfr_n: 6
+  max_duration: 300     # seconds, split if longer
+
+# Inference settings
+inference:
+  language: "auto"      # auto, zh, en, ja, ko, yue
+  use_itn: true         # inverse text normalization
+  batch_size: 1
+  device: "cpu"         # cpu or cuda
+
+# Server settings
+server:
+  host: "127.0.0.1"
+  port: 11235
+  cors_origins: ["http://localhost:1420", "http://localhost:3000", "tauri://localhost"]
+
+# Output defaults
+output:
+  default_format: "srt"   # srt, lrc, ass
+  max_line_length: 40     # chars per subtitle line
+  max_line_count: 2       # max lines per subtitle event

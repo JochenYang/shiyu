@@ -1,0 +1,24 @@
+# Subtitle Assistant - Python Backend Dependencies
+# Core inference
+onnxruntime>=1.16.0
+numpy>=1.24.0
+
+# Audio processing
+librosa>=0.10.0
+soundfile>=0.12.0
+kaldi-native-fbank>=1.1
+
+# Web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Subtitle generation
+pysubs2>=1.6.0
+
+# Config & utils
+pyyaml>=6.0.1
+pydantic>=2.5.0
+
+# FFmpeg wrapper (optional, we use subprocess mainly)
+ffmpeg-python>=0.2.0
