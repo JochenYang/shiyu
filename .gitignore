@@ -40,8 +40,8 @@ backend/.venv/
 backend/__pycache__/
 backend/**/__pycache__/
 
-# ONNX model cache (large binary)
-sensevoice-small/model.onnx
+# ONNX model (managed by Git LFS)
+# sensevoice-small/model.onnx is tracked via LFS, do NOT ignore
 
 # Temp / Log
 *.log
