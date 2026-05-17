@@ -95,6 +95,8 @@ class SenseVoiceEngine:
         
         # Strip all rich tags
         clean = self.RICH_TAGS.sub("", text).strip()
+        # Remove SenseVoice newline markers (\N)
+        clean = clean.replace("\\N", " ")
         # Collapse multiple spaces
         clean = re.sub(r"\s+", " ", clean)
         return clean, detected_lang
@@ -150,34 +152,90 @@ class SenseVoiceEngine:
     def transcribe_with_timestamps(self, features: np.ndarray,
                                     audio_duration_sec: float,
                                     language: str = "auto") -> List[dict]:
-        """Transcribe with approximate word-level timestamps.
+        """Transcribe with sentence-level timestamps.
         
-        Uses frame-to-time mapping based on audio duration.
-        Returns list of segments with start/end times.
+        Splits text by sentence/clause boundaries (periods, commas, etc.)
+        and estimates timestamps proportional to character count.
         """
         result = self.transcribe(features, language)
         text = result["text"]
-        
-        # Simple sentence splitting for timestamp estimation
-        sentences = re.split(r"([。！？.!?])", text)
+
+        # Split by sentence and clause boundaries for subtitle-friendly segments
+        # Each segment should be roughly one clause/sentence for editing convenience
+        parts = re.split(r"([。！？；!?;])", text)
+        sentences = []
+        for i in range(0, len(parts) - 1, 2):
+            s = parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")
+            s = s.strip()
+            if s:
+                sentences.append(s)
+        if len(parts) % 2 == 1 and parts[-1].strip():
+            sentences.append(parts[-1].strip())
+
+        # Further split long segments at comma boundaries
+        # A single subtitle longer than ~25 chars is hard to read
+        refined = []
+        for sent in sentences:
+            if len(sent) <= 25:
+                refined.append(sent)
+                continue
+            # Split at commas/顿号/冒号
+            sub_parts = re.split(r"([，、,：:、])", sent)
+            current = ""
+            for j in range(0, len(sub_parts) - 1, 2):
+                clause = sub_parts[j] + (sub_parts[j + 1] if j + 1 < len(sub_parts) else "")
+                if not current:
+                    current = clause
+                elif len(current) + len(clause) <= 25:
+                    current += clause
+                else:
+                    refined.append(current.strip())
+                    current = clause
+            if len(sub_parts) % 2 == 1 and sub_parts[-1]:
+                if current and len(current) + len(sub_parts[-1]) <= 25:
+                    current += sub_parts[-1]
+                else:
+                    if current.strip():
+                        refined.append(current.strip())
+                    current = sub_parts[-1]
+            if current.strip():
+                refined.append(current.strip())
+
+        # Step 3: Hard-cut fallback for segments still > max_len
+        # (long sentences with no comma/colon to split on)
+        final = []
+        for seg in refined:
+            if len(seg) <= 25:
+                final.append(seg)
+                continue
+            # Hard-cut at max_len boundary, attach trailing punctuation to prev chunk
+            i = 0
+            while i < len(seg):
+                end = min(i + 25, len(seg))
+                chunk = seg[i:end]
+                # If next chunk starts with punctuation, pull it into current chunk
+                if end < len(seg) and seg[end] in "，、,：:。！？；!?;":
+                    chunk += seg[end]
+                    end += 1
+                final.append(chunk.strip())
+                i = end
+
+        # Fallback: if no splitting happened, use whole text
+        if not final:
+            final = [text.strip()] if text.strip() else []
+
         segments = []
         current_time = 0.0
-        
-        for i in range(0, len(sentences) - 1, 2):
-            sentence = sentences[i] + (sentences[i + 1] if i + 1 < len(sentences) else "")
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            
-            # Estimate duration proportional to character count
-            ratio = len(sentence) / max(len(text), 1)
+        total_chars = sum(len(s) for s in final)
+
+        for seg_text in final:
+            ratio = len(seg_text) / max(total_chars, 1)
             seg_duration = audio_duration_sec * ratio
-            
             segments.append({
                 "start": current_time,
                 "end": current_time + seg_duration,
-                "text": sentence
+                "text": seg_text
             })
             current_time += seg_duration
-        
+
         return segments

@@ -165,5 +165,23 @@ defineExpose({ loadAudio, togglePlay });
 .time-slider {
   flex: 1;
 }
+.time-slider :deep(.n-slider-rail) {
+  background: rgba(51, 65, 85, 0.4);
+  height: 4px;
+  border-radius: 2px;
+}
+.time-slider :deep(.n-slider-fill) {
+  background: linear-gradient(90deg, #6366f1, #818cf8);
+  border-radius: 2px;
+}
+.time-slider :deep(.n-slider-thumb) {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #818cf8;
+  box-shadow: 0 0 6px rgba(99, 102, 241, 0.4);
+}
+.time-slider :deep(.n-slider-thumb:hover) {
+  box-shadow: 0 0 10px rgba(99, 102, 241, 0.6);
+}
 
 </style>

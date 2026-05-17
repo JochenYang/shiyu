@@ -34,7 +34,13 @@ fn main() {
                 let (exe, using_venv) = if python_exe.exists() {
                     (python_exe.clone(), true)
                 } else {
-                    (std::path::PathBuf::from("python"), false)
+                    // Fallback: try conda/miniconda python, then system python
+                    let conda = std::path::PathBuf::from("D:/tools/miniconda3/python.exe");
+                    if conda.exists() {
+                        (conda, false)
+                    } else {
+                        (std::path::PathBuf::from("python"), false)
+                    }
                 };
 
                 println!("[shiyu] backend_dir: {}", backend_dir.display());
@@ -44,8 +50,8 @@ fn main() {
                 let result = Command::new(&exe)
                     .arg(&main_py)
                     .current_dir(&backend_dir)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
                     .spawn();
 
                 match result {

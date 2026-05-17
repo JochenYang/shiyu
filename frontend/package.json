@@ -10,8 +10,12 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@lucide/vue": "^1.16.0",
     "@tauri-apps/api": "^1.5.0",
     "@vicons/ionicons5": "^0.13.0",
+    "@vueuse/core": "^14.3.0",
+    "framer-motion": "^12.38.0",
+    "lucide-vue-next": "^1.0.0",
     "naive-ui": "^2.44.1",
     "vue": "^3.3.8",
     "wavesurfer.js": "^7.12.7"

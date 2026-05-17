@@ -18,13 +18,26 @@ def extract_audio_from_video(video_path: str, output_wav: str = None, sample_rat
     """Extract audio from video using ffmpeg. Returns path to wav file."""
     if output_wav is None:
         output_wav = tempfile.mktemp(suffix=".wav")
+    
+    # Try to find ffmpeg in PATH or via environment variable
+    ffmpeg_exe = os.environ.get("FFMPEG_PATH", "ffmpeg")
+    
     cmd = [
-        "ffmpeg", "-y", "-i", video_path,
+        ffmpeg_exe, "-y", "-i", video_path,
         "-vn", "-acodec", "pcm_s16le",
         "-ac", "1", "-ar", str(sample_rate),
         output_wav
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        # Fallback for common WinGet path if not in PATH
+        winget_ffmpeg = r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
+        if os.path.exists(winget_ffmpeg):
+            cmd[0] = winget_ffmpeg
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        else:
+            raise
     return output_wav
 
 

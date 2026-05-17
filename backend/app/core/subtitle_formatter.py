@@ -76,25 +76,20 @@ def _split_long_lines(text: str, max_length: int = 40, max_lines: int = 2) -> st
     return "\\N".join(lines)
 
 
-def generate_srt(segments: List[SubtitleSegment], 
-                 max_line_length: int = 40,
-                 max_line_count: int = 2) -> str:
+def generate_srt(segments: List[SubtitleSegment]) -> str:
     """Generate SRT format subtitle.
-    
-    Args:
-        segments: List of subtitle segments
-        max_line_length: Max chars per line
-        max_line_count: Max lines per subtitle event
-    
+
+    Each segment is one short sentence (already split by engine),
+    no further line splitting needed.
+
     Returns:
         SRT formatted string
     """
     lines = []
     for i, seg in enumerate(segments, 1):
-        text = _split_long_lines(seg.text, max_line_length, max_line_count)
         lines.append(str(i))
         lines.append(f"{_format_srt_time(seg.start)} --> {_format_srt_time(seg.end)}")
-        lines.append(text)
+        lines.append(seg.text)
         lines.append("")
     return "\n".join(lines)
 
@@ -148,11 +143,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + "\n".join(event_lines)
 
 
-def segments_from_transcription(segments_raw: List[Dict], 
-                                 merge_gap: float = 0.5) -> List[SubtitleSegment]:
+def segments_from_transcription(segments_raw: List[Dict],
+                                 merge_gap: float = 0.0) -> List[SubtitleSegment]:
     """Convert raw transcription segments to SubtitleSegment objects.
-    
-    Optionally merge segments with small gaps.
+
+    merge_gap defaults to 0 (no merging) because the engine already
+    splits text into short sentence-level segments.
     """
     result = []
     for seg in segments_raw:
@@ -163,19 +159,18 @@ def segments_from_transcription(segments_raw: List[Dict],
         )
         if s.text:
             result.append(s)
-    
-    # Merge segments with small gaps
+
+    # Merge segments with small gaps (disabled by default)
     if len(result) > 1 and merge_gap > 0:
         merged = [result[0]]
         for curr in result[1:]:
             prev = merged[-1]
             gap = curr.start - prev.end
             if gap <= merge_gap and len(prev.text) + len(curr.text) < 80:
-                # Merge
                 prev.end = curr.end
                 prev.text += " " + curr.text
             else:
                 merged.append(curr)
         result = merged
-    
+
     return result

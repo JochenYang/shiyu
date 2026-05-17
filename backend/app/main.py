@@ -75,8 +75,6 @@ app.add_middleware(
 class TranscribeRequest(BaseModel):
     language: Optional[str] = "auto"
     format: Optional[str] = "srt"
-    max_line_length: Optional[int] = 40
-    max_line_count: Optional[int] = 2
 
 
 @app.get("/health")
@@ -89,19 +87,15 @@ async def health_check():
 async def transcribe_file(
     file: UploadFile = File(...),
     language: str = Form("auto"),
-    output_format: str = Form("srt"),
-    max_line_length: int = Form(40),
-    max_line_count: int = Form(2)
+    output_format: str = Form("srt")
 ):
     """Transcribe audio/video file and return subtitle content.
-    
+
     Args:
         file: Audio or video file
         language: Target language (auto/zh/en/ja/ko/yue)
         output_format: srt / lrc / ass
-        max_line_length: Max chars per subtitle line
-        max_line_count: Max lines per subtitle event
-    
+
     Returns:
         Plain text subtitle content
     """
@@ -153,7 +147,7 @@ async def transcribe_file(
         
         # Generate subtitle
         if fmt == "srt":
-            content = generate_srt(segments, max_line_length, max_line_count)
+            content = generate_srt(segments)
         elif fmt == "lrc":
             content = generate_lrc(segments)
         else:  # ass
