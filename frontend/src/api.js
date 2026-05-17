@@ -24,8 +24,6 @@ export async function transcribeFile(file, options = {}) {
   formData.append("file", file);
   formData.append("language", options.language || "auto");
   formData.append("output_format", options.output_format || "srt");
-  formData.append("max_line_length", String(options.max_line_length || 40));
-  formData.append("max_line_count", String(options.max_line_count || 2));
 
   const res = await fetch(`${API_BASE}/transcribe`, {
     method: "POST",
@@ -51,6 +49,31 @@ export async function transcribeJson(file, language = "auto") {
   formData.append("language", language);
 
   const res = await fetch(`${API_BASE}/transcribe/json`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err);
+  }
+  return res.json();
+}
+
+/**
+ * Transcribe a local file by path (Tauri drag-drop, no upload needed).
+ * Returns both subtitle content and segments in one request.
+ * @param {string} filePath - Absolute path to the file on disk
+ * @param {Object} options - { language, output_format }
+ * @returns {Promise<Object>} { content, segments, filename, duration, language }
+ */
+export async function transcribeLocal(filePath, options = {}) {
+  const formData = new FormData();
+  formData.append("path", filePath);
+  formData.append("language", options.language || "auto");
+  formData.append("output_format", options.output_format || "srt");
+
+  const res = await fetch(`${API_BASE}/transcribe/local`, {
     method: "POST",
     body: formData,
   });

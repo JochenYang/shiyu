@@ -14,6 +14,7 @@
         :step="1"
         size="small"
         class="time-slider"
+        :format-tooltip="formatSliderTooltip"
         @update:value="onSliderChange"
       />
       <span class="time-total">{{ formatTime(duration) }}</span>
@@ -46,9 +47,9 @@ let sliderDragging = false;
 onMounted(() => {
   ws = WaveSurfer.create({
     container: waveform.value,
-    waveColor: "rgba(102, 126, 234, 0.5)",
-    progressColor: "rgba(118, 75, 162, 0.85)",
-    cursorColor: "rgba(255, 255, 255, 0.6)",
+    waveColor: "rgba(148, 163, 184, 0.3)",
+    progressColor: "rgba(245, 158, 11, 0.7)",
+    cursorColor: "rgba(245, 158, 11, 0.5)",
     cursorWidth: 1,
     height: 48,
     barWidth: 2,
@@ -56,7 +57,8 @@ onMounted(() => {
     barRadius: 2,
     normalize: true,
     interact: true,
-    minPxPerSec: 50,
+    // Let waveform auto-fit container width (no horizontal scroll)
+    fillParent: true,
   });
 
   ws.on("ready", () => {
@@ -114,6 +116,16 @@ function onSliderChange(val) {
   }
 }
 
+/**
+ * Format slider tooltip value (0-1000) as HH:MM:SS.
+ * Shows human-readable time instead of raw numeric value.
+ */
+function formatSliderTooltip(val) {
+  if (duration.value <= 0) return "0:00";
+  const sec = (val / 1000) * duration.value;
+  return formatTime(sec);
+}
+
 function formatTime(sec) {
   if (!sec || sec < 0) return "0:00";
   const m = Math.floor(sec / 60);
@@ -132,6 +144,11 @@ defineExpose({ loadAudio, togglePlay });
 .waveform {
   border-radius: 6px;
   overflow: hidden;
+}
+
+/* Hide any leftover horizontal scrollbar inside wavesurfer shadow container */
+.waveform :deep(div) {
+  overflow-x: hidden !important;
 }
 
 .player-bar {
@@ -166,22 +183,22 @@ defineExpose({ loadAudio, togglePlay });
   flex: 1;
 }
 .time-slider :deep(.n-slider-rail) {
-  background: rgba(51, 65, 85, 0.4);
-  height: 4px;
+  background: rgba(51, 65, 85, 0.3);
+  height: 3px;
   border-radius: 2px;
 }
 .time-slider :deep(.n-slider-fill) {
-  background: linear-gradient(90deg, #6366f1, #818cf8);
+  background: linear-gradient(90deg, #f59e0b, #fbbf24);
   border-radius: 2px;
 }
 .time-slider :deep(.n-slider-thumb) {
   width: 12px;
   height: 12px;
-  border: 2px solid #818cf8;
-  box-shadow: 0 0 6px rgba(99, 102, 241, 0.4);
+  border: 2px solid #f59e0b;
+  box-shadow: 0 0 6px rgba(245, 158, 11, 0.3);
 }
 .time-slider :deep(.n-slider-thumb:hover) {
-  box-shadow: 0 0 10px rgba(99, 102, 241, 0.6);
+  box-shadow: 0 0 10px rgba(245, 158, 11, 0.5);
 }
 
 </style>

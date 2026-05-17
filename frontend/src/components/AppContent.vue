@@ -1,112 +1,122 @@
 <template>
   <div class="app-shell">
-    <!-- Background Decor -->
-    <div class="glow-orb orb-1"></div>
-    <div class="glow-orb orb-2"></div>
+    <!-- Ambient Glow Effects -->
+    <div class="ambient-glow glow-warm"></div>
+    <div class="ambient-glow glow-cool"></div>
 
     <!-- Header -->
     <header class="app-header">
       <div class="brand">
-        <h1 class="brand-title">时语 <span>Shiyu</span></h1>
-        <p class="brand-sub">专业本地 AI 字幕生成器</p>
+        <div class="brand-mark">
+          <div class="brand-icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" x2="12" y1="19" y2="22"/>
+            </svg>
+          </div>
+          <div class="brand-text">
+            <h1>时语 <span class="brand-en">Shiyu</span></h1>
+            <p class="brand-tagline">本地 AI 字幕引擎</p>
+          </div>
+        </div>
       </div>
-      <div class="status-badge" :class="{ online: backendOnline }">
-        <div class="pulse-dot"></div>
-        {{ backendOnline ? "服务在线" : "服务离线" }}
+      <div class="status-chip" :class="{ online: backendOnline }">
+        <div class="status-dot"></div>
+        <span>{{ backendOnline ? "引擎就绪" : "引擎离线" }}</span>
       </div>
     </header>
 
     <!-- Main Content -->
     <main class="app-main">
-      <!-- Step 1: Upload -->
-      <section>
+      <!-- Upload Zone -->
+      <section class="upload-zone">
         <n-upload
           :max="1"
           accept="audio/*,video/*"
           :show-file-list="false"
           :custom-request="handleUpload"
         >
-          <n-upload-dragger class="premium-dragger" :class="{ 'drag-hover': isDraggingOver }">
-            <div class="dragger-icon-wrapper">
-              <UploadCloud :size="32" />
-            </div>
-            <div class="upload-content">
-              <h3>拖拽或点击上传音频 / 视频文件</h3>
-              <p>支持 MP3, WAV, MP4, MKV 等格式</p>
+          <n-upload-dragger class="drop-surface" :class="{ 'drag-hover': isDraggingOver }">
+            <div class="drop-inner">
+              <div class="drop-icon-ring">
+                <UploadCloud :size="24" />
+              </div>
+              <div class="drop-copy">
+                <h3>拖入或点击选择文件</h3>
+                <p>支持 MP3、WAV、MP4、MKV 等常见音视频格式</p>
+              </div>
             </div>
           </n-upload-dragger>
         </n-upload>
 
-        <div v-if="selectedFile" class="file-glass-card">
-          <div class="file-meta">
-            <FileText :size="18" class="meta-icon" />
-            <div class="meta-text">
-              <span class="filename">{{ selectedFile.name }}</span>
-              <span class="filesize">{{ formatFileSize(selectedFile.size) }}</span>
+        <!-- File Indicator -->
+        <transition name="slide-up">
+          <div v-if="selectedFile" class="file-pill">
+            <div class="file-info">
+              <FileText :size="16" class="file-icon" />
+              <span class="file-name">{{ selectedFile.name }}</span>
+              <span class="file-size">{{ formatFileSize(selectedFile.size) }}</span>
             </div>
+            <button class="file-clear" @click="clearFile" aria-label="移除文件">
+              <X :size="14" />
+            </button>
           </div>
-          <n-button quaternary circle size="small" @click="clearFile">
-            <template #icon><X :size="14" /></template>
-          </n-button>
-        </div>
+        </transition>
       </section>
 
-      <!-- Step 2: Settings & Action -->
-      <transition name="slide-fade">
-        <div v-if="selectedFile" class="action-grid">
-          <div class="settings-strip">
-            <div class="config-item">
-              <span class="config-label">输出格式</span>
-              <n-select v-model:value="format" :options="formatOptions" size="medium" class="premium-select" />
+      <!-- Config + Action -->
+      <transition name="slide-up">
+        <section v-if="selectedFile" class="config-section">
+          <div class="config-row">
+            <div class="config-field">
+              <label class="field-label">输出格式</label>
+              <n-select v-model:value="format" :options="formatOptions" size="medium" />
             </div>
-            <div class="config-item">
-              <span class="config-label">语言</span>
-              <n-select v-model:value="language" :options="languageOptions" size="medium" class="premium-select" />
+            <div class="config-field">
+              <label class="field-label">识别语言</label>
+              <n-select v-model:value="language" :options="languageOptions" size="medium" />
             </div>
-            <div class="config-item center">
-              <span class="config-label">逆文本规范化</span>
+            <div class="config-field config-toggle">
+              <label class="field-label">逆文本规范化</label>
               <n-switch v-model:value="useItn" size="medium" />
             </div>
           </div>
-          
-          <n-button
-            type="primary"
-            block
-            strong
-            size="large"
-            :loading="isProcessing"
-            :disabled="!backendOnline"
+
+          <button
+            class="action-btn"
+            :class="{ loading: isProcessing }"
+            :disabled="!backendOnline || isProcessing"
             @click="startTranscribe"
-            class="generate-btn"
           >
-            <template #icon v-if="!isProcessing">
-              <Zap :size="18" />
-            </template>
-            {{ isProcessing ? "识别中..." : "开始生成字幕" }}
-          </n-button>
-        </div>
+            <span class="action-btn-bg"></span>
+            <span class="action-btn-content">
+              <Zap v-if="!isProcessing" :size="18" />
+              <span class="spinner" v-else></span>
+              {{ isProcessing ? "识别中…" : "开始生成字幕" }}
+            </span>
+          </button>
+        </section>
       </transition>
 
-      <!-- Step 3: Wave Player -->
+      <!-- Audio Player -->
       <transition name="scale-in">
-        <n-card v-if="audioUrl" class="section-card player-section" size="small">
-          <template #header>
-            <div class="card-header">
-              <Music :size="16" />
-              <span>音频预览</span>
-            </div>
-          </template>
+        <section v-if="audioUrl" class="player-section">
+          <div class="section-label">
+            <Music :size="14" />
+            <span>音频预览</span>
+          </div>
           <WavePlayer
             :src="audioUrl"
             :segments="parsedSegments"
             @timeupdate="onTimeUpdate"
           />
-        </n-card>
+        </section>
       </transition>
 
-      <!-- Step 4: Subtitle Preview -->
+      <!-- Subtitle Preview -->
       <transition name="scale-in">
-        <n-card v-if="resultContent" class="section-card preview-section" size="small">
+        <section v-if="resultContent" class="preview-section">
           <SubtitlePreview
             :segments="parsedSegments"
             :format="format"
@@ -115,30 +125,32 @@
             @copy="copyResult"
             @seek="seekPlayer"
           />
-        </n-card>
+        </section>
       </transition>
 
-      <!-- Step 5: Raw Output (Collapsible) -->
-      <n-card v-if="resultContent" class="section-card raw-section" size="small">
-        <n-collapse arrow-placement="right">
-          <n-collapse-item name="raw">
-            <template #header>
-              <div class="collapse-trigger">
-                <Code :size="14" />
-                <span>原始 {{ format.toUpperCase() }} 内容</span>
+      <!-- Raw Output -->
+      <transition name="scale-in">
+        <section v-if="resultContent" class="raw-section">
+          <n-collapse arrow-placement="right">
+            <n-collapse-item name="raw">
+              <template #header>
+                <div class="collapse-label">
+                  <Code :size="14" />
+                  <span>原始 {{ format.toUpperCase() }} 内容</span>
+                </div>
+              </template>
+              <div class="raw-viewer">
+                <n-code :code="resultContent" language="txt" word-wrap />
               </div>
-            </template>
-            <div class="code-viewer">
-              <n-code :code="resultContent" language="txt" word-wrap />
-            </div>
-          </n-collapse-item>
-        </n-collapse>
-      </n-card>
+            </n-collapse-item>
+          </n-collapse>
+        </section>
+      </transition>
     </main>
 
     <!-- Footer -->
     <footer class="app-footer">
-      <div class="footer-line"></div>
+      <div class="footer-divider"></div>
       <p>©2026 时语 Shiyu · Jochen · 完全本地运行</p>
     </footer>
   </div>
@@ -156,10 +168,10 @@ import {
   UploadCloud, FileText, X, Zap, Music, Code,
 } from "lucide-vue-next";
 import { listen } from "@tauri-apps/api/event";
-import { readBinaryFile } from "@tauri-apps/api/fs";
+import { convertFileSrc } from "@tauri-apps/api/tauri";
 import WavePlayer from "./WavePlayer.vue";
 import SubtitlePreview from "./SubtitlePreview.vue";
-import { healthCheck, transcribeFile, transcribeJson, downloadText } from "../api.js";
+import { healthCheck, transcribeFile, transcribeJson, transcribeLocal, downloadText } from "../api.js";
 
 const message = useMessage();
 
@@ -178,6 +190,7 @@ const languageOptions = [
 ];
 
 const selectedFile = ref(null);
+const localFilePath = ref(null);  // Tauri drag-drop: store path for direct backend access
 const audioUrl = ref(null);
 const format = ref("srt");
 const language = ref("auto");
@@ -208,7 +221,7 @@ onMounted(async () => {
 
   // Tauri native file-drop listeners
   try {
-    unlistenDrop = await listen("tauri://file-drop", async (event) => {
+    unlistenDrop = await listen("tauri://file-drop", (event) => {
       isDraggingOver.value = false;
       const paths = event.payload;
       if (!paths || paths.length === 0) return;
@@ -217,20 +230,15 @@ onMounted(async () => {
         message.warning("不支持的文件格式，请拖入音频/视频文件");
         return;
       }
-      try {
-        const bytes = await readBinaryFile(mediaPath);
-        const blob = new Blob([bytes]);
-        const fileName = mediaPath.split(/[\\/]/).pop() || "file";
-        const file = new File([blob], fileName, { type: blob.type || "video/mp4" });
-        selectedFile.value = file;
-        if (audioUrl.value) URL.revokeObjectURL(audioUrl.value);
-        audioUrl.value = URL.createObjectURL(blob);
-        resultContent.value = "";
-        resultSegments.value = [];
-        message.info(`已加载: ${fileName}`);
-      } catch (err) {
-        message.error("读取文件失败: " + err);
-      }
+      // Instant: no readBinaryFile, use convertFileSrc for audio preview
+      const fileName = mediaPath.split(/[\\/]/).pop() || "file";
+      localFilePath.value = mediaPath;
+      selectedFile.value = { name: fileName, size: 0 };  // Lightweight placeholder
+      if (audioUrl.value) URL.revokeObjectURL(audioUrl.value);
+      audioUrl.value = convertFileSrc(mediaPath);
+      resultContent.value = "";
+      resultSegments.value = [];
+      message.info(`已加载: ${fileName}`);
     });
 
     unlistenHover = await listen("tauri://file-drop-hover", () => {
@@ -264,6 +272,7 @@ function handleUpload({ file }) {
 
 function clearFile() {
   selectedFile.value = null;
+  localFilePath.value = null;
   if (audioUrl.value) URL.revokeObjectURL(audioUrl.value);
   audioUrl.value = null;
   resultContent.value = "";
@@ -283,17 +292,29 @@ async function startTranscribe() {
   resultSegments.value = [];
 
   try {
-    const [content, json] = await Promise.all([
-      transcribeFile(selectedFile.value, {
+    if (localFilePath.value) {
+      // Tauri drag-drop: use path-based API (single request, no upload)
+      const result = await transcribeLocal(localFilePath.value, {
         language: language.value,
         output_format: format.value,
-      }),
-      transcribeJson(selectedFile.value, language.value).catch(() => null),
-    ]);
-
-    resultContent.value = content;
-    if (json?.segments) {
-      resultSegments.value = json.segments;
+      });
+      resultContent.value = result.content;
+      if (result.segments) {
+        resultSegments.value = result.segments;
+      }
+    } else {
+      // Browser click-upload: use FormData upload (two requests)
+      const [content, json] = await Promise.all([
+        transcribeFile(selectedFile.value, {
+          language: language.value,
+          output_format: format.value,
+        }),
+        transcribeJson(selectedFile.value, language.value).catch(() => null),
+      ]);
+      resultContent.value = content;
+      if (json?.segments) {
+        resultSegments.value = json.segments;
+      }
     }
     message.success("字幕生成完成");
   } catch (err) {
@@ -336,10 +357,11 @@ async function copyResult() {
 </script>
 
 <style scoped>
+/* ─── Layout Shell ─── */
 .app-shell {
-  max-width: 800px;
+  max-width: 760px;
   margin: 0 auto;
-  padding: 40px 24px;
+  padding: 36px 28px 24px;
   display: flex;
   flex-direction: column;
   min-height: 100vh;
@@ -347,272 +369,406 @@ async function copyResult() {
   z-index: 1;
 }
 
-/* Background Glows */
-.glow-orb {
+/* ─── Ambient Glow ─── */
+.ambient-glow {
   position: fixed;
   border-radius: 50%;
-  filter: blur(80px);
+  filter: blur(100px);
   z-index: -1;
-  opacity: 0.15;
+  pointer-events: none;
 }
-.orb-1 {
+.glow-warm {
+  width: 500px;
+  height: 500px;
+  background: radial-gradient(circle, rgba(245, 158, 11, 0.08), transparent 70%);
+  top: -150px;
+  right: -120px;
+}
+.glow-cool {
   width: 400px;
   height: 400px;
-  background: #6366f1;
-  top: -100px;
-  right: -100px;
-}
-.orb-2 {
-  width: 300px;
-  height: 300px;
-  background: #4f46e5;
-  bottom: 50px;
-  left: -50px;
+  background: radial-gradient(circle, rgba(20, 184, 166, 0.06), transparent 70%);
+  bottom: 10%;
+  left: -100px;
 }
 
-/* Header */
+/* ─── Header ─── */
 .app-header {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 48px;
+  align-items: center;
+  margin-bottom: 40px;
 }
 
-.brand-title {
-  font-size: 2.2rem;
-  font-weight: 800;
-  letter-spacing: -1px;
-  margin: 0;
-  color: #fff;
-}
-.brand-title span {
-  font-weight: 300;
-  opacity: 0.4;
-  font-size: 1.4rem;
-  margin-left: 8px;
-}
-
-.brand-sub {
-  margin: 4px 0 0;
-  color: #94a3b8;
-  font-size: 0.9rem;
-  font-weight: 400;
-}
-
-.status-badge {
+.brand-mark {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 14px;
-  background: rgba(30, 41, 59, 0.5);
-  border: 1px solid rgba(51, 65, 85, 0.5);
-  border-radius: 100px;
-  font-size: 0.75rem;
-  font-weight: 600;
-  color: #94a3b8;
-  transition: all 0.3s;
-}
-.status-badge.online {
-  color: #818cf8;
-  border-color: rgba(129, 140, 248, 0.3);
+  gap: 14px;
 }
 
-.pulse-dot {
+.brand-icon {
+  width: 44px;
+  height: 44px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.15), rgba(20, 184, 166, 0.1));
+  border: 1px solid rgba(245, 158, 11, 0.2);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-amber);
+}
+
+.brand-text h1 {
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  margin: 0;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+.brand-en {
+  font-weight: 300;
+  opacity: 0.35;
+  font-size: 1rem;
+  margin-left: 6px;
+}
+
+.brand-tagline {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+
+/* Status Chip */
+.status-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  background: rgba(15, 21, 32, 0.6);
+  border: 1px solid var(--border-subtle);
+  border-radius: 100px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  transition: all 0.4s ease;
+}
+.status-chip.online {
+  color: var(--accent-teal);
+  border-color: rgba(20, 184, 166, 0.25);
+  background: rgba(20, 184, 166, 0.05);
+}
+
+.status-dot {
   width: 6px;
   height: 6px;
   background: currentColor;
   border-radius: 50%;
-  box-shadow: 0 0 0 0 rgba(129, 140, 248, 0.4);
+  transition: box-shadow 0.4s;
 }
-.online .pulse-dot {
-  animation: pulse 2s infinite;
-}
-
-@keyframes pulse {
-  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(129, 140, 248, 0.7); }
-  70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(129, 140, 248, 0); }
-  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(129, 140, 248, 0); }
+.status-chip.online .status-dot {
+  box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.5);
+  animation: pulse-teal 2s infinite;
 }
 
-/* Main */
+@keyframes pulse-teal {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.5); }
+  70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(20, 184, 166, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(20, 184, 166, 0); }
+}
+
+/* ─── Main ─── */
 .app-main {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: 20px;
 }
 
-/* Dragger */
-.premium-dragger {
-  background: rgba(15, 23, 42, 0.6) !important;
-  border: 2px dashed rgba(51, 65, 85, 0.5) !important;
-  border-radius: 20px !important;
-  padding: 48px 0 !important;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+/* ─── Upload Zone ─── */
+.drop-surface {
+  background: rgba(15, 21, 32, 0.5) !important;
+  border: 1.5px dashed rgba(71, 85, 105, 0.35) !important;
+  border-radius: 16px !important;
+  padding: 40px 24px !important;
+  transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  position: relative;
+  overflow: hidden;
 }
-.premium-dragger:hover {
-  background: rgba(30, 41, 59, 0.4) !important;
-  border-color: #6366f1 !important;
-  transform: translateY(-2px);
+.drop-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at center, rgba(245, 158, 11, 0.03), transparent 70%);
+  opacity: 0;
+  transition: opacity 0.35s;
 }
-.premium-dragger.drag-hover {
-  background: rgba(99, 102, 241, 0.08) !important;
-  border-color: #818cf8 !important;
+.drop-surface:hover {
+  border-color: rgba(245, 158, 11, 0.35) !important;
+  background: rgba(20, 26, 38, 0.5) !important;
+}
+.drop-surface:hover::before {
+  opacity: 1;
+}
+.drop-surface.drag-hover {
+  background: rgba(245, 158, 11, 0.04) !important;
+  border-color: var(--accent-amber) !important;
   border-style: solid !important;
-  transform: scale(1.01);
-  box-shadow: 0 0 30px rgba(99, 102, 241, 0.15);
+  transform: scale(1.005);
+  box-shadow: 0 0 40px rgba(245, 158, 11, 0.08);
 }
 
-.dragger-icon-wrapper {
-  width: 64px;
-  height: 64px;
-  background: rgba(99, 102, 241, 0.1);
-  border-radius: 16px;
+.drop-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  position: relative;
+  z-index: 1;
+}
+
+.drop-icon-ring {
+  width: 56px;
+  height: 56px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.1), rgba(20, 184, 166, 0.06));
+  border: 1px solid rgba(245, 158, 11, 0.15);
+  border-radius: 14px;
   display: flex;
   align-items: center;
   justify-content: center;
-  margin: 0 auto 16px;
-  color: #818cf8;
+  color: var(--accent-amber);
+  transition: transform 0.3s, box-shadow 0.3s;
+}
+.drop-surface:hover .drop-icon-ring {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(245, 158, 11, 0.08);
 }
 
-.upload-content h3 {
+.drop-copy h3 {
   margin: 0;
-  font-size: 1.1rem;
-  color: #f1f5f9;
+  font-size: 1rem;
+  color: var(--text-primary);
+  font-weight: 500;
+  text-align: center;
 }
-.upload-content p {
-  margin: 8px 0 0;
-  font-size: 0.85rem;
-  color: #64748b;
+.drop-copy p {
+  margin: 4px 0 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-align: center;
 }
 
-/* File Card */
-.file-glass-card {
-  margin-top: 16px;
-  padding: 12px 16px;
-  background: rgba(15, 23, 42, 0.4);
-  border: 1px solid rgba(51, 65, 85, 0.5);
-  backdrop-filter: blur(12px);
+/* ─── File Pill ─── */
+.file-pill {
+  margin-top: 12px;
+  padding: 10px 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
   border-radius: 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-}
-
-.file-meta {
-  display: flex;
-  align-items: center;
   gap: 12px;
 }
-.meta-icon {
-  color: #818cf8;
-}
-.meta-text {
+
+.file-info {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
-.filename {
-  font-size: 0.9rem;
+.file-icon {
+  color: var(--accent-amber);
+  flex-shrink: 0;
+}
+.file-name {
+  font-size: 0.85rem;
   font-weight: 500;
-  color: #f1f5f9;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.filesize {
-  font-size: 0.75rem;
-  color: #64748b;
+.file-size {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.file-clear {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: none;
+  background: rgba(51, 65, 85, 0.2);
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.file-clear:hover {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
 }
 
-/* Action Area */
-.action-grid {
+/* ─── Config Section ─── */
+.config-section {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
 
-.settings-strip {
+.config-row {
   display: grid;
   grid-template-columns: 1fr 1fr auto;
   gap: 12px;
   padding: 16px;
-  background: rgba(15, 23, 42, 0.4);
-  border-radius: 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
 }
 
-.config-item {
+.config-field {
   display: flex;
   flex-direction: column;
+  gap: 6px;
+}
+.config-toggle {
+  align-items: center;
+  justify-content: center;
   gap: 8px;
 }
-.config-label {
-  font-size: 0.7rem;
+
+.field-label {
+  font-size: 0.68rem;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #475569;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
 }
 
-.premium-select :deep(.n-base-selection) {
-  background: rgba(2, 6, 23, 0.3);
-}
-
-.generate-btn {
-  height: 52px;
-  font-size: 1rem;
-  box-shadow: 0 4px 20px -4px rgba(99, 102, 241, 0.5);
-}
-
-/* Cards & Sections */
-.section-card {
+/* ─── Action Button (Custom, no Naive UI) ─── */
+.action-btn {
+  position: relative;
+  width: 100%;
+  height: 50px;
   border: none;
-  background: rgba(15, 23, 42, 0.4);
-  backdrop-filter: blur(20px);
+  border-radius: 13px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #0a0e17;
+  overflow: hidden;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.action-btn:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 30px rgba(245, 158, 11, 0.25);
+}
+.action-btn:not(:disabled):active {
+  transform: translateY(0);
+}
+.action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
-.card-header {
+.action-btn-bg {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, #f59e0b, #fbbf24, #f59e0b);
+  background-size: 200% 200%;
+  animation: gradient-shift 4s ease infinite;
+}
+
+@keyframes gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+.action-btn-content {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 0.9rem;
-  font-weight: 600;
-  color: #94a3b8;
+  justify-content: center;
+  gap: 8px;
 }
 
-.collapse-trigger {
+/* Loading spinner */
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(10, 14, 23, 0.3);
+  border-top-color: #0a0e17;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ─── Sections ─── */
+.player-section,
+.preview-section,
+.raw-section {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.section-label {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 0.8rem;
+  font-size: 0.82rem;
   font-weight: 600;
-  color: #64748b;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
 }
 
-.code-viewer {
+.collapse-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.raw-viewer {
   margin-top: 8px;
   padding: 12px;
-  background: #020617;
+  background: var(--bg-base);
   border-radius: 8px;
 }
 
-/* Transitions */
-.slide-fade-enter-active { transition: all 0.4s ease-out; }
-.slide-fade-enter-from { opacity: 0; transform: translateY(10px); }
+/* ─── Transitions ─── */
+.slide-up-enter-active { transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+.slide-up-enter-from { opacity: 0; transform: translateY(12px); }
 
-.scale-in-enter-active { transition: all 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
-.scale-in-enter-from { opacity: 0; transform: scale(0.98); }
+.scale-in-enter-active { transition: all 0.45s cubic-bezier(0.16, 1, 0.3, 1); }
+.scale-in-enter-from { opacity: 0; transform: scale(0.97) translateY(6px); }
 
-/* Footer */
+/* ─── Footer ─── */
 .app-footer {
-  margin-top: 64px;
-  padding-bottom: 24px;
+  margin-top: 48px;
+  padding-bottom: 20px;
   text-align: center;
 }
-.footer-line {
+.footer-divider {
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(51, 65, 85, 0.5), transparent);
-  margin-bottom: 24px;
+  background: linear-gradient(90deg, transparent, var(--border-subtle), transparent);
+  margin-bottom: 20px;
 }
 .app-footer p {
-  font-size: 0.8rem;
-  color: #334155;
-  font-weight: 500;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 400;
+  letter-spacing: 0.01em;
 }
 </style>

@@ -3,12 +3,14 @@
     <div class="preview-header">
       <span class="preview-title">字幕预览</span>
       <div class="preview-actions">
-        <n-button size="tiny" secondary @click="$emit('download')">
+        <button class="action-chip" @click="$emit('download')">
+          <Download :size="13" />
           下载 {{ format.toUpperCase() }}
-        </n-button>
-        <n-button size="tiny" secondary @click="$emit('copy')">
+        </button>
+        <button class="action-chip" @click="$emit('copy')">
+          <Copy :size="13" />
           复制
-        </n-button>
+        </button>
       </div>
     </div>
     <div class="preview-list" v-if="segments.length">
@@ -29,7 +31,7 @@
 </template>
 
 <script setup>
-import { NButton } from "naive-ui";
+import { Download, Copy } from "lucide-vue-next";
 
 const props = defineProps({
   segments: { type: Array, default: () => [] },
@@ -60,7 +62,7 @@ function isSegmentActive(seg) {
 
 <style scoped>
 .subtitle-preview {
-  background: rgba(255, 255, 255, 0.03);
+  background: transparent;
   border-radius: 10px;
   overflow: hidden;
 }
@@ -69,14 +71,14 @@ function isSegmentActive(seg) {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 10px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 0 2px 12px;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.2);
 }
 
 .preview-title {
   font-weight: 600;
-  font-size: 0.88rem;
-  color: #e0e0e0;
+  font-size: 0.85rem;
+  color: var(--text-secondary, #94a3b8);
 }
 
 .preview-actions {
@@ -84,60 +86,87 @@ function isSegmentActive(seg) {
   gap: 6px;
 }
 
+/* Custom action chips replacing Naive UI buttons */
+.action-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle, rgba(51, 65, 85, 0.25));
+  background: rgba(15, 21, 32, 0.5);
+  color: var(--text-secondary, #94a3b8);
+  font-family: inherit;
+  font-size: 0.72rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.action-chip:hover {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.25);
+  color: var(--accent-amber, #f59e0b);
+}
+
 .preview-list {
-  max-height: 220px;
+  max-height: 240px;
   overflow-y: auto;
-  padding: 4px 0;
+  padding: 6px 0;
 }
 
 .seg-row {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  padding: 5px 14px;
+  padding: 6px 10px;
   cursor: pointer;
-  transition: background 0.12s;
-  border-radius: 4px;
-  margin: 0 4px;
+  transition: background 0.15s;
+  border-radius: 6px;
+  margin: 1px 0;
 }
 
 .seg-row:hover {
-  background: rgba(102, 126, 234, 0.08);
+  background: rgba(245, 158, 11, 0.05);
 }
 
 .seg-row.active {
-  background: rgba(102, 126, 234, 0.16);
+  background: rgba(245, 158, 11, 0.1);
 }
 
 .seg-idx {
-  color: #667eea;
-  font-size: 0.72rem;
-  min-width: 16px;
+  color: var(--accent-amber, #f59e0b);
+  font-size: 0.7rem;
+  min-width: 18px;
   text-align: right;
   flex-shrink: 0;
+  opacity: 0.7;
 }
 
 .seg-time {
-  color: #888;
-  font-size: 0.72rem;
+  color: var(--text-muted, #475569);
+  font-size: 0.7rem;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   flex-shrink: 0;
 }
 
 .seg-text {
-  color: #ddd;
-  font-size: 0.85rem;
+  color: var(--text-primary, #f0f4f8);
+  font-size: 0.82rem;
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.seg-row.active .seg-text {
+  color: var(--accent-amber, #f59e0b);
+}
+
 .preview-empty {
   text-align: center;
-  padding: 20px;
-  color: #666;
-  font-size: 0.85rem;
+  padding: 24px;
+  color: var(--text-muted, #475569);
+  font-size: 0.82rem;
 }
 </style>

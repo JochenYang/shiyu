@@ -15,6 +15,10 @@
       "fs": {
         "readFile": true,
         "scope": ["**"]
+      },
+      "protocol": {
+        "asset": true,
+        "assetScope": ["**"]
       }
     },
     "bundle": {

@@ -214,6 +214,75 @@ async def transcribe_json(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+@app.post("/transcribe/local")
+async def transcribe_local(
+    path: str = Form(...),
+    language: str = Form("auto"),
+    output_format: str = Form("srt")
+):
+    """Transcribe a local file by path (for Tauri drag-drop, no upload needed).
+
+    Args:
+        path: Absolute path to the audio/video file on disk
+        language: Target language (auto/zh/en/ja/ko/yue)
+        output_format: srt / lrc / ass
+
+    Returns:
+        JSON with subtitle content and segments for preview
+    """
+    if engine is None:
+        raise HTTPException(503, "Model not loaded")
+
+    file_path = Path(path)
+    if not file_path.exists():
+        raise HTTPException(400, f"File not found: {path}")
+
+    fmt = output_format.lower()
+    if fmt not in ("srt", "lrc", "ass"):
+        raise HTTPException(400, f"Unsupported format: {output_format}")
+
+    try:
+        video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"}
+        is_video = file_path.suffix.lower() in video_exts
+
+        audio_cfg = config["audio"]
+        features = preprocess_audio(str(file_path), is_video=is_video, config=audio_cfg)
+
+        import librosa
+        if is_video:
+            from app.core.audio_processor import extract_audio_from_video
+            audio_path = extract_audio_from_video(str(file_path))
+        else:
+            audio_path = str(file_path)
+
+        waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
+        duration_sec = len(waveform) / sr
+
+        # Run inference once, get both segments and formatted content
+        segments_raw = engine.transcribe_with_timestamps(
+            features, duration_sec, language
+        )
+        segments = segments_from_transcription(segments_raw)
+
+        if fmt == "srt":
+            content = generate_srt(segments)
+        elif fmt == "lrc":
+            content = generate_lrc(segments)
+        else:
+            content = generate_ass(segments, title=file_path.name)
+
+        return {
+            "content": content,
+            "segments": segments_raw,
+            "filename": file_path.name,
+            "duration": duration_sec,
+            "language": language,
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Transcription failed: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
     server_cfg = config["server"] if config else {"host": "127.0.0.1", "port": 11235}
