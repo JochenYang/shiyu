@@ -70,6 +70,12 @@ fn main() {
                 backend_process: Mutex::new(child),
             });
 
+            if let Some(main_window) = app.get_window("main") {
+                let icon_bytes = include_bytes!("../../assets/logo.png");
+                let icon = tauri::Icon::Raw(icon_bytes.to_vec());
+                let _ = main_window.set_icon(icon); // Logo padding cropped & refreshed
+            }
+
             Ok(())
         })
         .on_window_event(|event| {

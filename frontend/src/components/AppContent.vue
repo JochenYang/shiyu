@@ -1,15 +1,5 @@
 <template>
   <div class="app-layout">
-    <!-- Header -->
-    <header class="app-header">
-      <div class="header-left">
-        <h1 class="app-title">时语字幕助手</h1>
-      </div>
-      <div class="header-right">
-        <button class="icon-btn" @click="showSettings = true"><Settings :size="20" /></button>
-      </div>
-    </header>
-
     <div class="app-body">
       <!-- 左侧边栏 -->
       <aside class="sidebar">
@@ -23,7 +13,10 @@
             :custom-request="handleUpload"
             class="upload-container"
           >
-            <n-upload-dragger class="upload-dragger" :class="{ 'drag-hover': isDraggingOver }">
+            <n-upload-dragger
+              class="upload-dragger"
+              :class="{ 'drag-hover': isDraggingOver }"
+            >
               <Upload class="upload-icon" :size="28" />
               <div class="upload-text">拖拽音视频文件到此处</div>
               <div class="upload-subtext">或点击导入文件</div>
@@ -36,19 +29,25 @@
               <Film v-if="isVideo" class="file-icon" :size="20" />
               <Music v-else class="file-icon" :size="20" />
               <div class="file-details">
-                <span class="file-name" :title="selectedFile.name">{{ selectedFile.name }}</span>
-                <span class="file-meta">{{ isVideo ? '视频文件' : '音频文件' }}</span>
+                <span class="file-name" :title="selectedFile.name">{{
+                  selectedFile.name
+                }}</span>
+                <span class="file-meta">{{
+                  isVideo ? "视频文件" : "音频文件"
+                }}</span>
               </div>
             </div>
-            
+
             <n-upload
               :max="1"
               accept="audio/*,video/*"
               :show-file-list="false"
               :custom-request="handleUpload"
-              style="display: inline-flex;"
+              style="display: inline-flex"
             >
-              <button class="secondary-btn small-btn replace-btn">更换文件</button>
+              <button class="secondary-btn small-btn replace-btn">
+                更换文件
+              </button>
             </n-upload>
           </div>
         </div>
@@ -71,7 +70,9 @@
             <span class="item-time">{{ fmtTimeFull(seg.start) }}</span>
             <span class="item-text">{{ seg.text }}</span>
           </div>
-          <div class="list-empty" v-if="parsedSegments.length === 0">暂无字幕</div>
+          <div class="list-empty" v-if="parsedSegments.length === 0">
+            暂无字幕
+          </div>
         </div>
       </aside>
 
@@ -80,37 +81,57 @@
         <!-- 预览区 -->
         <div class="media-preview-area">
           <div class="media-container">
-            <video 
-              ref="mediaPlayer" 
-              :src="audioUrl" 
+            <video
+              ref="mediaPlayer"
+              :src="audioUrl"
               class="media-element"
-              @timeupdate="onTimeUpdate" 
-              @loadedmetadata="onLoadedMetadata" 
-              @play="onPlay" 
-              @pause="onPause" 
+              @timeupdate="onTimeUpdate"
+              @loadedmetadata="onLoadedMetadata"
+              @play="onPlay"
+              @pause="onPause"
               @ended="onPause"
               v-show="isVideo && audioUrl"
             ></video>
-            
-            <div class="media-placeholder" v-if="!audioUrl || (!isVideo && !isProcessing)">
+
+            <div
+              class="media-placeholder"
+              v-if="!audioUrl || (!isVideo && !isProcessing)"
+            >
               <Film :size="56" class="placeholder-icon" />
-              <div class="placeholder-text">{{ audioUrl ? '导入音视频文件以开始预览' : '导入音视频文件以开始预览' }}</div>
+              <div class="placeholder-text">
+                {{
+                  audioUrl
+                    ? "导入音视频文件以开始预览"
+                    : "导入音视频文件以开始预览"
+                }}
+              </div>
             </div>
 
             <!-- 视频/音频字幕叠加层 -->
-            <div class="subtitle-overlay" v-if="audioUrl && currentSegment" :class="{'is-audio': !isVideo}">
-              <span class="subtitle-text">{{ currentSegmentText || currentSegment.text }}</span>
+            <div
+              class="subtitle-overlay"
+              v-if="audioUrl && currentSegment"
+              :class="{ 'is-audio': !isVideo }"
+            >
+              <span class="subtitle-text">{{
+                currentSegmentText || currentSegment.text
+              }}</span>
             </div>
 
             <!-- 开始识别的按钮遮罩层 (如果是已导入且尚未识别) -->
-            <div class="processing-overlay" v-if="audioUrl && parsedSegments.length === 0 && !isProcessing">
-               <button class="primary-btn run-btn" @click="startTranscribe">开始生成字幕</button>
+            <div
+              class="processing-overlay"
+              v-if="audioUrl && parsedSegments.length === 0 && !isProcessing"
+            >
+              <button class="primary-btn run-btn" @click="startTranscribe">
+                开始生成字幕
+              </button>
             </div>
-            
+
             <!-- 正在处理 -->
             <div class="processing-overlay" v-if="isProcessing">
-               <span class="spinner"></span>
-               <div class="processing-text">正在识别中...</div>
+              <span class="spinner"></span>
+              <div class="processing-text">正在识别中...</div>
             </div>
           </div>
         </div>
@@ -119,34 +140,79 @@
         <div class="editor-area">
           <div class="editor-header">
             <span class="editor-title">字幕编辑</span>
-            <span class="editor-count">{{ parsedSegments.length > 0 ? (currentSegIndex >= 0 ? currentSegIndex + 1 : 1) : 0 }} / {{ parsedSegments.length }}</span>
+            <span class="editor-count"
+              >{{
+                parsedSegments.length > 0
+                  ? currentSegIndex >= 0
+                    ? currentSegIndex + 1
+                    : 1
+                  : 0
+              }}
+              / {{ parsedSegments.length }}</span
+            >
           </div>
           <div class="editor-time" v-if="currentSegment">
-            开始 <span>{{ fmtTimeFull(currentSegment.start) }}</span> &nbsp;→&nbsp; 结束 <span>{{ fmtTimeFull(currentSegment.end) }}</span> &nbsp;时长 <span>{{ (currentSegment.end - currentSegment.start).toFixed(1) }}s</span>
+            开始
+            <span>{{ fmtTimeFull(currentSegment.start) }}</span> &nbsp;→&nbsp;
+            结束 <span>{{ fmtTimeFull(currentSegment.end) }}</span> &nbsp;时长
+            <span
+              >{{
+                (currentSegment.end - currentSegment.start).toFixed(1)
+              }}s</span
+            >
           </div>
-          <div class="editor-time" v-else>
-            &nbsp;
-          </div>
-          <textarea 
-            class="editor-input" 
+          <div class="editor-time" v-else>&nbsp;</div>
+          <textarea
+            class="editor-input"
             placeholder="点击编辑字幕文本..."
             v-model="currentSegmentText"
             :disabled="!currentSegment"
           ></textarea>
           <div class="editor-actions">
             <div class="action-group-left">
-              <button class="secondary-btn" @click="prevSegment" :disabled="currentSegIndex <= 0">上一条</button>
-              <button class="secondary-btn" @click="nextSegment" :disabled="currentSegIndex >= parsedSegments.length - 1 || currentSegIndex < 0">下一条</button>
+              <button
+                class="secondary-btn"
+                @click="prevSegment"
+                :disabled="currentSegIndex <= 0"
+              >
+                上一条
+              </button>
+              <button
+                class="secondary-btn"
+                @click="nextSegment"
+                :disabled="
+                  currentSegIndex >= parsedSegments.length - 1 ||
+                  currentSegIndex < 0
+                "
+              >
+                下一条
+              </button>
             </div>
             <div class="action-group-right">
-              <button class="primary-btn" @click="saveCurrentSegment" :disabled="!currentSegment">保存</button>
-              <select v-model="format" class="format-select" :disabled="parsedSegments.length === 0">
+              <button
+                class="primary-btn"
+                @click="saveCurrentSegment"
+                :disabled="!currentSegment"
+              >
+                保存
+              </button>
+              <select
+                v-model="format"
+                class="format-select"
+                :disabled="parsedSegments.length === 0"
+              >
                 <option value="srt">SRT</option>
                 <option value="lrc">LRC</option>
                 <option value="ass">ASS</option>
                 <option value="txt">TXT</option>
               </select>
-              <button class="secondary-btn" :disabled="parsedSegments.length === 0" @click="downloadResult">导出字幕</button>
+              <button
+                class="secondary-btn"
+                :disabled="parsedSegments.length === 0"
+                @click="downloadResult"
+              >
+                导出字幕
+              </button>
             </div>
           </div>
         </div>
@@ -156,12 +222,26 @@
     <!-- 底部控制栏 -->
     <footer class="player-controls">
       <!-- 全局底部进度条 -->
-      <div class="progress-container-global" :class="{ dragging: isDraggingProgress }" @mousedown="onProgressMouseDown" @mousemove="onProgressHover" @mouseleave="onProgressLeave" ref="progressContainer">
-        <div class="progress-bar-global" :style="{ width: progressPercent + '%' }">
+      <div
+        class="progress-container-global"
+        :class="{ dragging: isDraggingProgress }"
+        @mousedown="onProgressMouseDown"
+        @mousemove="onProgressHover"
+        @mouseleave="onProgressLeave"
+        ref="progressContainer"
+      >
+        <div
+          class="progress-bar-global"
+          :style="{ width: progressPercent + '%' }"
+        >
           <div class="progress-thumb"></div>
         </div>
         <!-- 悬停时间提示框 -->
-        <div class="progress-tooltip" v-show="showProgressTooltip" :style="{ left: tooltipX + 'px' }">
+        <div
+          class="progress-tooltip"
+          v-show="showProgressTooltip"
+          :style="{ left: tooltipX + 'px' }"
+        >
           {{ tooltipTimeStr }}
         </div>
       </div>
@@ -170,28 +250,49 @@
         {{ fmtTime(playbackTime) }} / {{ fmtTime(mediaDuration) }}
       </div>
       <div class="control-center">
-        <button class="icon-btn" @click="skip(-5)"><Rewind :size="20" /></button>
+        <button class="icon-btn" @click="skip(-5)">
+          <Rewind :size="20" />
+        </button>
         <button class="play-btn" @click="togglePlay">
           <Play v-if="!isPlaying" :size="22" class="play-icon" />
           <Pause v-else :size="22" />
         </button>
-        <button class="icon-btn" @click="skip(5)"><FastForward :size="20" /></button>
+        <button class="icon-btn" @click="skip(5)">
+          <FastForward :size="20" />
+        </button>
       </div>
       <div class="control-volume">
         <button class="icon-btn vol-icon" @click="toggleMute">
           <VolumeX v-if="volume === 0 || isMuted" :size="18" />
           <Volume2 v-else :size="18" />
         </button>
-        <n-slider v-model:value="volume" :max="1" :step="0.01" class="volume-slider" @update:value="onVolumeChange" :format-tooltip="formatVolumeTooltip" />
+        <n-slider
+          v-model:value="volume"
+          :max="1"
+          :step="0.01"
+          class="volume-slider"
+          @update:value="onVolumeChange"
+          :format-tooltip="formatVolumeTooltip"
+        />
+        <div class="divider"></div>
+        <button class="icon-btn" @click="showSettings = true" title="设置">
+          <Settings :size="18" />
+        </button>
       </div>
     </footer>
 
     <!-- 设置弹窗 -->
-    <div class="custom-modal-overlay" v-if="showSettings" @click.self="showSettings = false">
+    <div
+      class="custom-modal-overlay"
+      v-if="showSettings"
+      @click.self="showSettings = false"
+    >
       <div class="custom-modal">
         <div class="custom-modal-header">
           <h3>软件设置</h3>
-          <button class="icon-btn" @click="showSettings = false"><X :size="18" /></button>
+          <button class="icon-btn" @click="showSettings = false">
+            <X :size="18" />
+          </button>
         </div>
         <div class="custom-modal-body">
           <div class="setting-item">
@@ -205,13 +306,26 @@
           <div class="setting-item col">
             <div class="setting-label">默认字幕导出目录</div>
             <div class="path-picker">
-              <n-input v-model:value="appSettings.defaultSavePath" placeholder="默认将与源文件同目录..." readonly />
-              <button class="secondary-btn small-btn" @click="selectDefaultDir">选择</button>
-              <button class="secondary-btn small-btn" @click="appSettings.defaultSavePath = ''">清除</button>
+              <n-input
+                v-model:value="appSettings.defaultSavePath"
+                placeholder="默认将与源文件同目录..."
+                readonly
+              />
+              <button class="secondary-btn small-btn" @click="selectDefaultDir">
+                选择
+              </button>
+              <button
+                class="secondary-btn small-btn"
+                @click="appSettings.defaultSavePath = ''"
+              >
+                清除
+              </button>
             </div>
           </div>
           <div class="setting-item col">
-            <div class="setting-label">自定义极客字典 (一行一个，如: 错词=对词)</div>
+            <div class="setting-label">
+              自定义极客字典 (一行一个，如: 错词=对词)
+            </div>
             <n-input
               v-model:value="appSettings.customGlossaryText"
               type="textarea"
@@ -221,7 +335,12 @@
           </div>
           <div class="setting-item">
             <div class="setting-label">排错日志</div>
-            <button class="secondary-btn small-btn" @click="openLogDir">打开日志文件夹</button>
+            <button class="secondary-btn small-btn" @click="openLogDir">
+              打开日志文件夹
+            </button>
+          </div>
+          <div class="copyright-info">
+            © 2026 时语 Shiyu Subtitle v1.0.0. All rights reserved.
           </div>
         </div>
       </div>
@@ -231,13 +350,39 @@
 
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue";
-import { NUpload, NUploadDragger, NSlider, NSwitch, NInput, useMessage } from "naive-ui";
-import { Settings, Upload, Film, Music, Play, Pause, Rewind, FastForward, Volume2, VolumeX, X } from "lucide-vue-next";
+import {
+  NUpload,
+  NUploadDragger,
+  NSlider,
+  NSwitch,
+  NInput,
+  useMessage,
+} from "naive-ui";
+import {
+  Settings,
+  Upload,
+  Film,
+  Music,
+  Play,
+  Pause,
+  Rewind,
+  FastForward,
+  Volume2,
+  VolumeX,
+  X,
+} from "lucide-vue-next";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { save, open } from "@tauri-apps/api/dialog";
 import { writeTextFile } from "@tauri-apps/api/fs";
-import { healthCheck, transcribeFile, transcribeJson, transcribeLocal, downloadText, openLogFolder } from "../api.js";
+import {
+  healthCheck,
+  transcribeFile,
+  transcribeJson,
+  transcribeLocal,
+  downloadText,
+  openLogFolder,
+} from "../api.js";
 
 const message = useMessage();
 
@@ -261,7 +406,7 @@ const showSettings = ref(false);
 const appSettings = ref({
   autostart: false,
   startMinimized: false,
-  defaultSavePath: ''
+  defaultSavePath: "",
 });
 
 // Player State
@@ -288,7 +433,8 @@ let unlistenDrop = null;
 let unlistenHover = null;
 let unlistenCancel = null;
 
-const MEDIA_EXTENSIONS = /\.(mp4|mkv|avi|mov|wmv|flv|webm|mp3|wav|m4a|flac|ogg|aac)$/i;
+const MEDIA_EXTENSIONS =
+  /\.(mp4|mkv|avi|mov|wmv|flv|webm|mp3|wav|m4a|flac|ogg|aac)$/i;
 const VIDEO_EXTENSIONS = /\.(mp4|mkv|avi|mov|wmv|flv|webm)$/i;
 
 const parsedSegments = computed(() => {
@@ -302,7 +448,10 @@ const progressPercent = computed(() => {
 });
 
 const currentSegment = computed(() => {
-  if (currentSegIndex.value >= 0 && currentSegIndex.value < parsedSegments.value.length) {
+  if (
+    currentSegIndex.value >= 0 &&
+    currentSegIndex.value < parsedSegments.value.length
+  ) {
     return parsedSegments.value[currentSegIndex.value];
   }
   return null;
@@ -319,7 +468,7 @@ watch(currentSegIndex, (idx) => {
 
 // Load settings
 onMounted(async () => {
-  const saved = localStorage.getItem('shiyu_settings');
+  const saved = localStorage.getItem("shiyu_settings");
   if (saved) {
     appSettings.value = { ...appSettings.value, ...JSON.parse(saved) };
   }
@@ -358,21 +507,27 @@ onMounted(async () => {
   }
 });
 
-watch(appSettings, (newVal) => {
-  localStorage.setItem('shiyu_settings', JSON.stringify(newVal));
-}, { deep: true });
+watch(
+  appSettings,
+  (newVal) => {
+    localStorage.setItem("shiyu_settings", JSON.stringify(newVal));
+  },
+  { deep: true },
+);
 
 onBeforeUnmount(() => {
   clearInterval(pollTimer);
-  if (audioUrl.value && !localFilePath.value) URL.revokeObjectURL(audioUrl.value);
+  if (audioUrl.value && !localFilePath.value)
+    URL.revokeObjectURL(audioUrl.value);
   unlistenDrop?.();
   unlistenHover?.();
   unlistenCancel?.();
 });
 
 function handleFileSelected(filePathOrFile, isTauriPath = false) {
-  if (audioUrl.value && !localFilePath.value) URL.revokeObjectURL(audioUrl.value);
-  
+  if (audioUrl.value && !localFilePath.value)
+    URL.revokeObjectURL(audioUrl.value);
+
   resultSegments.value = [];
   currentSegIndex.value = -1;
   playbackTime.value = 0;
@@ -392,7 +547,7 @@ function handleFileSelected(filePathOrFile, isTauriPath = false) {
     audioUrl.value = URL.createObjectURL(file);
     isVideo.value = VIDEO_EXTENSIONS.test(file.name);
   }
-  
+
   message.info(`已加载文件: ${selectedFile.value.name}`);
 }
 
@@ -425,13 +580,17 @@ async function startTranscribe() {
       const result = await transcribeLocal(localFilePath.value, {
         language: language.value,
         output_format: format.value,
-        glossary: glossaryStr
+        glossary: glossaryStr,
       });
       if (result.segments) {
         resultSegments.value = result.segments;
       }
     } else {
-      const json = await transcribeJson(selectedFile.value, language.value, glossaryStr);
+      const json = await transcribeJson(
+        selectedFile.value,
+        language.value,
+        glossaryStr,
+      );
       if (json?.segments) {
         resultSegments.value = json.segments;
       }
@@ -462,8 +621,12 @@ function skip(seconds) {
   mediaPlayer.value.currentTime += seconds;
 }
 
-function onPlay() { isPlaying.value = true; }
-function onPause() { isPlaying.value = false; }
+function onPlay() {
+  isPlaying.value = true;
+}
+function onPause() {
+  isPlaying.value = false;
+}
 function onLoadedMetadata() {
   if (mediaPlayer.value) {
     mediaDuration.value = mediaPlayer.value.duration;
@@ -504,7 +667,8 @@ function formatVolumeTooltip(val) {
 }
 
 function updateProgressFromMouse(e) {
-  if (!mediaDuration.value || !progressContainer.value || !mediaPlayer.value) return;
+  if (!mediaDuration.value || !progressContainer.value || !mediaPlayer.value)
+    return;
   const rect = progressContainer.value.getBoundingClientRect();
   let clickX = e.clientX - rect.left;
   clickX = Math.max(0, Math.min(clickX, rect.width));
@@ -513,12 +677,13 @@ function updateProgressFromMouse(e) {
 }
 
 function onProgressMouseDown(e) {
-  if (!mediaDuration.value || !progressContainer.value || !mediaPlayer.value) return;
+  if (!mediaDuration.value || !progressContainer.value || !mediaPlayer.value)
+    return;
   isDraggingProgress.value = true;
   updateProgressFromMouse(e);
-  
-  window.addEventListener('mousemove', onProgressMouseMove);
-  window.addEventListener('mouseup', onProgressMouseUp);
+
+  window.addEventListener("mousemove", onProgressMouseMove);
+  window.addEventListener("mouseup", onProgressMouseUp);
 }
 
 function onProgressMouseMove(e) {
@@ -531,8 +696,8 @@ function onProgressMouseMove(e) {
 function onProgressMouseUp(e) {
   if (isDraggingProgress.value) {
     isDraggingProgress.value = false;
-    window.removeEventListener('mousemove', onProgressMouseMove);
-    window.removeEventListener('mouseup', onProgressMouseUp);
+    window.removeEventListener("mousemove", onProgressMouseMove);
+    window.removeEventListener("mouseup", onProgressMouseUp);
     if (mediaDuration.value && mediaPlayer.value) {
       mediaPlayer.value.currentTime = dragPercent.value * mediaDuration.value;
     }
@@ -545,7 +710,9 @@ function onProgressHover(e) {
   const hoverX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
   const percent = hoverX / rect.width;
   tooltipX.value = hoverX;
-  tooltipTimeStr.value = fmtTimeFull(percent * mediaDuration.value).split(".")[0]; // 只显示到秒
+  tooltipTimeStr.value = fmtTimeFull(percent * mediaDuration.value).split(
+    ".",
+  )[0]; // 只显示到秒
   showProgressTooltip.value = true;
 }
 
@@ -553,11 +720,16 @@ function onProgressLeave() {
   showProgressTooltip.value = false;
 }
 
+let lastManualSeekTime = 0;
+
 function autoUpdateSegmentIndex(time) {
+  if (Date.now() - lastManualSeekTime < 800) return;
   if (parsedSegments.value.length === 0) return;
-  
+
   // Try to find the segment corresponding to the current time
-  const idx = parsedSegments.value.findIndex(seg => time >= seg.start && time <= seg.end);
+  const idx = parsedSegments.value.findIndex(
+    (seg) => time >= seg.start && time <= seg.end,
+  );
   if (idx !== -1) {
     // Only auto-update if we are not actively editing a different one
     // or we could just strictly follow the playback head
@@ -566,18 +738,19 @@ function autoUpdateSegmentIndex(time) {
 }
 
 function seekToSegment(idx) {
+  lastManualSeekTime = Date.now();
   currentSegIndex.value = idx;
   if (mediaPlayer.value && parsedSegments.value[idx]) {
     mediaPlayer.value.currentTime = parsedSegments.value[idx].start;
     // Don't auto play, just seek
   }
-  
+
   // 滚动列表定位
   setTimeout(() => {
     if (!listContainer.value) return;
-    const items = listContainer.value.querySelectorAll('.list-item');
+    const items = listContainer.value.querySelectorAll(".list-item");
     if (items[idx]) {
-      items[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      items[idx].scrollIntoView({ behavior: "smooth", block: "center" });
     }
   }, 50);
 }
@@ -594,7 +767,10 @@ function nextSegment() {
   }
 }
 function saveCurrentSegment() {
-  if (currentSegIndex.value >= 0 && currentSegIndex.value < parsedSegments.value.length) {
+  if (
+    currentSegIndex.value >= 0 &&
+    currentSegIndex.value < parsedSegments.value.length
+  ) {
     parsedSegments.value[currentSegIndex.value].text = currentSegmentText.value;
     message.success("已保存修改");
   }
@@ -609,22 +785,28 @@ async function downloadResult() {
     srtContent += `${fmtTimeSrt(seg.start)} --> ${fmtTimeSrt(seg.end)}\n`;
     srtContent += `${seg.text}\n\n`;
   });
-  
-  const defaultName = selectedFile.value?.name.replace(/\.[^.]+$/, "") || "subtitle";
-  
+
+  const defaultName =
+    selectedFile.value?.name.replace(/\.[^.]+$/, "") || "subtitle";
+
   try {
     const filePath = await save({
-      defaultPath: appSettings.value.defaultSavePath ? `${appSettings.value.defaultSavePath}\\${defaultName}.srt` : `${defaultName}.srt`,
-      filters: [{ name: 'Subtitle', extensions: ['srt'] }]
+      defaultPath: appSettings.value.defaultSavePath
+        ? `${appSettings.value.defaultSavePath}\\${defaultName}.srt`
+        : `${defaultName}.srt`,
+      filters: [{ name: "Subtitle", extensions: ["srt"] }],
     });
-    
+
     if (filePath) {
       await writeTextFile(filePath, srtContent);
       message.success("导出成功！");
     }
   } catch (err) {
     // Fallback to browser download if not running in Tauri
-    if (err.toString().includes('__TAURI_IPC__') || err.toString().includes('window.__TAURI__')) {
+    if (
+      err.toString().includes("__TAURI_IPC__") ||
+      err.toString().includes("window.__TAURI__")
+    ) {
       downloadText(srtContent, `${defaultName}.srt`);
     } else {
       message.error("导出失败: " + err.toString());
@@ -660,27 +842,49 @@ async function openLogDir() {
 // Utils
 function fmtTimeFull(sec) {
   if (sec == null || sec < 0) return "00:00:00.000";
-  const h = Math.floor(sec / 3600).toString().padStart(2, "0");
-  const m = Math.floor((sec % 3600) / 60).toString().padStart(2, "0");
-  const s = Math.floor(sec % 60).toString().padStart(2, "0");
-  const ms = Math.floor((sec % 1) * 1000).toString().padStart(3, "0");
+  const h = Math.floor(sec / 3600)
+    .toString()
+    .padStart(2, "0");
+  const m = Math.floor((sec % 3600) / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = Math.floor(sec % 60)
+    .toString()
+    .padStart(2, "0");
+  const ms = Math.floor((sec % 1) * 1000)
+    .toString()
+    .padStart(3, "0");
   return `${h}:${m}:${s}.${ms}`;
 }
 
 function fmtTime(sec) {
   if (sec == null || sec < 0) return "00:00:00";
-  const h = Math.floor(sec / 3600).toString().padStart(2, "0");
-  const m = Math.floor((sec % 3600) / 60).toString().padStart(2, "0");
-  const s = Math.floor(sec % 60).toString().padStart(2, "0");
+  const h = Math.floor(sec / 3600)
+    .toString()
+    .padStart(2, "0");
+  const m = Math.floor((sec % 3600) / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = Math.floor(sec % 60)
+    .toString()
+    .padStart(2, "0");
   return `${h}:${m}:${s}`;
 }
 
 function fmtTimeSrt(sec) {
   if (sec == null || sec < 0) return "00:00:00,000";
-  const h = Math.floor(sec / 3600).toString().padStart(2, "0");
-  const m = Math.floor((sec % 3600) / 60).toString().padStart(2, "0");
-  const s = Math.floor(sec % 60).toString().padStart(2, "0");
-  const ms = Math.floor((sec % 1) * 1000).toString().padStart(3, "0");
+  const h = Math.floor(sec / 3600)
+    .toString()
+    .padStart(2, "0");
+  const m = Math.floor((sec % 3600) / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = Math.floor(sec % 60)
+    .toString()
+    .padStart(2, "0");
+  const ms = Math.floor((sec % 1) * 1000)
+    .toString()
+    .padStart(3, "0");
   return `${h}:${m}:${s},${ms}`;
 }
 </script>
@@ -706,26 +910,11 @@ function fmtTimeSrt(sec) {
   height: 100vh;
   background-color: var(--bg-app, #121212);
   color: var(--text-main, #f0f0f0);
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
   overflow: hidden;
-}
-
-.app-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 16px 24px;
-  height: 60px;
-  background-color: var(--bg-panel, #1a1a1a);
-  border-bottom: 1px solid var(--border-color, #2a2a2a);
-  flex-shrink: 0;
-}
-
-.app-title {
-  font-size: 1.1rem;
-  font-weight: 500;
-  margin: 0;
-  letter-spacing: 0.5px;
 }
 
 .icon-btn {
@@ -771,7 +960,8 @@ function fmtTimeSrt(sec) {
   padding: 30px 20px !important;
   transition: all 0.3s;
 }
-.upload-container :deep(.n-upload-dragger:hover), .drag-hover {
+.upload-container :deep(.n-upload-dragger:hover),
+.drag-hover {
   border-color: #666 !important;
   background-color: #282828 !important;
 }
@@ -954,7 +1144,7 @@ function fmtTimeSrt(sec) {
 .processing-overlay {
   position: absolute;
   inset: 0;
-  background: rgba(0,0,0,0.6);
+  background: rgba(0, 0, 0, 0.6);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -989,7 +1179,7 @@ function fmtTimeSrt(sec) {
   padding: 6px 16px;
   border-radius: 6px;
   font-size: 1.15rem;
-  text-shadow: 1px 1px 3px rgba(0,0,0,0.8);
+  text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.8);
   word-wrap: break-word;
   line-height: 1.5;
 }
@@ -1053,7 +1243,8 @@ function fmtTimeSrt(sec) {
   align-items: center;
 }
 
-.action-group-left, .action-group-right {
+.action-group-left,
+.action-group-right {
   display: flex;
   gap: 12px;
 }
@@ -1075,7 +1266,8 @@ function fmtTimeSrt(sec) {
   cursor: not-allowed;
 }
 
-.primary-btn, .secondary-btn {
+.primary-btn,
+.secondary-btn {
   padding: 8px 16px;
   border-radius: 6px;
   font-size: 0.85rem;
@@ -1154,7 +1346,7 @@ function fmtTimeSrt(sec) {
   height: 12px;
   background-color: #fff;
   border-radius: 50%;
-  box-shadow: 0 0 4px rgba(0,0,0,0.5);
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.5);
   transition: transform 0.2s;
   pointer-events: none;
 }
@@ -1213,14 +1405,21 @@ function fmtTimeSrt(sec) {
   display: flex;
   align-items: center;
   gap: 12px;
-  width: 200px; /* Fixed width */
+  flex: 1;
   justify-content: flex-end;
 }
 .vol-icon {
+  width: 24px;
   color: #888;
 }
 .volume-slider {
-  width: 100px;
+  width: 80px;
+}
+.divider {
+  width: 1px;
+  height: 16px;
+  background-color: #333;
+  margin: 0 4px;
 }
 .volume-slider :deep(.n-slider-rail) {
   background-color: #333;
@@ -1305,5 +1504,14 @@ function fmtTimeSrt(sec) {
   font-size: 0.85rem;
   white-space: nowrap;
   flex-shrink: 0;
+}
+.copyright-info {
+  margin-top: 24px;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--text-muted, #666);
+  border-top: 1px solid var(--border-color, #2a2a2a);
+  padding-top: 16px;
+  letter-spacing: 0.5px;
 }
 </style>
