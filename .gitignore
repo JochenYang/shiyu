@@ -33,6 +33,7 @@ frontend/dist/
 
 # Rust / Tauri
 frontend/src-tauri/target/
+frontend/src-tauri/resources/
 
 # Python backend dependencies
 backend/venv/

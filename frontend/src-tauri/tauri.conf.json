@@ -1,4 +1,8 @@
 {
+  "package": {
+    "productName": "Shiyu",
+    "version": "1.0.0"
+  },
   "build": {
     "beforeBuildCommand": "npm run build",
     "beforeDevCommand": "npm run dev",
@@ -41,7 +45,7 @@
         "icons/icon.icns",
         "icons/icon.ico"
       ],
-      "identifier": "com.shiyu.app",
+      "identifier": "com.shiyu.subtitle",
       "longDescription": "时语 Shiyu - AI-powered local subtitle generator using SenseVoice",
       "macOS": {
         "entitlements": null,
@@ -51,8 +55,8 @@
         "signingIdentity": null
       },
       "resources": [
-        "../../backend",
-        "../../models"
+        "resources/backend",
+        "resources/models"
       ],
       "shortDescription": "时语 - 本地 AI 字幕助手",
       "targets": "all",

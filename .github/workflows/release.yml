@@ -1,0 +1,126 @@
+name: Release Shiyu
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release Shiyu
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Pull Git LFS files
+        run: git lfs pull
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+          cache-dependency-path: './frontend/package.json'
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies (Linux only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev build-essential curl wget libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install Node dependencies
+        run: npm install
+        working-directory: ./frontend
+
+      # --- Prepare Resources: Windows ---
+      - name: Clean & Copy resources (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          # Remove existing junctions or files if present
+          if (Test-Path frontend/src-tauri/resources/backend) { Remove-Item -Path frontend/src-tauri/resources/backend -Recurse -Force }
+          if (Test-Path frontend/src-tauri/resources/models) { Remove-Item -Path frontend/src-tauri/resources/models -Recurse -Force }
+          
+          # Create clean directories
+          New-Item -ItemType Directory -Force -Path frontend/src-tauri/resources/backend
+          New-Item -ItemType Directory -Force -Path frontend/src-tauri/resources/models
+          
+          # Copy backend files (excluding venv, logs, __pycache__)
+          Copy-Item -Path backend/* -Destination frontend/src-tauri/resources/backend -Recurse -Force -Exclude "venv", ".venv", "logs", "__pycache__"
+          
+          # Copy model files
+          Copy-Item -Path models/* -Destination frontend/src-tauri/resources/models -Recurse -Force
+
+      # --- Prepare Resources: macOS & Linux ---
+      - name: Clean & Copy resources (Unix)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        run: |
+          # Remove existing junctions or files if present
+          rm -rf frontend/src-tauri/resources/backend
+          rm -rf frontend/src-tauri/resources/models
+          
+          # Create clean directories
+          mkdir -p frontend/src-tauri/resources/backend
+          mkdir -p frontend/src-tauri/resources/models
+          
+          # Copy backend files (excluding venv, logs, __pycache__)
+          rsync -av --exclude="venv" --exclude=".venv" --exclude="logs" --exclude="__pycache__" backend/ frontend/src-tauri/resources/backend/
+          
+          # Copy model files
+          rsync -av models/ frontend/src-tauri/resources/models/
+
+      # --- Build Python Environment inside Tauri resources: Windows ---
+      - name: Build Python Env (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd frontend/src-tauri/resources/backend
+          python -m venv venv
+          # Install dependencies inside the packaged venv
+          .\venv\Scripts\pip install --upgrade pip
+          .\venv\Scripts\pip install -r requirements.txt
+
+      # --- Build Python Environment inside Tauri resources: macOS & Linux ---
+      - name: Build Python Env (Unix)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        run: |
+          cd frontend/src-tauri/resources/backend
+          python3 -m venv venv
+          # Install dependencies inside the packaged venv
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install -r requirements.txt
+
+      # --- Build & Release Tauri App (All platforms) ---
+      - name: Build & Publish Tauri Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "时语 Shiyu v__VERSION__"
+          releaseBody: "时语 Shiyu 本地 AI 字幕助手三端完美发布版！"
+          releaseDraft: true
+          prerelease: false
+          projectPath: "./frontend"
