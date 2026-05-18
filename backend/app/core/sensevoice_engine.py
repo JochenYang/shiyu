@@ -411,3 +411,132 @@ class SenseVoiceEngine:
             final = [text.strip()] if text.strip() else []
 
         return final
+
+    def transcribe_waveform_with_vad(self, waveform: np.ndarray, sample_rate: int, audio_cfg: dict,
+                                     duration_sec: float, language: str = "zh",
+                                     custom_glossary: dict = None) -> List[dict]:
+        """Process long audio by splitting into safe chunks using energy-based VAD.
+        
+        Features:
+        - Energy VAD to find silence boundaries
+        - Merging short segments into max 25-second chunks
+        - Context padding
+        - Glossary mapping for domain-specific terminology correction
+        """
+        import librosa
+        from app.core.audio_processor import compute_fbank_kaldi, apply_lfr, apply_cmvn, load_cmvn
+        import os
+        
+        # 1. 能量 VAD 寻找静音切分点 (而不是过滤掉)
+        intervals = librosa.effects.split(waveform, top_db=40, frame_length=2048, hop_length=512)
+        
+        n_mels = audio_cfg.get("n_mels", 80)
+        frame_length = audio_cfg.get("frame_length", 25)
+        frame_shift = audio_cfg.get("frame_shift", 10)
+        lfr_m = audio_cfg.get("lfr_m", 7)
+        lfr_n = audio_cfg.get("lfr_n", 6)
+        cmvn_file = audio_cfg.get("cmvn_file", None)
+        
+        cmvn = load_cmvn(cmvn_file) if cmvn_file and os.path.exists(cmvn_file) else None
+        
+        # 术语纠错表 Glossary
+        base_glossary = {
+            "labelbel": "Label",
+            "go it": "Godot",
+            "goold it": "Godot",
+            "good it": "Godot",
+            "goold": "Godot",
+            "个到特": "Godot",
+            "高到特": "Godot",
+            "狗道特": "Godot",
+            "狗到特": "Godot",
+            "c家家": "C++",
+            "思家家": "C++",
+            "c加加": "C++",
+            "拍森": "Python",
+            "泰普斯克里普特": "TypeScript",
+            "加瓦": "Java",
+            "瑞阿克特": "React",
+            "微优伊": "Vue",
+            "维优伊": "Vue",
+            "尤尼提": "Unity",
+            "昂瑞尔": "Unreal"
+        }
+        
+        if custom_glossary:
+            base_glossary.update(custom_glossary)
+            
+        glossary = base_glossary
+        
+        # 2. 将 VAD 区间转换为静音缝隙 (Silences)
+        silences = []
+        last_end = 0
+        for start, end in intervals:
+            if start > last_end:
+                silences.append((last_end, start))
+            last_end = end
+        if last_end < len(waveform):
+            silences.append((last_end, len(waveform)))
+            
+        # 3. 100% 覆盖切割法：只在静音中点下刀，绝不丢弃任何样本
+        chunks = []
+        current_start = 0
+        min_chunk_sec = 8.0   # 最小切片长度，低于这个不切
+        max_chunk_sec = 28.0  # 极限长度（备用）
+        
+        for sil_start, sil_end in silences:
+            cut_point = (sil_start + sil_end) // 2
+            
+            # 如果累积到切分点已经超过推荐长度，就切一刀
+            if (cut_point - current_start) / sample_rate > min_chunk_sec:
+                chunks.append((current_start, cut_point))
+                current_start = cut_point
+                
+        # 兜底：处理剩余部分
+        if current_start < len(waveform):
+            # 如果尾巴实在太短，直接融合给上一段
+            if chunks and (len(waveform) - current_start) / sample_rate < 2.0:
+                prev_start, _ = chunks.pop()
+                chunks.append((prev_start, len(waveform)))
+            else:
+                chunks.append((current_start, len(waveform)))
+                
+        if not chunks:
+            chunks = [(0, len(waveform))]
+
+        all_segments = []
+        
+        for start_idx, end_idx in chunks:
+            # 因为已经是 100% 无缝切割（且切点在静音中），不再需要激进的 padding
+            # 加极小的 padding (50ms) 以免爆音边界
+            pad = int(sample_rate * 0.05)
+            s_idx = max(0, start_idx - pad)
+            e_idx = min(len(waveform), end_idx + pad)
+            
+            chunk_wave = waveform[s_idx:e_idx]
+            chunk_duration = len(chunk_wave) / sample_rate
+            
+            fbank = compute_fbank_kaldi(chunk_wave, sample_rate, n_mels, frame_length, frame_shift)
+            features = apply_lfr(fbank, lfr_m, lfr_n)
+            if cmvn is not None:
+                features = apply_cmvn(features, cmvn).astype(np.float32)
+            features = np.expand_dims(features, axis=0)
+            
+            # 对单个分段强制进行高质量推理
+            chunk_segments = self.transcribe_with_timestamps(features, chunk_duration, language)
+            
+            chunk_start_sec = s_idx / sample_rate
+            for seg in chunk_segments:
+                # 合并时间戳
+                seg["start"] = round(seg["start"] + chunk_start_sec, 3)
+                seg["end"] = round(seg["end"] + chunk_start_sec, 3)
+                
+                # 术语纠错后处理
+                text = seg["text"]
+                for bad, good in glossary.items():
+                    text = text.replace(bad, good)
+                seg["text"] = text
+                
+                all_segments.append(seg)
+                
+        return all_segments

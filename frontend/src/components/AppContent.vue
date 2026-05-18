@@ -1,205 +1,286 @@
 <template>
-  <div class="app-shell">
-    <!-- Ambient Glow Effects -->
-    <div class="ambient-glow glow-warm"></div>
-    <div class="ambient-glow glow-cool"></div>
-
+  <div class="app-layout">
     <!-- Header -->
     <header class="app-header">
-      <div class="brand">
-        <div class="brand-mark">
-          <div class="brand-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-              <line x1="12" x2="12" y1="19" y2="22"/>
-            </svg>
-          </div>
-          <div class="brand-text">
-            <h1>时语 <span class="brand-en">Shiyu</span></h1>
-            <p class="brand-tagline">本地 AI 字幕引擎</p>
-          </div>
-        </div>
+      <div class="header-left">
+        <h1 class="app-title">时语字幕助手</h1>
       </div>
-      <div class="status-chip" :class="{ online: backendOnline }">
-        <div class="status-dot"></div>
-        <span>{{ backendOnline ? "引擎就绪" : "引擎离线" }}</span>
+      <div class="header-right">
+        <button class="icon-btn" @click="showSettings = true"><Settings :size="20" /></button>
       </div>
     </header>
 
-    <!-- Main Content -->
-    <main class="app-main">
-      <!-- Upload Zone -->
-      <section class="upload-zone">
-        <n-upload
-          :max="1"
-          accept="audio/*,video/*"
-          :show-file-list="false"
-          :custom-request="handleUpload"
-        >
-          <n-upload-dragger class="drop-surface" :class="{ 'drag-hover': isDraggingOver }">
-            <div class="drop-inner">
-              <div class="drop-icon-ring">
-                <UploadCloud :size="24" />
-              </div>
-              <div class="drop-copy">
-                <h3>拖入或点击选择文件</h3>
-                <p>支持 MP3、WAV、MP4、MKV 等常见音视频格式</p>
-              </div>
-            </div>
-          </n-upload-dragger>
-        </n-upload>
-
-        <!-- File Indicator -->
-        <transition name="slide-up">
-          <div v-if="selectedFile" class="file-pill">
-            <div class="file-info">
-              <FileText :size="16" class="file-icon" />
-              <span class="file-name">{{ selectedFile.name }}</span>
-              <span class="file-size">{{ formatFileSize(selectedFile.size) }}</span>
-            </div>
-            <button class="file-clear" @click="clearFile" aria-label="移除文件">
-              <X :size="14" />
-            </button>
-          </div>
-        </transition>
-      </section>
-
-      <!-- Config + Action -->
-      <transition name="slide-up">
-        <section v-if="selectedFile" class="config-section">
-          <div class="config-row">
-            <div class="config-field">
-              <label class="field-label">输出格式</label>
-              <n-select v-model:value="format" :options="formatOptions" size="medium" />
-            </div>
-            <div class="config-field">
-              <label class="field-label">识别语言</label>
-              <n-select v-model:value="language" :options="languageOptions" size="medium" />
-            </div>
-            <div class="config-field config-toggle">
-              <label class="field-label">逆文本规范化</label>
-              <n-switch v-model:value="useItn" size="medium" />
-            </div>
-          </div>
-
-          <button
-            class="action-btn"
-            :class="{ loading: isProcessing }"
-            :disabled="!backendOnline || isProcessing"
-            @click="startTranscribe"
+    <div class="app-body">
+      <!-- 左侧边栏 -->
+      <aside class="sidebar">
+        <!-- 上传/文件信息区域 -->
+        <div class="file-zone">
+          <n-upload
+            v-if="!selectedFile"
+            :max="1"
+            accept="audio/*,video/*"
+            :show-file-list="false"
+            :custom-request="handleUpload"
+            class="upload-container"
           >
-            <span class="action-btn-bg"></span>
-            <span class="action-btn-content">
-              <Zap v-if="!isProcessing" :size="18" />
-              <span class="spinner" v-else></span>
-              {{ isProcessing ? "识别中…" : "开始生成字幕" }}
-            </span>
-          </button>
-        </section>
-      </transition>
+            <n-upload-dragger class="upload-dragger" :class="{ 'drag-hover': isDraggingOver }">
+              <Upload class="upload-icon" :size="28" />
+              <div class="upload-text">拖拽音视频文件到此处</div>
+              <div class="upload-subtext">或点击导入文件</div>
+            </n-upload-dragger>
+          </n-upload>
 
-      <!-- Audio Player -->
-      <transition name="scale-in">
-        <section v-if="audioUrl" class="player-section">
-          <div class="section-label">
-            <Music :size="14" />
-            <span>音频预览</span>
-          </div>
-          <WavePlayer
-            :src="audioUrl"
-            :segments="parsedSegments"
-            @timeupdate="onTimeUpdate"
-          />
-        </section>
-      </transition>
-
-      <!-- Subtitle Preview -->
-      <transition name="scale-in">
-        <section v-if="resultContent" class="preview-section">
-          <SubtitlePreview
-            :segments="parsedSegments"
-            :format="format"
-            :current-time="playbackTime"
-            @download="downloadResult"
-            @copy="copyResult"
-            @seek="seekPlayer"
-          />
-        </section>
-      </transition>
-
-      <!-- Raw Output -->
-      <transition name="scale-in">
-        <section v-if="resultContent" class="raw-section">
-          <n-collapse arrow-placement="right">
-            <n-collapse-item name="raw">
-              <template #header>
-                <div class="collapse-label">
-                  <Code :size="14" />
-                  <span>原始 {{ format.toUpperCase() }} 内容</span>
-                </div>
-              </template>
-              <div class="raw-viewer">
-                <n-code :code="resultContent" language="txt" word-wrap />
+          <!-- 已选择文件展示卡片 -->
+          <div class="file-pill" v-else>
+            <div class="file-info">
+              <Film v-if="isVideo" class="file-icon" :size="20" />
+              <Music v-else class="file-icon" :size="20" />
+              <div class="file-details">
+                <span class="file-name" :title="selectedFile.name">{{ selectedFile.name }}</span>
+                <span class="file-meta">{{ isVideo ? '视频文件' : '音频文件' }}</span>
               </div>
-            </n-collapse-item>
-          </n-collapse>
-        </section>
-      </transition>
-    </main>
+            </div>
+            
+            <n-upload
+              :max="1"
+              accept="audio/*,video/*"
+              :show-file-list="false"
+              :custom-request="handleUpload"
+              style="display: inline-flex;"
+            >
+              <button class="secondary-btn small-btn replace-btn">更换文件</button>
+            </n-upload>
+          </div>
+        </div>
 
-    <!-- Footer -->
-    <footer class="app-footer">
-      <div class="footer-divider"></div>
-      <p>©2026 时语 Shiyu · Jochen · 完全本地运行</p>
+        <!-- 列表头部 -->
+        <div class="list-header">
+          <span class="list-title">字幕列表</span>
+          <span class="list-count">{{ parsedSegments.length }} 条</span>
+        </div>
+
+        <!-- 列表 -->
+        <div class="subtitle-list" ref="listContainer">
+          <div
+            v-for="(seg, idx) in parsedSegments"
+            :key="idx"
+            class="list-item"
+            :class="{ active: currentSegIndex === idx }"
+            @click="seekToSegment(idx)"
+          >
+            <span class="item-time">{{ fmtTimeFull(seg.start) }}</span>
+            <span class="item-text">{{ seg.text }}</span>
+          </div>
+          <div class="list-empty" v-if="parsedSegments.length === 0">暂无字幕</div>
+        </div>
+      </aside>
+
+      <!-- 右侧主区域 -->
+      <main class="main-content">
+        <!-- 预览区 -->
+        <div class="media-preview-area">
+          <div class="media-container">
+            <video 
+              ref="mediaPlayer" 
+              :src="audioUrl" 
+              class="media-element"
+              @timeupdate="onTimeUpdate" 
+              @loadedmetadata="onLoadedMetadata" 
+              @play="onPlay" 
+              @pause="onPause" 
+              @ended="onPause"
+              v-show="isVideo && audioUrl"
+            ></video>
+            
+            <div class="media-placeholder" v-if="!audioUrl || (!isVideo && !isProcessing)">
+              <Film :size="56" class="placeholder-icon" />
+              <div class="placeholder-text">{{ audioUrl ? '导入音视频文件以开始预览' : '导入音视频文件以开始预览' }}</div>
+            </div>
+
+            <!-- 视频/音频字幕叠加层 -->
+            <div class="subtitle-overlay" v-if="audioUrl && currentSegment" :class="{'is-audio': !isVideo}">
+              <span class="subtitle-text">{{ currentSegmentText || currentSegment.text }}</span>
+            </div>
+
+            <!-- 开始识别的按钮遮罩层 (如果是已导入且尚未识别) -->
+            <div class="processing-overlay" v-if="audioUrl && parsedSegments.length === 0 && !isProcessing">
+               <button class="primary-btn run-btn" @click="startTranscribe">开始生成字幕</button>
+            </div>
+            
+            <!-- 正在处理 -->
+            <div class="processing-overlay" v-if="isProcessing">
+               <span class="spinner"></span>
+               <div class="processing-text">正在识别中...</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 编辑区 -->
+        <div class="editor-area">
+          <div class="editor-header">
+            <span class="editor-title">字幕编辑</span>
+            <span class="editor-count">{{ parsedSegments.length > 0 ? (currentSegIndex >= 0 ? currentSegIndex + 1 : 1) : 0 }} / {{ parsedSegments.length }}</span>
+          </div>
+          <div class="editor-time" v-if="currentSegment">
+            开始 <span>{{ fmtTimeFull(currentSegment.start) }}</span> &nbsp;→&nbsp; 结束 <span>{{ fmtTimeFull(currentSegment.end) }}</span> &nbsp;时长 <span>{{ (currentSegment.end - currentSegment.start).toFixed(1) }}s</span>
+          </div>
+          <div class="editor-time" v-else>
+            &nbsp;
+          </div>
+          <textarea 
+            class="editor-input" 
+            placeholder="点击编辑字幕文本..."
+            v-model="currentSegmentText"
+            :disabled="!currentSegment"
+          ></textarea>
+          <div class="editor-actions">
+            <div class="action-group-left">
+              <button class="secondary-btn" @click="prevSegment" :disabled="currentSegIndex <= 0">上一条</button>
+              <button class="secondary-btn" @click="nextSegment" :disabled="currentSegIndex >= parsedSegments.length - 1 || currentSegIndex < 0">下一条</button>
+            </div>
+            <div class="action-group-right">
+              <button class="primary-btn" @click="saveCurrentSegment" :disabled="!currentSegment">保存</button>
+              <select v-model="format" class="format-select" :disabled="parsedSegments.length === 0">
+                <option value="srt">SRT</option>
+                <option value="lrc">LRC</option>
+                <option value="ass">ASS</option>
+                <option value="txt">TXT</option>
+              </select>
+              <button class="secondary-btn" :disabled="parsedSegments.length === 0" @click="downloadResult">导出字幕</button>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- 底部控制栏 -->
+    <footer class="player-controls">
+      <!-- 全局底部进度条 -->
+      <div class="progress-container-global" :class="{ dragging: isDraggingProgress }" @mousedown="onProgressMouseDown" @mousemove="onProgressHover" @mouseleave="onProgressLeave" ref="progressContainer">
+        <div class="progress-bar-global" :style="{ width: progressPercent + '%' }">
+          <div class="progress-thumb"></div>
+        </div>
+        <!-- 悬停时间提示框 -->
+        <div class="progress-tooltip" v-show="showProgressTooltip" :style="{ left: tooltipX + 'px' }">
+          {{ tooltipTimeStr }}
+        </div>
+      </div>
+
+      <div class="control-time">
+        {{ fmtTime(playbackTime) }} / {{ fmtTime(mediaDuration) }}
+      </div>
+      <div class="control-center">
+        <button class="icon-btn" @click="skip(-5)"><Rewind :size="20" /></button>
+        <button class="play-btn" @click="togglePlay">
+          <Play v-if="!isPlaying" :size="22" class="play-icon" />
+          <Pause v-else :size="22" />
+        </button>
+        <button class="icon-btn" @click="skip(5)"><FastForward :size="20" /></button>
+      </div>
+      <div class="control-volume">
+        <button class="icon-btn vol-icon" @click="toggleMute">
+          <VolumeX v-if="volume === 0 || isMuted" :size="18" />
+          <Volume2 v-else :size="18" />
+        </button>
+        <n-slider v-model:value="volume" :max="1" :step="0.01" class="volume-slider" @update:value="onVolumeChange" :format-tooltip="formatVolumeTooltip" />
+      </div>
     </footer>
+
+    <!-- 设置弹窗 -->
+    <div class="custom-modal-overlay" v-if="showSettings" @click.self="showSettings = false">
+      <div class="custom-modal">
+        <div class="custom-modal-header">
+          <h3>软件设置</h3>
+          <button class="icon-btn" @click="showSettings = false"><X :size="18" /></button>
+        </div>
+        <div class="custom-modal-body">
+          <div class="setting-item">
+            <div class="setting-label">开机自动启动</div>
+            <n-switch v-model:value="appSettings.autostart" />
+          </div>
+          <div class="setting-item">
+            <div class="setting-label">启动时最小化到托盘</div>
+            <n-switch v-model:value="appSettings.startMinimized" />
+          </div>
+          <div class="setting-item col">
+            <div class="setting-label">默认字幕导出目录</div>
+            <div class="path-picker">
+              <n-input v-model:value="appSettings.defaultSavePath" placeholder="默认将与源文件同目录..." readonly />
+              <button class="secondary-btn small-btn" @click="selectDefaultDir">选择</button>
+              <button class="secondary-btn small-btn" @click="appSettings.defaultSavePath = ''">清除</button>
+            </div>
+          </div>
+          <div class="setting-item col">
+            <div class="setting-label">自定义极客字典 (一行一个，如: 错词=对词)</div>
+            <n-input
+              v-model:value="appSettings.customGlossaryText"
+              type="textarea"
+              placeholder="goold it=Godot&#10;思家家=C++&#10;微优伊=Vue"
+              :autosize="{ minRows: 3, maxRows: 6 }"
+            />
+          </div>
+          <div class="setting-item">
+            <div class="setting-label">排错日志</div>
+            <button class="secondary-btn small-btn" @click="openLogDir">打开日志文件夹</button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue";
-import {
-  NCard, NButton, NTag,
-  NUpload, NUploadDragger, NSelect, NSwitch,
-  NIcon, NCollapse, NCollapseItem, NCode,
-  useMessage,
-} from "naive-ui";
-import {
-  UploadCloud, FileText, X, Zap, Music, Code,
-} from "lucide-vue-next";
+import { NUpload, NUploadDragger, NSlider, NSwitch, NInput, useMessage } from "naive-ui";
+import { Settings, Upload, Film, Music, Play, Pause, Rewind, FastForward, Volume2, VolumeX, X } from "lucide-vue-next";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
-import WavePlayer from "./WavePlayer.vue";
-import SubtitlePreview from "./SubtitlePreview.vue";
-import { healthCheck, transcribeFile, transcribeJson, transcribeLocal, downloadText } from "../api.js";
+import { save, open } from "@tauri-apps/api/dialog";
+import { writeTextFile } from "@tauri-apps/api/fs";
+import { healthCheck, transcribeFile, transcribeJson, transcribeLocal, downloadText, openLogFolder } from "../api.js";
 
 const message = useMessage();
 
-const formatOptions = [
-  { label: "SRT（推荐）", value: "srt" },
-  { label: "LRC（歌词）", value: "lrc" },
-  { label: "ASS（高级）", value: "ass" },
-];
-const languageOptions = [
-  { label: "自动检测", value: "auto" },
-  { label: "中文", value: "zh" },
-  { label: "English", value: "en" },
-  { label: "日本語", value: "ja" },
-  { label: "한국어", value: "ko" },
-  { label: "粤语", value: "yue" },
-];
-
+// State
 const selectedFile = ref(null);
-const localFilePath = ref(null);  // Tauri drag-drop: store path for direct backend access
+const localFilePath = ref(null);
 const audioUrl = ref(null);
-const format = ref("srt");
-const language = ref("auto");
-const useItn = ref(true);
+const isVideo = ref(false);
 const isProcessing = ref(false);
-const resultContent = ref("");
-const resultSegments = ref([]);
 const backendOnline = ref(false);
+
+const format = ref("srt");
+const language = ref("zh");
+
+const resultSegments = ref([]);
+const currentSegIndex = ref(-1);
+const currentSegmentText = ref("");
+
+// Settings state
+const showSettings = ref(false);
+const appSettings = ref({
+  autostart: false,
+  startMinimized: false,
+  defaultSavePath: ''
+});
+
+// Player State
+const mediaPlayer = ref(null);
+const isPlaying = ref(false);
+const mediaDuration = ref(0);
 const playbackTime = ref(0);
+const volume = ref(1);
+const isMuted = ref(false);
+const prevVolume = ref(1);
+const progressContainer = ref(null);
+const listContainer = ref(null);
+
+// Progress Tooltip & Drag State
+const showProgressTooltip = ref(false);
+const tooltipX = ref(0);
+const tooltipTimeStr = ref("00:00:00");
+const isDraggingProgress = ref(false);
+const dragPercent = ref(0);
 
 const isDraggingOver = ref(false);
 let pollTimer = null;
@@ -208,8 +289,41 @@ let unlistenHover = null;
 let unlistenCancel = null;
 
 const MEDIA_EXTENSIONS = /\.(mp4|mkv|avi|mov|wmv|flv|webm|mp3|wav|m4a|flac|ogg|aac)$/i;
+const VIDEO_EXTENSIONS = /\.(mp4|mkv|avi|mov|wmv|flv|webm)$/i;
 
+const parsedSegments = computed(() => {
+  return resultSegments.value;
+});
+
+const progressPercent = computed(() => {
+  if (mediaDuration.value <= 0) return 0;
+  if (isDraggingProgress.value) return dragPercent.value * 100;
+  return (playbackTime.value / mediaDuration.value) * 100;
+});
+
+const currentSegment = computed(() => {
+  if (currentSegIndex.value >= 0 && currentSegIndex.value < parsedSegments.value.length) {
+    return parsedSegments.value[currentSegIndex.value];
+  }
+  return null;
+});
+
+// Sync text input with current segment
+watch(currentSegIndex, (idx) => {
+  if (idx >= 0 && idx < parsedSegments.value.length) {
+    currentSegmentText.value = parsedSegments.value[idx].text;
+  } else {
+    currentSegmentText.value = "";
+  }
+});
+
+// Load settings
 onMounted(async () => {
+  const saved = localStorage.getItem('shiyu_settings');
+  if (saved) {
+    appSettings.value = { ...appSettings.value, ...JSON.parse(saved) };
+  }
+
   pollTimer = setInterval(async () => {
     try {
       await healthCheck();
@@ -219,7 +333,6 @@ onMounted(async () => {
     }
   }, 2000);
 
-  // Tauri native file-drop listeners
   try {
     unlistenDrop = await listen("tauri://file-drop", (event) => {
       isDraggingOver.value = false;
@@ -230,15 +343,7 @@ onMounted(async () => {
         message.warning("不支持的文件格式，请拖入音频/视频文件");
         return;
       }
-      // Instant: no readBinaryFile, use convertFileSrc for audio preview
-      const fileName = mediaPath.split(/[\\/]/).pop() || "file";
-      localFilePath.value = mediaPath;
-      selectedFile.value = { name: fileName, size: 0 };  // Lightweight placeholder
-      if (audioUrl.value) URL.revokeObjectURL(audioUrl.value);
-      audioUrl.value = convertFileSrc(mediaPath);
-      resultContent.value = "";
-      resultSegments.value = [];
-      message.info(`已加载: ${fileName}`);
+      handleFileSelected(mediaPath, true);
     });
 
     unlistenHover = await listen("tauri://file-drop-hover", () => {
@@ -249,72 +354,90 @@ onMounted(async () => {
       isDraggingOver.value = false;
     });
   } catch {
-    // Running in browser (dev mode without Tauri), skip native drop
+    // Running in browser dev mode
   }
 });
 
+watch(appSettings, (newVal) => {
+  localStorage.setItem('shiyu_settings', JSON.stringify(newVal));
+}, { deep: true });
+
 onBeforeUnmount(() => {
   clearInterval(pollTimer);
-  if (audioUrl.value) URL.revokeObjectURL(audioUrl.value);
+  if (audioUrl.value && !localFilePath.value) URL.revokeObjectURL(audioUrl.value);
   unlistenDrop?.();
   unlistenHover?.();
   unlistenCancel?.();
 });
 
+function handleFileSelected(filePathOrFile, isTauriPath = false) {
+  if (audioUrl.value && !localFilePath.value) URL.revokeObjectURL(audioUrl.value);
+  
+  resultSegments.value = [];
+  currentSegIndex.value = -1;
+  playbackTime.value = 0;
+  mediaDuration.value = 0;
+  isPlaying.value = false;
+
+  if (isTauriPath) {
+    const fileName = filePathOrFile.split(/[\\/]/).pop() || "file";
+    localFilePath.value = filePathOrFile;
+    selectedFile.value = { name: fileName, size: 0 };
+    audioUrl.value = convertFileSrc(filePathOrFile);
+    isVideo.value = VIDEO_EXTENSIONS.test(filePathOrFile);
+  } else {
+    const file = filePathOrFile;
+    selectedFile.value = file;
+    localFilePath.value = null;
+    audioUrl.value = URL.createObjectURL(file);
+    isVideo.value = VIDEO_EXTENSIONS.test(file.name);
+  }
+  
+  message.info(`已加载文件: ${selectedFile.value.name}`);
+}
+
 function handleUpload({ file }) {
-  const f = file.file;
-  selectedFile.value = f;
-  if (audioUrl.value) URL.revokeObjectURL(audioUrl.value);
-  audioUrl.value = URL.createObjectURL(f);
-  resultContent.value = "";
-  resultSegments.value = [];
-}
-
-function clearFile() {
-  selectedFile.value = null;
-  localFilePath.value = null;
-  if (audioUrl.value) URL.revokeObjectURL(audioUrl.value);
-  audioUrl.value = null;
-  resultContent.value = "";
-  resultSegments.value = [];
-}
-
-function formatFileSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1048576).toFixed(1)} MB`;
+  handleFileSelected(file.file, false);
 }
 
 async function startTranscribe() {
   if (!selectedFile.value) return;
   isProcessing.value = true;
-  resultContent.value = "";
   resultSegments.value = [];
+  currentSegIndex.value = -1;
 
   try {
+    let glossaryDict = {};
+    if (appSettings.value.customGlossaryText) {
+      const lines = appSettings.value.customGlossaryText.split("\n");
+      for (const line of lines) {
+        if (line.includes("=")) {
+          const [bad, good] = line.split("=");
+          if (bad.trim() && good.trim()) {
+            glossaryDict[bad.trim()] = good.trim();
+          }
+        }
+      }
+    }
+    const glossaryStr = JSON.stringify(glossaryDict);
+
     if (localFilePath.value) {
-      // Tauri drag-drop: use path-based API (single request, no upload)
       const result = await transcribeLocal(localFilePath.value, {
         language: language.value,
         output_format: format.value,
+        glossary: glossaryStr
       });
-      resultContent.value = result.content;
       if (result.segments) {
         resultSegments.value = result.segments;
       }
     } else {
-      // Browser click-upload: use FormData upload (two requests)
-      const [content, json] = await Promise.all([
-        transcribeFile(selectedFile.value, {
-          language: language.value,
-          output_format: format.value,
-        }),
-        transcribeJson(selectedFile.value, language.value).catch(() => null),
-      ]);
-      resultContent.value = content;
+      const json = await transcribeJson(selectedFile.value, language.value, glossaryStr);
       if (json?.segments) {
         resultSegments.value = json.segments;
       }
+    }
+    if (resultSegments.value.length > 0) {
+      currentSegIndex.value = 0;
     }
     message.success("字幕生成完成");
   } catch (err) {
@@ -324,451 +447,863 @@ async function startTranscribe() {
   }
 }
 
-const parsedSegments = computed(() => {
-  return resultSegments.value.map((s) => ({
-    start: s.start,
-    end: s.end,
-    text: s.text,
-  }));
-});
-
-function onTimeUpdate(t) {
-  playbackTime.value = t;
-}
-
-function seekPlayer(time) {
-  playbackTime.value = time;
-}
-
-function downloadResult() {
-  if (!resultContent.value || !selectedFile.value) return;
-  const baseName = selectedFile.value.name.replace(/\.[^.]+$/, "") || "subtitle";
-  downloadText(resultContent.value, `${baseName}.${format.value}`);
-}
-
-async function copyResult() {
-  try {
-    await navigator.clipboard.writeText(resultContent.value);
-    message.success("已复制到剪贴板");
-  } catch {
-    message.error("复制失败");
+// Player controls
+function togglePlay() {
+  if (!mediaPlayer.value || !audioUrl.value) return;
+  if (isPlaying.value) {
+    mediaPlayer.value.pause();
+  } else {
+    mediaPlayer.value.play();
   }
+}
+
+function skip(seconds) {
+  if (!mediaPlayer.value) return;
+  mediaPlayer.value.currentTime += seconds;
+}
+
+function onPlay() { isPlaying.value = true; }
+function onPause() { isPlaying.value = false; }
+function onLoadedMetadata() {
+  if (mediaPlayer.value) {
+    mediaDuration.value = mediaPlayer.value.duration;
+  }
+}
+function onTimeUpdate() {
+  if (mediaPlayer.value) {
+    playbackTime.value = mediaPlayer.value.currentTime;
+    autoUpdateSegmentIndex(playbackTime.value);
+  }
+}
+
+function onVolumeChange(val) {
+  if (mediaPlayer.value) {
+    mediaPlayer.value.volume = val;
+    if (val > 0) isMuted.value = false;
+  }
+}
+
+function toggleMute() {
+  if (!mediaPlayer.value) return;
+  if (isMuted.value || volume.value === 0) {
+    // Unmute
+    isMuted.value = false;
+    volume.value = prevVolume.value > 0 ? prevVolume.value : 0.5;
+    mediaPlayer.value.volume = volume.value;
+  } else {
+    // Mute
+    isMuted.value = true;
+    prevVolume.value = volume.value;
+    volume.value = 0;
+    mediaPlayer.value.volume = 0;
+  }
+}
+
+function formatVolumeTooltip(val) {
+  return `${Math.round(val * 100)}%`;
+}
+
+function updateProgressFromMouse(e) {
+  if (!mediaDuration.value || !progressContainer.value || !mediaPlayer.value) return;
+  const rect = progressContainer.value.getBoundingClientRect();
+  let clickX = e.clientX - rect.left;
+  clickX = Math.max(0, Math.min(clickX, rect.width));
+  const percent = clickX / rect.width;
+  dragPercent.value = percent;
+}
+
+function onProgressMouseDown(e) {
+  if (!mediaDuration.value || !progressContainer.value || !mediaPlayer.value) return;
+  isDraggingProgress.value = true;
+  updateProgressFromMouse(e);
+  
+  window.addEventListener('mousemove', onProgressMouseMove);
+  window.addEventListener('mouseup', onProgressMouseUp);
+}
+
+function onProgressMouseMove(e) {
+  if (isDraggingProgress.value) {
+    updateProgressFromMouse(e);
+    onProgressHover(e); // 同时更新悬停时间
+  }
+}
+
+function onProgressMouseUp(e) {
+  if (isDraggingProgress.value) {
+    isDraggingProgress.value = false;
+    window.removeEventListener('mousemove', onProgressMouseMove);
+    window.removeEventListener('mouseup', onProgressMouseUp);
+    if (mediaDuration.value && mediaPlayer.value) {
+      mediaPlayer.value.currentTime = dragPercent.value * mediaDuration.value;
+    }
+  }
+}
+
+function onProgressHover(e) {
+  if (!mediaDuration.value || !progressContainer.value) return;
+  const rect = progressContainer.value.getBoundingClientRect();
+  const hoverX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+  const percent = hoverX / rect.width;
+  tooltipX.value = hoverX;
+  tooltipTimeStr.value = fmtTimeFull(percent * mediaDuration.value).split(".")[0]; // 只显示到秒
+  showProgressTooltip.value = true;
+}
+
+function onProgressLeave() {
+  showProgressTooltip.value = false;
+}
+
+function autoUpdateSegmentIndex(time) {
+  if (parsedSegments.value.length === 0) return;
+  
+  // Try to find the segment corresponding to the current time
+  const idx = parsedSegments.value.findIndex(seg => time >= seg.start && time <= seg.end);
+  if (idx !== -1) {
+    // Only auto-update if we are not actively editing a different one
+    // or we could just strictly follow the playback head
+    currentSegIndex.value = idx;
+  }
+}
+
+function seekToSegment(idx) {
+  currentSegIndex.value = idx;
+  if (mediaPlayer.value && parsedSegments.value[idx]) {
+    mediaPlayer.value.currentTime = parsedSegments.value[idx].start;
+    // Don't auto play, just seek
+  }
+  
+  // 滚动列表定位
+  setTimeout(() => {
+    if (!listContainer.value) return;
+    const items = listContainer.value.querySelectorAll('.list-item');
+    if (items[idx]) {
+      items[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, 50);
+}
+
+// Editor actions
+function prevSegment() {
+  if (currentSegIndex.value > 0) {
+    seekToSegment(currentSegIndex.value - 1);
+  }
+}
+function nextSegment() {
+  if (currentSegIndex.value < parsedSegments.value.length - 1) {
+    seekToSegment(currentSegIndex.value + 1);
+  }
+}
+function saveCurrentSegment() {
+  if (currentSegIndex.value >= 0 && currentSegIndex.value < parsedSegments.value.length) {
+    parsedSegments.value[currentSegIndex.value].text = currentSegmentText.value;
+    message.success("已保存修改");
+  }
+}
+
+async function downloadResult() {
+  if (parsedSegments.value.length === 0) return;
+  // Format segments to SRT
+  let srtContent = "";
+  parsedSegments.value.forEach((seg, i) => {
+    srtContent += `${i + 1}\n`;
+    srtContent += `${fmtTimeSrt(seg.start)} --> ${fmtTimeSrt(seg.end)}\n`;
+    srtContent += `${seg.text}\n\n`;
+  });
+  
+  const defaultName = selectedFile.value?.name.replace(/\.[^.]+$/, "") || "subtitle";
+  
+  try {
+    const filePath = await save({
+      defaultPath: appSettings.value.defaultSavePath ? `${appSettings.value.defaultSavePath}\\${defaultName}.srt` : `${defaultName}.srt`,
+      filters: [{ name: 'Subtitle', extensions: ['srt'] }]
+    });
+    
+    if (filePath) {
+      await writeTextFile(filePath, srtContent);
+      message.success("导出成功！");
+    }
+  } catch (err) {
+    // Fallback to browser download if not running in Tauri
+    if (err.toString().includes('__TAURI_IPC__') || err.toString().includes('window.__TAURI__')) {
+      downloadText(srtContent, `${defaultName}.srt`);
+    } else {
+      message.error("导出失败: " + err.toString());
+    }
+  }
+}
+
+async function selectDefaultDir() {
+  try {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+    });
+    if (selected) {
+      appSettings.value.defaultSavePath = selected;
+    }
+  } catch (err) {
+    message.error("选择目录失败");
+  }
+}
+
+async function openLogDir() {
+  try {
+    const res = await openLogFolder();
+    if (res.status !== "ok") {
+      message.error(res.msg || "无法打开日志文件夹，请检查后端服务");
+    }
+  } catch (err) {
+    message.error("调用后端打开日志文件夹失败: " + err);
+  }
+}
+
+// Utils
+function fmtTimeFull(sec) {
+  if (sec == null || sec < 0) return "00:00:00.000";
+  const h = Math.floor(sec / 3600).toString().padStart(2, "0");
+  const m = Math.floor((sec % 3600) / 60).toString().padStart(2, "0");
+  const s = Math.floor(sec % 60).toString().padStart(2, "0");
+  const ms = Math.floor((sec % 1) * 1000).toString().padStart(3, "0");
+  return `${h}:${m}:${s}.${ms}`;
+}
+
+function fmtTime(sec) {
+  if (sec == null || sec < 0) return "00:00:00";
+  const h = Math.floor(sec / 3600).toString().padStart(2, "0");
+  const m = Math.floor((sec % 3600) / 60).toString().padStart(2, "0");
+  const s = Math.floor(sec % 60).toString().padStart(2, "0");
+  return `${h}:${m}:${s}`;
+}
+
+function fmtTimeSrt(sec) {
+  if (sec == null || sec < 0) return "00:00:00,000";
+  const h = Math.floor(sec / 3600).toString().padStart(2, "0");
+  const m = Math.floor((sec % 3600) / 60).toString().padStart(2, "0");
+  const s = Math.floor(sec % 60).toString().padStart(2, "0");
+  const ms = Math.floor((sec % 1) * 1000).toString().padStart(3, "0");
+  return `${h}:${m}:${s},${ms}`;
 }
 </script>
 
 <style scoped>
-/* ─── Layout Shell ─── */
-.app-shell {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 36px 28px 24px;
+/* ─── Variables ─── */
+:root {
+  --bg-app: #121212;
+  --bg-panel: #1a1a1a;
+  --bg-card: #222222;
+  --border-color: #2a2a2a;
+  --text-main: #f0f0f0;
+  --text-muted: #888888;
+  --text-active: #1fbc5b; /* 主题绿 */
+  --btn-green: #1fbc5b;
+  --btn-green-hover: #1db155;
+}
+
+/* ─── Layout ─── */
+.app-layout {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
-  position: relative;
-  z-index: 1;
+  height: 100vh;
+  background-color: var(--bg-app, #121212);
+  color: var(--text-main, #f0f0f0);
+  font-family: system-ui, -apple-system, sans-serif;
+  overflow: hidden;
 }
 
-/* ─── Ambient Glow ─── */
-.ambient-glow {
-  position: fixed;
-  border-radius: 50%;
-  filter: blur(100px);
-  z-index: -1;
-  pointer-events: none;
-}
-.glow-warm {
-  width: 500px;
-  height: 500px;
-  background: radial-gradient(circle, rgba(245, 158, 11, 0.08), transparent 70%);
-  top: -150px;
-  right: -120px;
-}
-.glow-cool {
-  width: 400px;
-  height: 400px;
-  background: radial-gradient(circle, rgba(20, 184, 166, 0.06), transparent 70%);
-  bottom: 10%;
-  left: -100px;
-}
-
-/* ─── Header ─── */
 .app-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 40px;
+  padding: 16px 24px;
+  height: 60px;
+  background-color: var(--bg-panel, #1a1a1a);
+  border-bottom: 1px solid var(--border-color, #2a2a2a);
+  flex-shrink: 0;
 }
 
-.brand-mark {
-  display: flex;
-  align-items: center;
-  gap: 14px;
+.app-title {
+  font-size: 1.1rem;
+  font-weight: 500;
+  margin: 0;
+  letter-spacing: 0.5px;
 }
 
-.brand-icon {
-  width: 44px;
-  height: 44px;
-  background: linear-gradient(135deg, rgba(245, 158, 11, 0.15), rgba(20, 184, 166, 0.1));
-  border: 1px solid rgba(245, 158, 11, 0.2);
-  border-radius: 12px;
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted, #888);
+  cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--accent-amber);
+  transition: color 0.2s;
+  padding: 4px;
+}
+.icon-btn:hover {
+  color: var(--text-main, #f0f0f0);
 }
 
-.brand-text h1 {
-  font-size: 1.6rem;
-  font-weight: 700;
-  letter-spacing: -0.5px;
-  margin: 0;
-  color: var(--text-primary);
-  line-height: 1.2;
-}
-.brand-en {
-  font-weight: 300;
-  opacity: 0.35;
-  font-size: 1rem;
-  margin-left: 6px;
-}
-
-.brand-tagline {
-  margin: 2px 0 0;
-  color: var(--text-muted);
-  font-size: 0.78rem;
-  font-weight: 400;
-  letter-spacing: 0.02em;
-}
-
-/* Status Chip */
-.status-chip {
+.app-body {
   display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 12px;
-  background: rgba(15, 21, 32, 0.6);
-  border: 1px solid var(--border-subtle);
-  border-radius: 100px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  color: var(--text-muted);
-  transition: all 0.4s ease;
-}
-.status-chip.online {
-  color: var(--accent-teal);
-  border-color: rgba(20, 184, 166, 0.25);
-  background: rgba(20, 184, 166, 0.05);
-}
-
-.status-dot {
-  width: 6px;
-  height: 6px;
-  background: currentColor;
-  border-radius: 50%;
-  transition: box-shadow 0.4s;
-}
-.status-chip.online .status-dot {
-  box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.5);
-  animation: pulse-teal 2s infinite;
-}
-
-@keyframes pulse-teal {
-  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(20, 184, 166, 0.5); }
-  70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(20, 184, 166, 0); }
-  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(20, 184, 166, 0); }
-}
-
-/* ─── Main ─── */
-.app-main {
   flex: 1;
+  overflow: hidden;
+}
+
+/* ─── Sidebar ─── */
+.sidebar {
+  width: 320px;
   display: flex;
   flex-direction: column;
+  background-color: var(--bg-app, #121212);
+  border-right: 1px solid var(--border-color, #2a2a2a);
+  padding: 20px;
   gap: 20px;
 }
 
-/* ─── Upload Zone ─── */
-.drop-surface {
-  background: rgba(15, 21, 32, 0.5) !important;
-  border: 1.5px dashed rgba(71, 85, 105, 0.35) !important;
-  border-radius: 16px !important;
-  padding: 40px 24px !important;
-  transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1) !important;
-  position: relative;
-  overflow: hidden;
-}
-.drop-surface::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: radial-gradient(ellipse at center, rgba(245, 158, 11, 0.03), transparent 70%);
-  opacity: 0;
-  transition: opacity 0.35s;
-}
-.drop-surface:hover {
-  border-color: rgba(245, 158, 11, 0.35) !important;
-  background: rgba(20, 26, 38, 0.5) !important;
-}
-.drop-surface:hover::before {
-  opacity: 1;
-}
-.drop-surface.drag-hover {
-  background: rgba(245, 158, 11, 0.04) !important;
-  border-color: var(--accent-amber) !important;
-  border-style: solid !important;
-  transform: scale(1.005);
-  box-shadow: 0 0 40px rgba(245, 158, 11, 0.08);
+.file-zone {
+  flex-shrink: 0;
 }
 
-.drop-inner {
+.upload-container :deep(.n-upload-dragger) {
+  background-color: var(--bg-card, #222) !important;
+  border: 1px dashed #444 !important;
+  border-radius: 8px !important;
+  padding: 30px 20px !important;
+  transition: all 0.3s;
+}
+.upload-container :deep(.n-upload-dragger:hover), .drag-hover {
+  border-color: #666 !important;
+  background-color: #282828 !important;
+}
+
+.upload-icon {
+  color: #666;
+  margin-bottom: 12px;
+}
+.upload-text {
+  font-size: 0.9rem;
+  color: #ccc;
+  margin-bottom: 4px;
+}
+.upload-subtext {
+  font-size: 0.75rem;
+  color: #666;
+}
+
+/* File Pill */
+.file-pill {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 14px;
-  position: relative;
-  z-index: 1;
-}
-
-.drop-icon-ring {
-  width: 56px;
-  height: 56px;
-  background: linear-gradient(135deg, rgba(245, 158, 11, 0.1), rgba(20, 184, 166, 0.06));
-  border: 1px solid rgba(245, 158, 11, 0.15);
-  border-radius: 14px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--accent-amber);
-  transition: transform 0.3s, box-shadow 0.3s;
-}
-.drop-surface:hover .drop-icon-ring {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(245, 158, 11, 0.08);
-}
-
-.drop-copy h3 {
-  margin: 0;
-  font-size: 1rem;
-  color: var(--text-primary);
-  font-weight: 500;
-  text-align: center;
-}
-.drop-copy p {
-  margin: 4px 0 0;
-  font-size: 0.8rem;
-  color: var(--text-muted);
-  text-align: center;
-}
-
-/* ─── File Pill ─── */
-.file-pill {
-  margin-top: 12px;
-  padding: 10px 14px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   gap: 12px;
+  padding: 14px;
+  background-color: var(--bg-card, #222);
+  border-radius: 8px;
+  border: 1px solid var(--border-color, #2a2a2a);
 }
-
 .file-info {
   display: flex;
   align-items: center;
-  gap: 10px;
-  min-width: 0;
+  gap: 12px;
+  overflow: hidden;
 }
 .file-icon {
-  color: var(--accent-amber);
+  color: var(--text-active, #1fbc5b);
   flex-shrink: 0;
+}
+.file-details {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .file-name {
-  font-size: 0.85rem;
-  font-weight: 500;
-  color: var(--text-primary);
+  font-size: 0.9rem;
+  color: #eee;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
-.file-size {
-  font-size: 0.72rem;
-  color: var(--text-muted);
-  flex-shrink: 0;
+.file-meta {
+  font-size: 0.75rem;
+  color: #888;
+  margin-top: 2px;
 }
-.file-clear {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  border: none;
-  background: rgba(51, 65, 85, 0.2);
-  color: var(--text-secondary);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-  flex-shrink: 0;
-}
-.file-clear:hover {
-  background: rgba(239, 68, 68, 0.15);
-  color: #f87171;
-}
-
-/* ─── Config Section ─── */
-.config-section {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.config-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr auto;
-  gap: 12px;
-  padding: 16px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-subtle);
-  border-radius: 14px;
-}
-
-.config-field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.config-toggle {
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-}
-
-.field-label {
-  font-size: 0.68rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-}
-
-/* ─── Action Button (Custom, no Naive UI) ─── */
-.action-btn {
-  position: relative;
+.replace-btn {
   width: 100%;
-  height: 50px;
-  border: none;
-  border-radius: 13px;
+}
+
+.list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+.list-count {
+  font-size: 0.8rem;
+  color: #666;
+}
+
+.subtitle-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+}
+.subtitle-list::-webkit-scrollbar {
+  width: 4px;
+}
+.subtitle-list::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 2px;
+}
+
+.list-item {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
+  background-color: var(--bg-card, #222);
+  border-radius: 6px;
   cursor: pointer;
-  font-family: inherit;
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: #0a0e17;
+  transition: background 0.2s;
+  border: 1px solid transparent;
+}
+.list-item:hover {
+  background-color: #282828;
+}
+.list-item.active {
+  background-color: rgba(31, 188, 91, 0.1);
+  border-color: rgba(31, 188, 91, 0.3);
+}
+.item-time {
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: #888;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+.item-text {
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: #ddd;
+}
+.list-item.active .item-text {
+  color: var(--text-active, #1fbc5b);
+}
+
+.list-empty {
+  text-align: center;
+  color: #666;
+  font-size: 0.85rem;
+  margin-top: 20px;
+}
+
+/* ─── Main Content ─── */
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  gap: 20px;
+  background-color: var(--bg-app, #121212);
+  overflow-y: auto;
+}
+
+.media-preview-area {
+  background-color: var(--bg-panel, #1a1a1a);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
-  transition: transform 0.2s, box-shadow 0.2s;
+  position: relative;
+  min-height: 0;
+  flex: 1;
 }
-.action-btn:not(:disabled):hover {
-  transform: translateY(-1px);
-  box-shadow: 0 8px 30px rgba(245, 158, 11, 0.25);
+
+.media-container {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  background-color: #000;
+  min-height: 0;
 }
-.action-btn:not(:disabled):active {
-  transform: translateY(0);
+
+.media-element {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  min-height: 0;
 }
-.action-btn:disabled {
+
+.media-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color: #444;
+}
+.placeholder-icon {
+  margin-bottom: 16px;
+}
+.placeholder-text {
+  font-size: 0.9rem;
+}
+
+.processing-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.processing-text {
+  margin-top: 16px;
+  font-size: 0.9rem;
+  color: #eee;
+}
+
+/* ─── Overlays ─── */
+.subtitle-overlay {
+  position: absolute;
+  bottom: 24px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  pointer-events: none;
+  z-index: 10;
+  padding: 0 40px;
+}
+.subtitle-overlay.is-audio {
+  bottom: 50%;
+  transform: translateY(50%);
+}
+.subtitle-text {
+  display: inline-block;
+  background-color: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 1.15rem;
+  text-shadow: 1px 1px 3px rgba(0,0,0,0.8);
+  word-wrap: break-word;
+  line-height: 1.5;
+}
+
+/* ─── Editor Area ─── */
+.editor-area {
+  background-color: var(--bg-panel, #1a1a1a);
+  border-radius: 10px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.editor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.editor-title {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+.editor-count {
+  font-size: 0.8rem;
+  color: #666;
+}
+
+.editor-time {
+  font-size: 0.8rem;
+  color: #888;
+  margin-bottom: 12px;
+  font-family: monospace;
+}
+.editor-time span {
+  color: #aaa;
+}
+
+.editor-input {
+  background-color: var(--bg-app, #121212);
+  border: 1px solid var(--border-color, #2a2a2a);
+  border-radius: 6px;
+  padding: 12px;
+  color: #eee;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  resize: none;
+  height: 100px;
+  margin-bottom: 16px;
+  font-family: inherit;
+}
+.editor-input:focus {
+  outline: none;
+  border-color: #444;
+}
+
+.editor-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.action-group-left, .action-group-right {
+  display: flex;
+  gap: 12px;
+}
+
+.format-select {
+  background: #111;
+  color: #e0e0e0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 0 12px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  outline: none;
+  cursor: pointer;
+  height: 33px; /* 匹配按钮高度 */
+}
+.format-select:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
-.action-btn-bg {
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(135deg, #f59e0b, #fbbf24, #f59e0b);
-  background-size: 200% 200%;
-  animation: gradient-shift 4s ease infinite;
+.primary-btn, .secondary-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  border: none;
+  transition: all 0.2s;
+}
+.primary-btn {
+  background-color: var(--btn-green, #1fbc5b);
+  color: #000;
+  font-weight: 500;
+}
+.primary-btn:hover:not(:disabled) {
+  background-color: var(--btn-green-hover, #1db155);
+}
+.primary-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
-@keyframes gradient-shift {
-  0%, 100% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
+.secondary-btn {
+  background-color: #2a2a2a;
+  color: #ccc;
+}
+.secondary-btn:hover:not(:disabled) {
+  background-color: #333;
+}
+.secondary-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
-.action-btn-content {
+/* ─── Footer Controls ─── */
+.player-controls {
+  height: 64px;
+  background-color: var(--bg-app, #121212);
+  border-top: 1px solid var(--border-color, #2a2a2a);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 30px;
+  flex-shrink: 0;
   position: relative;
-  z-index: 1;
+}
+
+/* Global Progress Bar */
+.progress-container-global {
+  position: absolute;
+  top: -2px;
+  left: 0;
+  right: 0;
+  height: 4px;
+  background-color: rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+  z-index: 20;
+  transition: all 0.2s;
+}
+.progress-container-global:hover {
+  height: 8px;
+  top: -6px;
+}
+.progress-bar-global {
+  height: 100%;
+  background-color: var(--text-active, #1fbc5b);
+  transition: width 0.1s linear;
+  box-shadow: 0 0 8px rgba(31, 188, 91, 0.5);
+  position: relative;
+}
+
+.progress-thumb {
+  position: absolute;
+  right: -6px;
+  top: 50%;
+  transform: translateY(-50%) scale(0);
+  width: 12px;
+  height: 12px;
+  background-color: #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 4px rgba(0,0,0,0.5);
+  transition: transform 0.2s;
+  pointer-events: none;
+}
+.progress-container-global:hover .progress-thumb,
+.progress-container-global.dragging .progress-thumb {
+  transform: translateY(-50%) scale(1);
+}
+
+.progress-tooltip {
+  position: absolute;
+  bottom: 12px;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.85);
+  color: #fff;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.control-time {
+  font-family: monospace;
+  font-size: 0.85rem;
+  color: #888;
+  width: 200px; /* Fixed width to balance flex */
+}
+
+.control-center {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.play-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background-color: var(--btn-green, #1fbc5b);
+  border: none;
+  color: #000;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  cursor: pointer;
+  transition: transform 0.1s;
+}
+.play-btn:active {
+  transform: scale(0.95);
+}
+.play-icon {
+  margin-left: 2px; /* Visual center adjustment for play icon */
 }
 
-/* Loading spinner */
-.spinner {
-  width: 18px;
-  height: 18px;
-  border: 2px solid rgba(10, 14, 23, 0.3);
-  border-top-color: #0a0e17;
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
-
-/* ─── Sections ─── */
-.player-section,
-.preview-section,
-.raw-section {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-subtle);
-  border-radius: 14px;
-  padding: 16px;
-}
-
-.section-label {
+.control-volume {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 0.82rem;
-  font-weight: 600;
-  color: var(--text-secondary);
-  margin-bottom: 12px;
+  gap: 12px;
+  width: 200px; /* Fixed width */
+  justify-content: flex-end;
+}
+.vol-icon {
+  color: #888;
+}
+.volume-slider {
+  width: 100px;
+}
+.volume-slider :deep(.n-slider-rail) {
+  background-color: #333;
+}
+.volume-slider :deep(.n-slider-fill) {
+  background-color: #888;
+}
+.volume-slider :deep(.n-slider-thumb) {
+  display: none; /* Hide thumb to match typical sleek video players unless hovered */
+}
+.volume-slider:hover :deep(.n-slider-thumb) {
+  display: block;
+  width: 12px;
+  height: 12px;
+  box-shadow: none;
+  border: 2px solid #fff;
+  background: #fff;
 }
 
-.collapse-label {
+/* ─── Settings Modal ─── */
+.custom-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(2px);
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 0.78rem;
-  font-weight: 600;
-  color: var(--text-muted);
+  justify-content: center;
+  z-index: 1000;
 }
-
-.raw-viewer {
-  margin-top: 8px;
-  padding: 12px;
-  background: var(--bg-base);
-  border-radius: 8px;
+.custom-modal {
+  width: 480px;
+  background: #1c1c1c;
+  border: 1px solid #333;
+  border-radius: 10px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
 }
-
-/* ─── Transitions ─── */
-.slide-up-enter-active { transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
-.slide-up-enter-from { opacity: 0; transform: translateY(12px); }
-
-.scale-in-enter-active { transition: all 0.45s cubic-bezier(0.16, 1, 0.3, 1); }
-.scale-in-enter-from { opacity: 0; transform: scale(0.97) translateY(6px); }
-
-/* ─── Footer ─── */
-.app-footer {
-  margin-top: 48px;
-  padding-bottom: 20px;
-  text-align: center;
+.custom-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+  border-bottom: 1px solid #2a2a2a;
 }
-.footer-divider {
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--border-subtle), transparent);
-  margin-bottom: 20px;
+.custom-modal-header h3 {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 500;
+  color: #eee;
 }
-.app-footer p {
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  font-weight: 400;
-  letter-spacing: 0.01em;
+.custom-modal-body {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.setting-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.setting-item.col {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+.setting-label {
+  font-size: 0.95rem;
+  color: #ddd;
+}
+.path-picker {
+  display: flex;
+  width: 100%;
+  gap: 10px;
+  align-items: center;
+}
+.small-btn {
+  padding: 0 14px;
+  height: 34px;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 </style>

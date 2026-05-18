@@ -10,11 +10,16 @@
       "all": false,
       "shell": {
         "all": false,
-        "open": true
+        "open": ".*"
       },
       "fs": {
         "readFile": true,
+        "writeFile": true,
         "scope": ["**"]
+      },
+      "dialog": {
+        "save": true,
+        "open": true
       },
       "protocol": {
         "asset": true,
@@ -47,7 +52,7 @@
       },
       "resources": [
         "../../backend",
-        "../../sensevoice-small"
+        "../../models"
       ],
       "shortDescription": "时语 - 本地 AI 字幕助手",
       "targets": "all",
@@ -66,13 +71,13 @@
     "windows": [
       {
         "fullscreen": false,
-        "height": 700,
+        "height": 800,
         "resizable": true,
         "title": "时语 Shiyu",
-        "width": 900,
+        "width": 1200,
         "center": true,
-        "minWidth": 700,
-        "minHeight": 500,
+        "minWidth": 1000,
+        "minHeight": 650,
         "fileDropEnabled": true
       }
     ]

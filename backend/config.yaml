@@ -1,14 +1,14 @@
 # Subtitle Assistant Configuration
 # Model paths (relative to backend/ or absolute)
 model:
-  onnx_path: "../sensevoice-small/model.onnx"
-  tokens_path: "../sensevoice-small/tokens.json"
-  config_path: "../sensevoice-small/config.yaml"
-  # Note: paths resolved relative to backend/ -> ../sensevoice-small = <project_root>/sensevoice-small
+  onnx_path: "../models/sensevoice-small/model.onnx"
+  tokens_path: "../models/sensevoice-small/tokens.json"
+  config_path: "../models/sensevoice-small/config.yaml"
+  # Note: paths resolved relative to backend/ -> ../models/sensevoice-small = <project_root>/models/sensevoice-small
 
 # Audio preprocessing
 audio:
-  cmvn_file: "../sensevoice-small/am.mvn"
+  cmvn_file: "../models/sensevoice-small/am.mvn"
   sample_rate: 16000
   n_mels: 80
   frame_length: 25      # ms

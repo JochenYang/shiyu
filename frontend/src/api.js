@@ -14,6 +14,14 @@ export async function healthCheck() {
 }
 
 /**
+ * Command backend to open logs folder
+ */
+export async function openLogFolder() {
+  const res = await fetch(`${API_BASE}/logs/open`);
+  return res.json();
+}
+
+/**
  * Transcribe file and get subtitle content.
  * @param {File} file - Audio or video file
  * @param {Object} options - { language, output_format, max_line_length, max_line_count }
@@ -24,6 +32,7 @@ export async function transcribeFile(file, options = {}) {
   formData.append("file", file);
   formData.append("language", options.language || "auto");
   formData.append("output_format", options.output_format || "srt");
+  formData.append("glossary", options.glossary || "{}");
 
   const res = await fetch(`${API_BASE}/transcribe`, {
     method: "POST",
@@ -47,6 +56,11 @@ export async function transcribeJson(file, language = "auto") {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("language", language);
+  if (arguments.length > 2 && arguments[2]) {
+      formData.append("glossary", arguments[2]);
+  } else {
+      formData.append("glossary", "{}");
+  }
 
   const res = await fetch(`${API_BASE}/transcribe/json`, {
     method: "POST",
@@ -72,6 +86,7 @@ export async function transcribeLocal(filePath, options = {}) {
   formData.append("path", filePath);
   formData.append("language", options.language || "auto");
   formData.append("output_format", options.output_format || "srt");
+  formData.append("glossary", options.glossary || "{}");
 
   const res = await fetch(`${API_BASE}/transcribe/local`, {
     method: "POST",

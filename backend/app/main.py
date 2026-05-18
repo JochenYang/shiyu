@@ -79,15 +79,38 @@ class TranscribeRequest(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {"status": "ok", "model_loaded": engine is not None}
+    import os
+    log_dir = os.environ.get("SHIYU_LOG_DIR", "")
+    return {"status": "ok", "model_loaded": engine is not None, "log_dir": log_dir}
+
+
+@app.get("/logs/open")
+async def open_logs_folder():
+    import os
+    import sys
+    log_dir = os.environ.get("SHIYU_LOG_DIR", "")
+    if log_dir and os.path.exists(log_dir):
+        try:
+            if os.name == 'nt':
+                os.startfile(log_dir)
+            elif sys.platform == 'darwin':
+                import subprocess
+                subprocess.Popen(['open', log_dir])
+            else:
+                import subprocess
+                subprocess.Popen(['xdg-open', log_dir])
+            return {"status": "ok"}
+        except Exception as e:
+            return {"status": "error", "msg": str(e)}
+    return {"status": "error", "msg": "Directory not found"}
 
 
 @app.post("/transcribe")
 async def transcribe_file(
     file: UploadFile = File(...),
     language: str = Form("auto"),
-    output_format: str = Form("srt")
+    output_format: str = Form("srt"),
+    glossary: str = Form("{}")
 ):
     """Transcribe audio/video file and return subtitle content.
 
@@ -120,11 +143,9 @@ async def transcribe_file(
         video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"}
         is_video = tmp_path.suffix.lower() in video_exts
         
-        # Preprocess audio
+        # Preprocess and load audio
         audio_cfg = config["audio"]
-        features = preprocess_audio(str(tmp_path), is_video=is_video, config=audio_cfg)
         
-        # Get audio duration for timestamp estimation
         import librosa
         if is_video:
             from app.core.audio_processor import extract_audio_from_video
@@ -135,11 +156,20 @@ async def transcribe_file(
         waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
         duration_sec = len(waveform) / sr
         
-        # Run inference
-        segments_raw = engine.transcribe_with_timestamps(
-            features, 
-            audio_duration_sec=duration_sec,
-            language=language
+        import json
+        try:
+            custom_glossary = json.loads(glossary)
+        except:
+            custom_glossary = {}
+
+        # Run inference with VAD chunking
+        segments_raw = engine.transcribe_waveform_with_vad(
+            waveform=waveform,
+            sample_rate=sr,
+            audio_cfg=audio_cfg,
+            duration_sec=duration_sec,
+            language=language,
+            custom_glossary=custom_glossary
         )
         
         # Convert to subtitle segments
@@ -166,7 +196,8 @@ async def transcribe_file(
 @app.post("/transcribe/json")
 async def transcribe_json(
     file: UploadFile = File(...),
-    language: str = Form("auto")
+    language: str = Form("auto"),
+    glossary: str = Form("{}")
 ):
     """Transcribe and return raw JSON with segments."""
     if engine is None:
@@ -184,7 +215,6 @@ async def transcribe_json(
         is_video = tmp_path.suffix.lower() in video_exts
         
         audio_cfg = config["audio"]
-        features = preprocess_audio(str(tmp_path), is_video=is_video, config=audio_cfg)
         
         import librosa
         if is_video:
@@ -196,8 +226,19 @@ async def transcribe_json(
         waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
         duration_sec = len(waveform) / sr
         
-        segments = engine.transcribe_with_timestamps(
-            features, duration_sec, language
+        import json
+        try:
+            custom_glossary = json.loads(glossary)
+        except:
+            custom_glossary = {}
+            
+        segments = engine.transcribe_waveform_with_vad(
+            waveform=waveform,
+            sample_rate=sr,
+            audio_cfg=audio_cfg,
+            duration_sec=duration_sec,
+            language=language,
+            custom_glossary=custom_glossary
         )
         
         return {
@@ -218,7 +259,8 @@ async def transcribe_json(
 async def transcribe_local(
     path: str = Form(...),
     language: str = Form("auto"),
-    output_format: str = Form("srt")
+    output_format: str = Form("srt"),
+    glossary: str = Form("{}")
 ):
     """Transcribe a local file by path (for Tauri drag-drop, no upload needed).
 
@@ -246,8 +288,7 @@ async def transcribe_local(
         is_video = file_path.suffix.lower() in video_exts
 
         audio_cfg = config["audio"]
-        features = preprocess_audio(str(file_path), is_video=is_video, config=audio_cfg)
-
+        
         import librosa
         if is_video:
             from app.core.audio_processor import extract_audio_from_video
@@ -258,9 +299,20 @@ async def transcribe_local(
         waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
         duration_sec = len(waveform) / sr
 
-        # Run inference once, get both segments and formatted content
-        segments_raw = engine.transcribe_with_timestamps(
-            features, duration_sec, language
+        import json
+        try:
+            custom_glossary = json.loads(glossary)
+        except:
+            custom_glossary = {}
+
+        # Run inference once, get both segments and formatted content using VAD
+        segments_raw = engine.transcribe_waveform_with_vad(
+            waveform=waveform,
+            sample_rate=sr,
+            audio_cfg=audio_cfg,
+            duration_sec=duration_sec,
+            language=language,
+            custom_glossary=custom_glossary
         )
         segments = segments_from_transcription(segments_raw)
 

@@ -9,8 +9,26 @@
 </template>
 
 <script setup>
+import { onMounted, onBeforeUnmount } from "vue";
 import { NConfigProvider, NMessageProvider, darkTheme } from "naive-ui";
 import AppContent from "./components/AppContent.vue";
+
+// 屏蔽全局默认右键菜单（输入框除外），增强应用原生感
+function preventContextMenu(e) {
+  const target = e.target;
+  const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
+  if (!isInput) {
+    e.preventDefault();
+  }
+}
+
+onMounted(() => {
+  document.addEventListener('contextmenu', preventContextMenu);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener('contextmenu', preventContextMenu);
+});
 
 /**
  * Shiyu Design System Tokens
@@ -19,36 +37,36 @@ import AppContent from "./components/AppContent.vue";
  */
 const themeOverrides = {
   common: {
-    primaryColor: "#f59e0b",
-    primaryColorHover: "#fbbf24",
-    primaryColorPressed: "#d97706",
-    primaryColorSuppl: "#f59e0b",
+    primaryColor: "#1fbc5b",
+    primaryColorHover: "#1db155",
+    primaryColorPressed: "#189447",
+    primaryColorSuppl: "#1fbc5b",
     
-    textColor1: "#f0f4f8",
-    textColor2: "#94a3b8",
-    textColor3: "#64748b",
+    textColor1: "#e0e0e0",
+    textColor2: "#a0a0a0",
+    textColor3: "#666666",
     
-    bodyColor: "#0a0e17",
-    cardColor: "#0f1520",
-    modalColor: "#0f1520",
-    popoverColor: "#0f1520",
+    bodyColor: "#111111",
+    cardColor: "#1c1c1c",
+    modalColor: "#1c1c1c",
+    popoverColor: "#1c1c1c",
     
-    borderRadius: "12px",
+    borderRadius: "8px",
     fontFamily: '"Outfit", "PingFang SC", "Microsoft YaHei", sans-serif',
   },
   Card: {
-    borderRadius: "16px",
-    color: "rgba(15, 21, 32, 0.6)",
-    borderColor: "rgba(51, 65, 85, 0.25)",
+    borderRadius: "12px",
+    color: "#1c1c1c",
+    borderColor: "rgba(255, 255, 255, 0.1)",
   },
   Button: {
-    borderRadiusMedium: "10px",
-    fontWeight: "600",
+    borderRadiusMedium: "6px",
+    fontWeight: "500",
   },
   Input: {
-    borderRadius: "10px",
-    color: "rgba(10, 14, 23, 0.6)",
-    colorFocus: "rgba(10, 14, 23, 0.8)",
+    borderRadius: "6px",
+    color: "#111111",
+    colorFocus: "#1c1c1c",
   },
 };
 </script>
@@ -59,18 +77,15 @@ const themeOverrides = {
 :root {
   color-scheme: dark;
   /* Design tokens */
-  --bg-base: #0a0e17;
-  --bg-surface: #0f1520;
-  --bg-elevated: #141c2b;
-  --border-subtle: rgba(51, 65, 85, 0.25);
-  --border-medium: rgba(71, 85, 105, 0.35);
-  --accent-amber: #f59e0b;
-  --accent-amber-glow: rgba(245, 158, 11, 0.15);
-  --accent-teal: #14b8a6;
-  --accent-teal-glow: rgba(20, 184, 166, 0.12);
-  --text-primary: #f0f4f8;
-  --text-secondary: #94a3b8;
-  --text-muted: #475569;
+  --bg-base: #111111;
+  --bg-surface: #1c1c1c;
+  --bg-elevated: #242424;
+  --border-subtle: rgba(255, 255, 255, 0.1);
+  --border-medium: rgba(255, 255, 255, 0.2);
+  --accent-green: #1fbc5b;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0a0;
+  --text-muted: #666666;
 }
 
 html, body, #app {
@@ -103,11 +118,9 @@ html, body, #app {
   background: rgba(148, 163, 184, 0.25);
 }
 
-/* Clean layout with subtle ambient gradients */
+/* Clean layout */
 .shiyu-layout {
-  background:
-    radial-gradient(ellipse at 20% 0%, rgba(245, 158, 11, 0.04) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 100%, rgba(20, 184, 166, 0.03) 0%, transparent 40%);
+  background: var(--bg-base);
   min-height: 100vh;
 }
 
