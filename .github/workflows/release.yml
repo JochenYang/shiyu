@@ -111,6 +111,15 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install -r requirements.txt
 
+      # --- Get commit message for release body ---
+      - name: Get tag commit message
+        id: tag_message
+        shell: bash
+        run: |
+          echo "message<<EOF" >> "$GITHUB_OUTPUT"
+          git log -1 --format=%s
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
       # --- Build & Release Tauri App (All platforms) ---
       - name: Build & Publish Tauri Release
         uses: tauri-apps/tauri-action@v0
@@ -118,8 +127,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
-          releaseName: "时语字幕助手 v__VERSION__"
-          releaseBody: "时语 Shiyu 本地 AI 字幕助手三端完美发布版！"
+          releaseName: "时语 Shiyu v__VERSION__"
+          releaseBody: ${{ steps.tag_message.outputs.message }}
           releaseDraft: true
           prerelease: false
           projectPath: "./frontend"
