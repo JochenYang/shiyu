@@ -59,11 +59,14 @@
         "resources/models"
       ],
       "shortDescription": "时语 - 本地 AI 字幕助手",
-      "targets": "all",
+      "targets": ["nsis", "dmg"],
       "windows": {
         "certificateThumbprint": null,
         "digestAlgorithm": "sha256",
-        "timestampUrl": ""
+        "timestampUrl": "",
+        "nsis": {
+          "installMode": "currentUser"
+        }
       }
     },
     "security": {
