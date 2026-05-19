@@ -118,7 +118,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
-          releaseName: "时语 Shiyu v__VERSION__"
+          releaseName: "时语字幕助手 v__VERSION__"
           releaseBody: "时语 Shiyu 本地 AI 字幕助手三端完美发布版！"
           releaseDraft: true
           prerelease: false
