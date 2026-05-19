@@ -21,11 +21,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          lfs: true
-
-      - name: Pull Git LFS files
-        run: git lfs pull
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -51,6 +46,15 @@ jobs:
       - name: Install Node dependencies
         run: npm install
         working-directory: ./frontend
+
+      # --- Download SenseVoice-Small Model ---
+      - name: Download ONNX model
+        shell: bash
+        run: |
+          mkdir -p models/sensevoice-small
+          echo "Downloading SenseVoice-Small model (~230 MB)..."
+          curl -L -o models/sensevoice-small/model.onnx \
+            "https://huggingface.co/SenseVoiceSmall/model-onnx/resolve/main/model.onnx"
 
       # --- Prepare Resources: Windows ---
       - name: Clean & Copy resources (Windows)

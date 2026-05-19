@@ -77,7 +77,16 @@ graph TD
    ```bash
    pip install -r requirements.txt
    ```
-4. 请确保 `models/sensevoice-small/` 目录下已放置 `model.onnx` 模型文件。
+4. 下载 SenseVoice-Small 模型文件（约 230MB），放入 `models/sensevoice-small/` 目录：
+   ```bash
+   # 从 HuggingFace 下载
+   huggingface-cli download SenseVoiceSmall/model-onnx --local-dir models/sensevoice-small/
+   
+   # 或直接下载 ONNX 模型文件
+   # 下载地址: https://huggingface.co/SenseVoiceSmall/model-onnx/resolve/main/model.onnx
+   # 保存至: models/sensevoice-small/model.onnx
+   ```
+   > ⚠️ 模型文件较大（约 230MB），未包含在 Git 仓库中，需手动下载。
 
 #### 2. 初始化前端并启动开发服务
 1. 进入前端目录：
@@ -104,7 +113,7 @@ graph TD
    git tag v1.0.0
    git push origin v1.0.0
    ```
-3. GitHub 虚拟机将自动下载 Git LFS 托管的模型文件，分别在原生系统下构建，并在 Releases 中自动生成各平台的草稿包！
+3. GitHub 虚拟机将自动从 HuggingFace 下载模型文件，分别在原生系统下构建，并在 Releases 中自动生成各平台的草稿包！
 
 ---
 

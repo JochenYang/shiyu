@@ -76,7 +76,16 @@ graph TD
    ```bash
    pip install -r requirements.txt
    ```
-4. Verify the model directory exists at `models/sensevoice-small/` containing `model.onnx`.
+4. Download the SenseVoice-Small model (~230 MB) and place it in `models/sensevoice-small/`:
+   ```bash
+   # From HuggingFace
+   huggingface-cli download SenseVoiceSmall/model-onnx --local-dir models/sensevoice-small/
+   
+   # Or download the ONNX model directly:
+   # Download URL: https://huggingface.co/SenseVoiceSmall/model-onnx/resolve/main/model.onnx
+   # Save to: models/sensevoice-small/model.onnx
+   ```
+   > ⚠️ The model file is ~230 MB and is not included in the Git repository — download it separately.
 
 #### 2. Setup Frontend & Run Dev
 1. Navigate to the frontend directory:
@@ -105,7 +114,7 @@ To compile and package installers for Windows (.msi/.exe), macOS (.dmg), and Lin
    git tag v1.0.0
    git push origin v1.0.0
    ```
-3. The runner will download Git LFS models, compile Rust code, bundle native Python environments, and publish draft installers to your GitHub Releases.
+3. The runner will download the model from HuggingFace, compile Rust code, bundle native Python environments, and publish draft installers to your GitHub Releases.
 
 ---
 
