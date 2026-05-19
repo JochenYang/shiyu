@@ -1308,7 +1308,7 @@ function fmtTimeSrt(sec) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 30px;
+  padding: 0 48px; /* Increased padding from 30px to 48px for a more spacious, elegant look */
   flex-shrink: 0;
   position: relative;
 }
@@ -1372,7 +1372,10 @@ function fmtTimeSrt(sec) {
   font-family: monospace;
   font-size: 0.85rem;
   color: #888;
-  width: 200px; /* Fixed width to balance flex */
+  flex: 1; /* Allow left side to flex and balance the right side */
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
 }
 
 .control-center {
