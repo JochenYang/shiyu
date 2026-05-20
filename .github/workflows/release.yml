@@ -89,6 +89,44 @@ jobs:
           fi
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      # --- Clean any existing release for this version before uploading ---
+      - name: Clean existing release (Unix)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(jq -r '.package.version' frontend/src-tauri/tauri.conf.json)
+          RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v$VERSION" \
+            | jq -r '.id // empty')
+          if [ -n "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ]; then
+            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID"
+            echo "Deleted existing release $RELEASE_ID for v$VERSION"
+          else
+            echo "No existing release to delete"
+          fi
+
+      - name: Clean existing release (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $config = Get-Content frontend\src-tauri\tauri.conf.json | ConvertFrom-Json
+          $version = $config.package.version
+          $headers = @{ Authorization = "token $env:GITHUB_TOKEN" }
+          try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/v$version" -Headers $headers
+            if ($release.id) {
+              Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/${{ github.repository }}/releases/$($release.id)" -Headers $headers
+              Write-Output "Deleted existing release $($release.id) for v$version"
+            }
+          } catch {
+            Write-Output "No existing release to delete ($($_.Exception.Message))"
+          }
+
       # --- Build & Release Tauri App (All platforms) ---
       - name: Build & Publish Tauri Release
         uses: tauri-apps/tauri-action@v0.6.2
