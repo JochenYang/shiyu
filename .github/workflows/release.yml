@@ -42,55 +42,38 @@ jobs:
         run: npm install
         working-directory: ./frontend
 
-      # --- Prepare Resources: Windows ---
-      - name: Clean & Copy resources (Windows)
+      # --- Install Python deps + PyInstaller for backend build ---
+      - name: Install Python deps for PyInstaller
+        shell: bash
+        run: |
+          pip install -r backend/requirements.txt
+          pip install pyinstaller
+
+      # --- Build PyInstaller executable (same command on all platforms) ---
+      - name: Build backend executable with PyInstaller
+        working-directory: ./backend
+        run: python build.py
+
+      # --- Copy backend resources for Tauri: Windows ---
+      - name: Copy backend resources (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          # Remove existing junctions or files if present
+          # Remove existing if present
           if (Test-Path frontend/src-tauri/resources/backend) { Remove-Item -Path frontend/src-tauri/resources/backend -Recurse -Force }
-          
-          # Create clean directories
           New-Item -ItemType Directory -Force -Path frontend/src-tauri/resources/backend
-          
-          # Copy backend files (excluding venv, logs, __pycache__)
-          Copy-Item -Path backend/* -Destination frontend/src-tauri/resources/backend -Recurse -Force -Exclude "venv", ".venv", "logs", "__pycache__"
+          Copy-Item -Path backend/dist/shiyu-backend.exe -Destination frontend/src-tauri/resources/backend/shiyu-backend.exe
+          Copy-Item -Path backend/config.yaml -Destination frontend/src-tauri/resources/backend/config.yaml
 
-      # --- Prepare Resources: macOS & Linux ---
-      - name: Clean & Copy resources (Unix)
+      # --- Copy backend resources for Tauri: macOS ---
+      - name: Copy backend resources (macOS)
         if: matrix.platform != 'windows-latest'
         shell: bash
         run: |
-          # Remove existing junctions or files if present
           rm -rf frontend/src-tauri/resources/backend
-          
-          # Create clean directories
           mkdir -p frontend/src-tauri/resources/backend
-          
-          # Copy backend files (excluding venv, logs, __pycache__)
-          rsync -av --exclude="venv" --exclude=".venv" --exclude="logs" --exclude="__pycache__" backend/ frontend/src-tauri/resources/backend/
-
-      # --- Build Python Environment inside Tauri resources: Windows ---
-      - name: Build Python Env (Windows)
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: |
-          cd frontend/src-tauri/resources/backend
-          python -m venv venv
-          # Install dependencies inside the packaged venv
-          .\venv\Scripts\pip install --upgrade pip
-          .\venv\Scripts\pip install -r requirements.txt
-
-      # --- Build Python Environment inside Tauri resources: macOS & Linux ---
-      - name: Build Python Env (Unix)
-        if: matrix.platform != 'windows-latest'
-        shell: bash
-        run: |
-          cd frontend/src-tauri/resources/backend
-          python3 -m venv venv
-          # Install dependencies inside the packaged venv
-          ./venv/bin/pip install --upgrade pip
-          ./venv/bin/pip install -r requirements.txt
+          cp backend/dist/shiyu-backend frontend/src-tauri/resources/backend/shiyu-backend
+          cp backend/config.yaml frontend/src-tauri/resources/backend/config.yaml
 
       # --- Generate changelog from all commits since last tag ---
       - name: Generate release changelog

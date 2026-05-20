@@ -8,10 +8,19 @@ Steps:
 """
 import os
 import subprocess
+import sys
 import tempfile
 import numpy as np
 import librosa
 import kaldi_native_fbank as knf
+
+
+def _run_hidden(cmd, **kwargs):
+    """Run subprocess without flashing a console window on Windows."""
+    opts = dict(kwargs)
+    if sys.platform == "win32":
+        opts.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+    subprocess.run(cmd, **opts)
 
 
 def extract_audio_from_video(video_path: str, output_wav: str = None, sample_rate: int = 16000) -> str:
@@ -29,13 +38,13 @@ def extract_audio_from_video(video_path: str, output_wav: str = None, sample_rat
         output_wav
     ]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _run_hidden(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError:
         # Fallback for common WinGet path if not in PATH
         winget_ffmpeg = r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
         if os.path.exists(winget_ffmpeg):
             cmd[0] = winget_ffmpeg
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _run_hidden(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:
             raise
     return output_wav

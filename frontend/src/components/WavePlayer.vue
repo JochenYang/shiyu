@@ -43,6 +43,7 @@ const duration = ref(0);
 const sliderValue = ref(0);
 let ws = null;
 let sliderDragging = false;
+let sliderChangePending = false;
 
 onMounted(() => {
   ws = WaveSurfer.create({
@@ -67,7 +68,10 @@ onMounted(() => {
   });
 
   ws.on("audioprocess", () => {
-    if (!sliderDragging) {
+    // Skip sliderValue updates while a user-initiated seek is pending
+    // to prevent the slider from snapping back to the old position
+    // before the seeking event fires.
+    if (!sliderDragging && !sliderChangePending) {
       currentTime.value = ws.getCurrentTime();
       if (duration.value > 0) {
         sliderValue.value = Math.round((currentTime.value / duration.value) * 1000);
@@ -77,6 +81,8 @@ onMounted(() => {
   });
 
   ws.on("seeking", () => {
+    // Clear pending flag so audioprocess can resume updating sliderValue
+    sliderChangePending = false;
     const t = ws.getCurrentTime();
     currentTime.value = t;
     if (duration.value > 0) {
@@ -109,6 +115,7 @@ function togglePlay() {
 
 function onSliderChange(val) {
   if (ws && duration.value > 0) {
+    sliderChangePending = true;
     const time = (val / 1000) * duration.value;
     ws.seekTo(val / 1000);
     currentTime.value = time;
