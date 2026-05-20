@@ -108,12 +108,12 @@ jobs:
 
       # --- Build & Release Tauri App (All platforms) ---
       - name: Build & Publish Tauri Release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
-          releaseName: "时语 Shiyu v__VERSION__"
+          releaseName: "时语字幕助手 v__VERSION__"
           releaseBody: ${{ steps.changelog.outputs.changelog }}
           releaseDraft: true
           prerelease: false
