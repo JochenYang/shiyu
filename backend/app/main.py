@@ -21,6 +21,7 @@ from app.core.subtitle_formatter import (
     generate_srt, generate_lrc, generate_ass,
     segments_from_transcription, SubtitleSegment
 )
+from app.core.model_downloader import ensure_model, get_download_status, get_model_dir
 
 
 # Global state
@@ -30,27 +31,34 @@ engine = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: load config and model. Shutdown: cleanup."""
+    """Startup: load config and ensure model. Shutdown: cleanup."""
     global config, engine
-    
+
     # Load config
     config_path = os.environ.get("CONFIG_PATH", "config.yaml")
     config = load_config(config_path)
-    
-    # Init ONNX engine
-    model_cfg = config["model"]
-    inference_cfg = config["inference"]
-    engine = SenseVoiceEngine(
-        model_path=model_cfg["onnx_path"],
-        tokens_path=model_cfg["tokens_path"],
-        device=inference_cfg.get("device", "cpu")
-    )
-    
-    print(f"[SubtitleAssistant] Model loaded: {model_cfg['onnx_path']}")
+
+    # Start model download check (non-blocking, runs in background if needed)
+    model_status = ensure_model()
+    print(f"[SubtitleAssistant] Model status: {model_status['status']}")
+
+    # If model is already available, init ONNX engine immediately
+    if model_status["status"] == "ready":
+        inference_cfg = config["inference"]
+        engine = SenseVoiceEngine(
+            model_path=config["model"]["onnx_path"],
+            tokens_path=config["model"]["tokens_path"],
+            device=inference_cfg.get("device", "cpu")
+        )
+        print(f"[SubtitleAssistant] Model loaded: {config['model']['onnx_path']}")
+    else:
+        engine = None
+        print(f"[SubtitleAssistant] Model not ready yet: {model_status['status']}")
+
     print(f"[SubtitleAssistant] Server ready at http://{config['server']['host']}:{config['server']['port']}")
-    
+
     yield
-    
+
     # Cleanup
     print("[SubtitleAssistant] Shutting down...")
 
@@ -79,9 +87,49 @@ class TranscribeRequest(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    import os
     log_dir = os.environ.get("SHIYU_LOG_DIR", "")
-    return {"status": "ok", "model_loaded": engine is not None, "log_dir": log_dir}
+    model_ready = engine is not None
+    return {
+        "status": "ok",
+        "model_loaded": model_ready,
+        "log_dir": log_dir,
+        "model_status": "ready" if model_ready else get_download_status().get("status", "unknown"),
+    }
+
+
+@app.get("/model/status")
+async def model_status():
+    """Get model download/loading status. Auto-load engine when download completes."""
+    global engine
+    download_status = get_download_status()
+
+    # Auto-initialize engine when model becomes ready after background download
+    if engine is None and download_status["status"] == "ready":
+        try:
+            inference_cfg = config["inference"]
+            engine = SenseVoiceEngine(
+                model_path=config["model"]["onnx_path"],
+                tokens_path=config["model"]["tokens_path"],
+                device=inference_cfg.get("device", "cpu")
+            )
+            print(f"[SubtitleAssistant] Model loaded after download: {config['model']['onnx_path']}")
+        except Exception as e:
+            print(f"[SubtitleAssistant] Failed to load model after download: {e}")
+            download_status["status"] = "error"
+            download_status["error"] = str(e)
+
+    engine_ready = engine is not None
+    model_path = get_model_dir() / "model.onnx"
+    model_size = model_path.stat().st_size if model_path.exists() else 0
+
+    return {
+        "status": download_status["status"],
+        "progress": download_status["progress"],
+        "error": download_status.get("error", ""),
+        "engine_loaded": engine_ready,
+        "model_path": str(model_path),
+        "model_size_mb": round(model_size / (1024 * 1024), 1),
+    }
 
 
 @app.get("/logs/open")
@@ -105,6 +153,36 @@ async def open_logs_folder():
     return {"status": "error", "msg": "Directory not found"}
 
 
+@app.post("/model/download")
+async def trigger_model_download():
+    """Trigger or retry model download. Resets error state and starts fresh download."""
+    global engine
+    status = ensure_model()
+    return status
+
+
+@app.get("/model/open")
+async def open_model_folder():
+    """Open the model directory in file explorer."""
+    import os
+    import sys
+    model_dir = get_model_dir()
+    if model_dir.exists():
+        try:
+            if os.name == 'nt':
+                os.startfile(str(model_dir))
+            elif sys.platform == 'darwin':
+                import subprocess
+                subprocess.Popen(['open', str(model_dir)])
+            else:
+                import subprocess
+                subprocess.Popen(['xdg-open', str(model_dir)])
+            return {"status": "ok"}
+        except Exception as e:
+            return {"status": "error", "msg": str(e)}
+    return {"status": "error", "msg": "Model directory not found"}
+
+
 @app.post("/transcribe")
 async def transcribe_file(
     file: UploadFile = File(...),
@@ -124,38 +202,38 @@ async def transcribe_file(
     """
     if engine is None:
         raise HTTPException(503, "Model not loaded")
-    
+
     # Validate format
     fmt = output_format.lower()
     if fmt not in ("srt", "lrc", "ass"):
         raise HTTPException(400, f"Unsupported format: {output_format}")
-    
+
     # Save uploaded file to temp
     suffix = Path(file.filename).suffix or ".tmp"
     tmp_dir = tempfile.mkdtemp()
     tmp_path = Path(tmp_dir) / f"input{suffix}"
-    
+
     try:
         with open(tmp_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        
+
         # Check if video
         video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"}
         is_video = tmp_path.suffix.lower() in video_exts
-        
+
         # Preprocess and load audio
         audio_cfg = config["audio"]
-        
+
         import librosa
         if is_video:
             from app.core.audio_processor import extract_audio_from_video
             audio_path = extract_audio_from_video(str(tmp_path))
         else:
             audio_path = str(tmp_path)
-        
+
         waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
         duration_sec = len(waveform) / sr
-        
+
         import json
         try:
             custom_glossary = json.loads(glossary)
@@ -171,10 +249,10 @@ async def transcribe_file(
             language=language,
             custom_glossary=custom_glossary
         )
-        
+
         # Convert to subtitle segments
         segments = segments_from_transcription(segments_raw)
-        
+
         # Generate subtitle
         if fmt == "srt":
             content = generate_srt(segments)
@@ -182,12 +260,12 @@ async def transcribe_file(
             content = generate_lrc(segments)
         else:  # ass
             content = generate_ass(segments, title=file.filename)
-        
+
         return PlainTextResponse(content)
-    
+
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
-    
+
     finally:
         # Cleanup temp files
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -202,36 +280,36 @@ async def transcribe_json(
     """Transcribe and return raw JSON with segments."""
     if engine is None:
         raise HTTPException(503, "Model not loaded")
-    
+
     suffix = Path(file.filename).suffix or ".tmp"
     tmp_dir = tempfile.mkdtemp()
     tmp_path = Path(tmp_dir) / f"input{suffix}"
-    
+
     try:
         with open(tmp_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        
+
         video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"}
         is_video = tmp_path.suffix.lower() in video_exts
-        
+
         audio_cfg = config["audio"]
-        
+
         import librosa
         if is_video:
             from app.core.audio_processor import extract_audio_from_video
             audio_path = extract_audio_from_video(str(tmp_path))
         else:
             audio_path = str(tmp_path)
-        
+
         waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
         duration_sec = len(waveform) / sr
-        
+
         import json
         try:
             custom_glossary = json.loads(glossary)
         except:
             custom_glossary = {}
-            
+
         segments = engine.transcribe_waveform_with_vad(
             waveform=waveform,
             sample_rate=sr,
@@ -240,17 +318,17 @@ async def transcribe_json(
             language=language,
             custom_glossary=custom_glossary
         )
-        
+
         return {
             "filename": file.filename,
             "language": language,
             "duration": duration_sec,
             "segments": segments
         }
-    
+
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
-    
+
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -288,7 +366,7 @@ async def transcribe_local(
         is_video = file_path.suffix.lower() in video_exts
 
         audio_cfg = config["audio"]
-        
+
         import librosa
         if is_video:
             from app.core.audio_processor import extract_audio_from_video
@@ -333,6 +411,28 @@ async def transcribe_local(
 
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
+
+
+@app.post("/settings/log-level")
+async def set_log_level(level: str = Form("info")):
+    """Change backend log level dynamically at runtime."""
+    import logging
+    level_map = {
+        "debug": logging.DEBUG,
+        "info": logging.INFO,
+        "warning": logging.WARNING,
+        "error": logging.ERROR,
+    }
+    lvl = level_map.get(level.lower())
+    if lvl is None:
+        raise HTTPException(400, f"Unsupported log level: {level}")
+    
+    # Set root logger and all uvicorn loggers
+    logging.getLogger().setLevel(lvl)
+    for name in ["uvicorn", "uvicorn.access", "uvicorn.error"]:
+        logging.getLogger(name).setLevel(lvl)
+    
+    return {"status": "ok", "level": level}
 
 
 if __name__ == "__main__":

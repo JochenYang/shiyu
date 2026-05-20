@@ -114,3 +114,43 @@ export function downloadText(content, filename) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+/**
+ * Get model download/loading status.
+ * @returns {Promise<Object>} { status, progress, error, engine_loaded, model_path, model_size_mb }
+ */
+export async function getModelStatus() {
+  const res = await fetch(`${API_BASE}/model/status`);
+  return res.json();
+}
+
+/**
+ * Trigger or retry model download. Resets error and starts fresh download.
+ * @returns {Promise<Object>} { status, progress, error }
+ */
+export async function restartModelDownload() {
+  const res = await fetch(`${API_BASE}/model/download`, { method: "POST" });
+  return res.json();
+}
+
+/**
+ * Open model folder in file explorer.
+ */
+export async function openModelFolder() {
+  const res = await fetch(`${API_BASE}/model/open`);
+  return res.json();
+}
+
+/**
+ * Change backend log level dynamically.
+ * @param {string} level - "debug" | "info" | "warning" | "error"
+ */
+export async function setLogLevel(level) {
+  const formData = new FormData();
+  formData.append("level", level);
+  const res = await fetch(`${API_BASE}/settings/log-level`, {
+    method: "POST",
+    body: formData,
+  });
+  return res.json();
+}

@@ -76,20 +76,29 @@ def _split_long_lines(text: str, max_length: int = 40, max_lines: int = 2) -> st
     return "\\N".join(lines)
 
 
-def generate_srt(segments: List[SubtitleSegment]) -> str:
+def generate_srt(segments: List[SubtitleSegment],
+                 max_line_length: int = 40,
+                 max_line_count: int = 2) -> str:
     """Generate SRT format subtitle.
 
-    Each segment is one short sentence (already split by engine),
-    no further line splitting needed.
+    Splits long lines for readability when a segment exceeds max_line_length.
+
+    Args:
+        segments: List of subtitle segments
+        max_line_length: Max chars per line (40 default)
+        max_line_count: Max lines per subtitle event (2 default)
 
     Returns:
         SRT formatted string
     """
     lines = []
     for i, seg in enumerate(segments, 1):
+        text = seg.text
+        if len(text) > max_line_length:
+            text = _split_long_lines(text, max_line_length, max_line_count)
         lines.append(str(i))
         lines.append(f"{_format_srt_time(seg.start)} --> {_format_srt_time(seg.end)}")
-        lines.append(seg.text)
+        lines.append(text)
         lines.append("")
     return "\n".join(lines)
 
@@ -144,11 +153,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def segments_from_transcription(segments_raw: List[Dict],
-                                 merge_gap: float = 0.0) -> List[SubtitleSegment]:
+                                 merge_gap: float = 0.5) -> List[SubtitleSegment]:
     """Convert raw transcription segments to SubtitleSegment objects.
 
-    merge_gap defaults to 0 (no merging) because the engine already
-    splits text into short sentence-level segments.
+    merge_gap=0.5 re-joins nearby short segments into natural subtitle
+    events (especially important for mixed Chinese-English speech where
+    CTC splitting can be too granular).
     """
     result = []
     for seg in segments_raw:

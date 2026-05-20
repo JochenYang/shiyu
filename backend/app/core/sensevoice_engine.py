@@ -324,7 +324,7 @@ class SenseVoiceEngine:
         """
         # Level 1: Sentence boundary split
         if is_cjk:
-            parts = re.split(r"([。！？；!?;])", text)
+            parts = re.split(r"([。！？；!?;.])", text)
         else:
             # For English: split at sentence-ending punctuation followed by space
             parts = re.split(r"([.!?;](?:\s|$))", text)

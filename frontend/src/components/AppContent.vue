@@ -333,23 +333,89 @@
               :autosize="{ minRows: 3, maxRows: 6 }"
             />
           </div>
+          <!-- 模型状态 -->
+          <div class="setting-item col">
+            <div class="setting-label">语音模型</div>
+            <div class="model-status-row">
+              <span class="model-status-dot" :class="modelInfoClass"></span>
+              <span class="model-status-text">{{ modelInfoText }}</span>
+            </div>
+            <div class="path-picker" v-if="modelPath">
+              <n-input
+                v-model:value="modelPath"
+                placeholder="模型路径"
+                readonly
+              />
+              <button class="secondary-btn small-btn" @click="openModelDir">
+                打开文件夹
+              </button>
+            </div>
+          </div>
           <div class="setting-item">
             <div class="setting-label">排错日志</div>
             <button class="secondary-btn small-btn" @click="openLogDir">
               打开日志文件夹
             </button>
           </div>
+          <div class="setting-item">
+            <div class="setting-label">日志级别</div>
+            <select class="log-level-select" v-model="appSettings.logLevel" @change="onLogLevelChange">
+              <option value="debug">DEBUG</option>
+              <option value="info">INFO</option>
+              <option value="warning">WARNING</option>
+              <option value="error">ERROR</option>
+            </select>
+          </div>
           <div class="copyright-info">
-            © 2026 时语 Shiyu Subtitle v1.0.0. All rights reserved.
+            © 2026 时语 Shiyu Subtitle v1.1.0. All rights reserved.
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模型下载遮罩层 -->
+  <div class="download-overlay" v-if="modelStatus !== 'ready'">
+    <div class="download-card">
+      <div class="download-title">时语 Shiyu</div>
+      <div class="download-subtitle">本地 AI 字幕助手</div>
+
+      <div class="download-progress-area" v-if="modelStatus === 'downloading'">
+        <div class="download-progress-ring">
+          <svg width="80" height="80" viewBox="0 0 80 80">
+            <circle cx="40" cy="40" r="36" fill="none" stroke="#2a2a2a" stroke-width="6" />
+            <circle cx="40" cy="40" r="36" fill="none" stroke="#1fbc5b" stroke-width="6"
+              stroke-dasharray="226.2" :stroke-dashoffset="226.2 - 226.2 * modelProgress / 100"
+              stroke-linecap="round" transform="rotate(-90 40 40)" style="transition: stroke-dashoffset 0.3s" />
+          </svg>
+          <span class="download-progress-text">{{ modelProgress }}%</span>
+        </div>
+        <div class="download-info">正在下载语音模型 ({{ modelSizeStr }})</div>
+        <div class="download-subinfo">首次启动需要下载约 230MB，请耐心等待</div>
+      </div>
+
+      <div class="download-progress-area" v-else-if="modelStatus === 'loading'">
+        <div class="spinner"></div>
+        <div class="download-info">正在加载模型中...</div>
+      </div>
+
+      <div class="download-progress-area" v-else-if="modelStatus === 'error'">
+        <div class="download-error-icon">⚠️</div>
+        <div class="download-info">模型下载失败</div>
+        <div class="download-error-msg">{{ modelError }}</div>
+        <button class="primary-btn retry-btn" @click="retryDownload">重新下载</button>
+      </div>
+
+      <div class="download-progress-area" v-else-if="modelStatus === 'idle'">
+        <div class="spinner"></div>
+        <div class="download-info">正在检查模型...</div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from "vue";
 import {
   NUpload,
   NUploadDragger,
@@ -382,6 +448,10 @@ import {
   transcribeLocal,
   downloadText,
   openLogFolder,
+  getModelStatus,
+  restartModelDownload,
+  openModelFolder,
+  setLogLevel,
 } from "../api.js";
 
 const message = useMessage();
@@ -393,6 +463,35 @@ const audioUrl = ref(null);
 const isVideo = ref(false);
 const isProcessing = ref(false);
 const backendOnline = ref(false);
+
+// Model download state
+const modelStatus = ref("idle"); // idle, downloading, loading, ready, error
+const modelProgress = ref(0);
+const modelError = ref("");
+const modelSizeStr = ref("230 MB");
+const modelPath = ref("");
+let modelPollTimer = null;
+
+// Computed model info for settings panel
+const modelInfoClass = computed(() => {
+  switch (modelStatus.value) {
+    case "ready": return "dot-green";
+    case "downloading":
+    case "loading": return "dot-yellow";
+    case "error": return "dot-red";
+    default: return "dot-gray";
+  }
+});
+const modelInfoText = computed(() => {
+  switch (modelStatus.value) {
+    case "ready": return "模型就绪";
+    case "downloading": return `下载中 ${modelProgress.value}%`;
+    case "loading": return "加载中...";
+    case "error": return `下载失败: ${modelError.value || "未知错误"}`;
+    case "idle": return "正在检查...";
+    default: return "未知";
+  }
+});
 
 const format = ref("srt");
 const language = ref("zh");
@@ -407,6 +506,7 @@ const appSettings = ref({
   autostart: false,
   startMinimized: false,
   defaultSavePath: "",
+  logLevel: "info",
 });
 
 // Player State
@@ -464,6 +564,15 @@ watch(currentSegIndex, (idx) => {
   } else {
     currentSegmentText.value = "";
   }
+  // Auto-scroll the active list item into view during playback
+  if (idx >= 0 && listContainer.value) {
+    nextTick(() => {
+      const items = listContainer.value.querySelectorAll(".list-item");
+      if (items[idx]) {
+        items[idx].scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    });
+  }
 });
 
 // Load settings
@@ -473,10 +582,23 @@ onMounted(async () => {
     appSettings.value = { ...appSettings.value, ...JSON.parse(saved) };
   }
 
+  // Sync saved log level to backend on startup
+  if (appSettings.value.logLevel && appSettings.value.logLevel !== "info") {
+    try {
+      await setLogLevel(appSettings.value.logLevel);
+    } catch {
+      // Backend not ready yet; will retry on user change
+    }
+  }
+
   pollTimer = setInterval(async () => {
     try {
       await healthCheck();
       backendOnline.value = true;
+      // Once backend is online, start checking model status
+      if (modelStatus.value !== "ready") {
+        checkModelStatus();
+      }
     } catch {
       backendOnline.value = false;
     }
@@ -517,6 +639,7 @@ watch(
 
 onBeforeUnmount(() => {
   clearInterval(pollTimer);
+  if (modelPollTimer) clearInterval(modelPollTimer);
   if (audioUrl.value && !localFilePath.value)
     URL.revokeObjectURL(audioUrl.value);
   unlistenDrop?.();
@@ -836,6 +959,54 @@ async function openLogDir() {
     }
   } catch (err) {
     message.error("调用后端打开日志文件夹失败: " + err);
+  }
+}
+
+async function onLogLevelChange() {
+  try {
+    await setLogLevel(appSettings.value.logLevel);
+  } catch (err) {
+    message.error("设置日志级别失败: " + err);
+  }
+}
+
+async function checkModelStatus() {
+  try {
+    const status = await getModelStatus();
+    modelStatus.value = status.status;
+    modelProgress.value = status.progress || 0;
+    modelError.value = status.error || "";
+    if (status.model_size_mb) {
+      modelSizeStr.value = `${status.model_size_mb} MB`;
+    }
+    if (status.model_path) {
+      modelPath.value = status.model_path.replace(/\\/g, '/').replace(/\/model\.onnx$/, '');
+    }
+  } catch {
+    // Backend not ready yet, will retry
+  }
+}
+
+async function retryDownload() {
+  modelStatus.value = "idle";
+  modelProgress.value = 0;
+  modelError.value = "";
+  try {
+    await restartModelDownload();
+    // Status polling will pick up the new download state
+  } catch (err) {
+    // Backend might not be ready yet; polling loop will retry
+  }
+}
+
+async function openModelDir() {
+  try {
+    const res = await openModelFolder();
+    if (res.status !== "ok") {
+      message.error(res.msg || "无法打开模型文件夹");
+    }
+  } catch (err) {
+    message.error("调用后端失败: " + err);
   }
 }
 
@@ -1266,6 +1437,22 @@ function fmtTimeSrt(sec) {
   cursor: not-allowed;
 }
 
+.log-level-select {
+  background: #111;
+  color: #e0e0e0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  outline: none;
+  cursor: pointer;
+  height: 34px;
+}
+.log-level-select:focus {
+  border-color: #1fbc5b;
+}
+
 .primary-btn,
 .secondary-btn {
   padding: 8px 16px;
@@ -1516,5 +1703,110 @@ function fmtTimeSrt(sec) {
   border-top: 1px solid var(--border-color, #2a2a2a);
   padding-top: 16px;
   letter-spacing: 0.5px;
+}
+
+/* ─── Model Status ─── */
+.model-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.model-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.model-status-dot.dot-green { background: #1fbc5b; box-shadow: 0 0 6px rgba(31,188,91,0.5); }
+.model-status-dot.dot-yellow { background: #f0ad4e; box-shadow: 0 0 6px rgba(240,173,78,0.5); }
+.model-status-dot.dot-red    { background: #e74c3c; box-shadow: 0 0 6px rgba(231,76,60,0.5); }
+.model-status-dot.dot-gray   { background: #666; }
+.model-status-text {
+  font-size: 0.85rem;
+  color: #aaa;
+}
+
+/* ─── Model Download Overlay ─── */
+.download-overlay {
+  position: fixed;
+  inset: 0;
+  background: #111111;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.download-card {
+  text-align: center;
+  padding: 48px;
+}
+
+.download-title {
+  font-size: 2rem;
+  font-weight: 700;
+  color: #e0e0e0;
+  margin-bottom: 8px;
+  letter-spacing: 1px;
+}
+
+.download-subtitle {
+  font-size: 1rem;
+  color: #666;
+  margin-bottom: 48px;
+}
+
+.download-progress-area {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.download-progress-ring {
+  position: relative;
+  width: 80px;
+  height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.download-progress-text {
+  position: absolute;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #e0e0e0;
+}
+
+.download-info {
+  font-size: 1rem;
+  color: #ccc;
+  margin-top: 8px;
+}
+
+.download-subinfo {
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.download-error-icon {
+  font-size: 2.5rem;
+  margin-bottom: 8px;
+}
+
+.download-error-msg {
+  font-size: 0.85rem;
+  color: #e74c3c;
+  max-width: 400px;
+  word-break: break-all;
+}
+
+.retry-btn {
+  margin-top: 16px;
+  padding: 10px 32px;
+  border-radius: 8px;
+  font-size: 0.95rem;
 }
 </style>

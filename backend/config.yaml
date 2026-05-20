@@ -1,10 +1,10 @@
 # Subtitle Assistant Configuration
-# Model paths (relative to backend/ or absolute)
+# Model paths are resolved relative to model.dir
 model:
-  onnx_path: "../models/sensevoice-small/model.onnx"
-  tokens_path: "../models/sensevoice-small/tokens.json"
-  config_path: "../models/sensevoice-small/config.yaml"
-  # Note: paths resolved relative to backend/ -> ../models/sensevoice-small = <project_root>/models/sensevoice-small
+  dir: "~/.shiyu/models"          # base dir for all model files
+  onnx: "sensevoice-small/model.onnx"
+  tokens: "sensevoice-small/tokens.json"
+  model_config: "sensevoice-small/config.yaml"
 
 # Audio preprocessing
 audio:

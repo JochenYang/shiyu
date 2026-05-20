@@ -1,7 +1,7 @@
 {
   "package": {
     "productName": "时语字幕助手",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "build": {
     "beforeBuildCommand": "npm run build",
@@ -55,8 +55,7 @@
         "signingIdentity": null
       },
       "resources": [
-        "resources/backend",
-        "resources/models"
+        "resources/backend"
       ],
       "shortDescription": "时语 - 本地 AI 字幕助手",
       "targets": ["nsis", "dmg"],

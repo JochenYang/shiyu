@@ -42,15 +42,6 @@ jobs:
         run: npm install
         working-directory: ./frontend
 
-      # --- Download SenseVoice-Small Model ---
-      - name: Download ONNX model
-        shell: bash
-        run: |
-          mkdir -p models/sensevoice-small
-          echo "Downloading SenseVoice-Small model (~230 MB)..."
-          curl -L -o models/sensevoice-small/model.onnx \
-            "https://huggingface.co/SenseVoiceSmall/model-onnx/resolve/main/model.onnx"
-
       # --- Prepare Resources: Windows ---
       - name: Clean & Copy resources (Windows)
         if: matrix.platform == 'windows-latest'
@@ -58,17 +49,12 @@ jobs:
         run: |
           # Remove existing junctions or files if present
           if (Test-Path frontend/src-tauri/resources/backend) { Remove-Item -Path frontend/src-tauri/resources/backend -Recurse -Force }
-          if (Test-Path frontend/src-tauri/resources/models) { Remove-Item -Path frontend/src-tauri/resources/models -Recurse -Force }
           
           # Create clean directories
           New-Item -ItemType Directory -Force -Path frontend/src-tauri/resources/backend
-          New-Item -ItemType Directory -Force -Path frontend/src-tauri/resources/models
           
           # Copy backend files (excluding venv, logs, __pycache__)
           Copy-Item -Path backend/* -Destination frontend/src-tauri/resources/backend -Recurse -Force -Exclude "venv", ".venv", "logs", "__pycache__"
-          
-          # Copy model files
-          Copy-Item -Path models/* -Destination frontend/src-tauri/resources/models -Recurse -Force
 
       # --- Prepare Resources: macOS & Linux ---
       - name: Clean & Copy resources (Unix)
@@ -77,17 +63,12 @@ jobs:
         run: |
           # Remove existing junctions or files if present
           rm -rf frontend/src-tauri/resources/backend
-          rm -rf frontend/src-tauri/resources/models
           
           # Create clean directories
           mkdir -p frontend/src-tauri/resources/backend
-          mkdir -p frontend/src-tauri/resources/models
           
           # Copy backend files (excluding venv, logs, __pycache__)
           rsync -av --exclude="venv" --exclude=".venv" --exclude="logs" --exclude="__pycache__" backend/ frontend/src-tauri/resources/backend/
-          
-          # Copy model files
-          rsync -av models/ frontend/src-tauri/resources/models/
 
       # --- Build Python Environment inside Tauri resources: Windows ---
       - name: Build Python Env (Windows)
@@ -111,13 +92,18 @@ jobs:
           ./venv/bin/pip install --upgrade pip
           ./venv/bin/pip install -r requirements.txt
 
-      # --- Get commit message for release body ---
-      - name: Get tag commit message
-        id: tag_message
+      # --- Generate changelog from all commits since last tag ---
+      - name: Generate release changelog
+        id: changelog
         shell: bash
         run: |
-          echo "message<<EOF" >> "$GITHUB_OUTPUT"
-          git log -1 --format=%s
+          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1 || echo "")
+          echo "changelog<<EOF" >> "$GITHUB_OUTPUT"
+          if [ -z "$PREV_TAG" ]; then
+            git log --oneline --no-decorate | head -50
+          else
+            git log --oneline --no-decorate "$PREV_TAG..HEAD"
+          fi
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       # --- Build & Release Tauri App (All platforms) ---
@@ -128,7 +114,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: "时语 Shiyu v__VERSION__"
-          releaseBody: ${{ steps.tag_message.outputs.message }}
+          releaseBody: ${{ steps.changelog.outputs.changelog }}
           releaseDraft: true
           prerelease: false
           projectPath: "./frontend"
