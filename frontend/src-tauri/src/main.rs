@@ -10,16 +10,19 @@ struct AppState {
 }
 
 /// Resolve the backend directory, trying:
-///   1. Tauri resources (production mode) — checks for shiyu-backend.exe
-///   2. PyInstaller dist/ (local build, dev mode) — checks for shiyu-backend.exe
-///   3. backend/ source (local venv, dev mode) — checks for run_server.py
+///   1. Tauri resources (production) — checks for shiyu-backend.exe
+///   2. PyInstaller dist/ (production only) — checks for shiyu-backend.exe
+///   3. backend/ source (dev mode) — checks for run_server.py
 fn find_backend_dir(app: &tauri::App) -> Option<std::path::PathBuf> {
     let exe_name = if cfg!(windows) { "shiyu-backend.exe" } else { "shiyu-backend" };
 
-    // 1. Try resolving via Tauri's official path resolver (production mode)
-    if let Some(resource_path) = app.path_resolver().resolve_resource("resources/backend") {
-        if resource_path.join(exe_name).exists() {
-            return Some(resource_path);
+    // 1. Try resolving via Tauri's official path resolver (production mode only)
+    //    In debug mode, skip resource check so local source files are always used.
+    if !cfg!(debug_assertions) {
+        if let Some(resource_path) = app.path_resolver().resolve_resource("resources/backend") {
+            if resource_path.join(exe_name).exists() {
+                return Some(resource_path);
+            }
         }
     }
 
@@ -27,8 +30,8 @@ fn find_backend_dir(app: &tauri::App) -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir = cwd.as_path();
     for _ in 0..5 {
-        // 2a. PyInstaller local build (backend/dist/)
-        if dir.join("backend").join("dist").join(exe_name).exists() {
+        // 2a. PyInstaller local build (backend/dist/) — production only
+        if !cfg!(debug_assertions) && dir.join("backend").join("dist").join(exe_name).exists() {
             return Some(dir.join("backend").join("dist"));
         }
         // 2b. Original venv dev mode (backend/run_server.py)
@@ -76,7 +79,11 @@ fn start_backend(backend_dir: &std::path::Path) -> Option<std::process::Child> {
 
             println!("[shiyu] Using Python: {} (venv={})", python_bin.display(), using_venv);
             println!("[shiyu] Main script: {}", main_py.display());
-            (python_bin, vec![main_py.to_string_lossy().to_string()], "venv")
+            (python_bin, vec![
+                main_py.to_string_lossy().to_string(),
+                "--port=11235".to_string(),
+                "--log-level=INFO".to_string(),
+            ], "venv")
         }
     };
 

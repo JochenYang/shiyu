@@ -52,15 +52,12 @@ export async function transcribeFile(file, options = {}) {
  * @param {string} language - Target language
  * @returns {Promise<Object>} { filename, language, duration, segments }
  */
-export async function transcribeJson(file, language = "auto") {
+export async function transcribeJson(file, language = "auto", glossary = "{}", engine = "local") {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("language", language);
-  if (arguments.length > 2 && arguments[2]) {
-      formData.append("glossary", arguments[2]);
-  } else {
-      formData.append("glossary", "{}");
-  }
+  formData.append("glossary", glossary);
+  formData.append("engine_mode", engine);
 
   const res = await fetch(`${API_BASE}/transcribe/json`, {
     method: "POST",
@@ -87,6 +84,7 @@ export async function transcribeLocal(filePath, options = {}) {
   formData.append("language", options.language || "auto");
   formData.append("output_format", options.output_format || "srt");
   formData.append("glossary", options.glossary || "{}");
+  formData.append("engine_mode", options.engine || "local");
 
   const res = await fetch(`${API_BASE}/transcribe/local`, {
     method: "POST",
@@ -113,6 +111,16 @@ export function downloadText(content, filename) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+/**
+ * Get list of available ASR engines.
+ * @returns {Promise<Object>} { engines: [{ name, display_name, requires_network, is_local, available, reason }] }
+ */
+export async function getEngines() {
+  const res = await fetch(`${API_BASE}/engines`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }
 
 /**
@@ -152,5 +160,37 @@ export async function setLogLevel(level) {
     method: "POST",
     body: formData,
   });
+  return res.json();
+}
+
+/**
+ * Get cloud engine settings from backend.
+ * @returns {Promise<Object>} { api_url, model, has_key, enabled }
+ */
+export async function getEngineSettings() {
+  const res = await fetch(`${API_BASE}/settings/engine`);
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.json();
+}
+
+/**
+ * Save cloud engine configuration to backend.
+ * @param {Object} settings - { api_url, api_key, model, enabled }
+ */
+export async function saveEngineSettings(settings) {
+  const formData = new FormData();
+  formData.append("api_url", settings.api_url || "");
+  formData.append("api_key", settings.api_key || "");
+  formData.append("model", settings.model || "whisper-1");
+  formData.append("enabled", settings.enabled ? "true" : "false");
+  const res = await fetch(`${API_BASE}/settings/engine`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
   return res.json();
 }

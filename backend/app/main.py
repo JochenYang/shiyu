@@ -2,12 +2,13 @@
 Subtitle Assistant - FastAPI Backend Service.
 Provides REST API for audio/video transcription and subtitle generation.
 """
+import json
 import os
-import tempfile
 import shutil
+import tempfile
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,50 +17,149 @@ from pydantic import BaseModel
 
 from app.core.config_loader import load_config
 from app.core.audio_processor import preprocess_audio
-from app.core.sensevoice_engine import SenseVoiceEngine
-from app.core.subtitle_formatter import (
-    generate_srt, generate_lrc, generate_ass,
-    segments_from_transcription, SubtitleSegment
-)
 from app.core.model_downloader import ensure_model, get_download_status, get_model_dir
+from app.core.cloud_engine import load_engine_config, save_engine_config
+from app.core.engine_base import BaseTranscriber, TranscribeResult, Segment
 
 
-# Global state
+# ── Engine Registry ─────────────────────────────────────────────────
+# Maps engine_mode string → transcriber instance
+_transcriber_registry: Dict[str, BaseTranscriber] = {}
+
+# Global state (backward compat)
 config = None
-engine = None
+
+
+def _register_default_engines():
+    """Register all available ASR engines in the global registry."""
+    global _transcriber_registry, config
+    _transcriber_registry = {}
+
+    # 1. Local SenseVoice
+    try:
+        from app.core.sensevoice_engine import SenseVoiceTranscriber
+        if config:
+            register_engine(SenseVoiceTranscriber,
+                model_path=config["model"]["onnx_path"],
+                tokens_path=config["model"]["tokens_path"],
+                device=config["inference"].get("device", "cpu"),
+                audio_cfg=config.get("audio", {}))
+        else:
+            register_engine(SenseVoiceTranscriber)
+    except ImportError:
+        pass
+
+    # 2. Cloud API
+    try:
+        from app.core.cloud_engine import CloudTranscriber
+        register_engine(CloudTranscriber)
+    except ImportError:
+        pass
+
+    # Note: Bcut (必剪) and Jianying (剪映) free ASR engines were removed
+    # in May 2026 because their reverse-engineered API endpoints became
+    # permanently unreachable (DNS resolution failure).
+
+
+def register_engine(transcriber_cls, **init_kwargs):
+    """Register a transcriber class into the global registry.
+
+    Creates instance lazily on first use or eagerly if 'name' matches.
+    """
+    name = transcriber_cls.name
+    if name in _transcriber_registry:
+        return  # Already registered
+    _transcriber_registry[name] = {
+        "cls": transcriber_cls,
+        "kwargs": init_kwargs,
+        "instance": None,
+    }
+
+
+def get_engine(name: str) -> BaseTranscriber:
+    """Get or create a transcriber instance by name.
+
+    Falls back to 'sensevoice_local' for backward-compatible 'local',
+    and 'cloud' for backward-compatible 'cloud'.
+    """
+    # Backward compat aliases
+    alias_map = {"local": "sensevoice_local"}
+    resolved = alias_map.get(name, name)
+
+    entry = _transcriber_registry.get(resolved)
+    if entry is None:
+        raise HTTPException(400, f"Unknown engine: {name}")
+
+    if entry["instance"] is None:
+        entry["instance"] = entry["cls"](**entry["kwargs"])
+    return entry["instance"]
+
+
+def get_available_engines() -> list:
+    """Return list of registered engine metadata and availability."""
+    results = []
+    for name, entry in _transcriber_registry.items():
+        inst = entry["instance"] or entry["cls"]()
+        avail, reason = inst.is_available()
+        results.append({
+            "name": name,
+            "display_name": inst.display_name if hasattr(inst, "display_name") else name,
+            "requires_network": inst.requires_network if hasattr(inst, "requires_network") else False,
+            "is_local": inst.is_local if hasattr(inst, "is_local") else True,
+            "available": avail,
+            "reason": reason,
+        })
+    return results
+
+
+def _extract_audio_for_transcribe(file_path: Path, audio_config: dict = None) -> str:
+    """Extract audio from video if needed; ensure we have a 16kHz WAV.
+
+    Args:
+        file_path: Path to the upload or local file.
+        audio_config: Optional audio config dict.
+
+    Returns:
+        Path to the audio file (extracted WAV for video, original for audio).
+    """
+    video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"}
+    is_video = file_path.suffix.lower() in video_exts
+
+    if is_video:
+        from app.core.audio_processor import extract_audio_from_video
+        return extract_audio_from_video(str(file_path))
+    return str(file_path)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: load config and ensure model. Shutdown: cleanup."""
-    global config, engine
+    """Startup: load config and register engines. Shutdown: cleanup."""
+    global config
 
     # Load config
     config_path = os.environ.get("CONFIG_PATH", "config.yaml")
     config = load_config(config_path)
 
-    # Start model download check (non-blocking, runs in background if needed)
+    # Register all engines
+    _register_default_engines()
+
+    # Try to init local SenseVoice
     model_status = ensure_model()
     print(f"[SubtitleAssistant] Model status: {model_status['status']}")
 
-    # If model is already available, init ONNX engine immediately
     if model_status["status"] == "ready":
-        inference_cfg = config["inference"]
-        engine = SenseVoiceEngine(
-            model_path=config["model"]["onnx_path"],
-            tokens_path=config["model"]["tokens_path"],
-            device=inference_cfg.get("device", "cpu")
-        )
-        print(f"[SubtitleAssistant] Model loaded: {config['model']['onnx_path']}")
+        try:
+            get_engine("sensevoice_local")
+            print(f"[SubtitleAssistant] Model loaded: {config['model']['onnx_path']}")
+        except Exception as e:
+            print(f"[SubtitleAssistant] Failed to load model: {e}")
     else:
-        engine = None
         print(f"[SubtitleAssistant] Model not ready yet: {model_status['status']}")
 
     print(f"[SubtitleAssistant] Server ready at http://{config['server']['host']}:{config['server']['port']}")
 
     yield
 
-    # Cleanup
     print("[SubtitleAssistant] Shutting down...")
 
 
@@ -88,37 +188,35 @@ class TranscribeRequest(BaseModel):
 @app.get("/health")
 async def health_check():
     log_dir = os.environ.get("SHIYU_LOG_DIR", "")
-    model_ready = engine is not None
+    engines = get_available_engines()
+    local_ready = any(e["name"] == "sensevoice_local" and e["available"] for e in engines)
     return {
         "status": "ok",
-        "model_loaded": model_ready,
+        "model_loaded": local_ready,
         "log_dir": log_dir,
-        "model_status": "ready" if model_ready else get_download_status().get("status", "unknown"),
+        "engines": engines,
+        "model_status": "ready" if local_ready else get_download_status().get("status", "unknown"),
     }
 
 
 @app.get("/model/status")
 async def model_status():
     """Get model download/loading status. Auto-load engine when download completes."""
-    global engine
     download_status = get_download_status()
 
-    # Auto-initialize engine when model becomes ready after background download
-    if engine is None and download_status["status"] == "ready":
+    # Auto-initialize SenseVoiceTranscriber when model becomes ready
+    if download_status["status"] == "ready":
         try:
-            inference_cfg = config["inference"]
-            engine = SenseVoiceEngine(
-                model_path=config["model"]["onnx_path"],
-                tokens_path=config["model"]["tokens_path"],
-                device=inference_cfg.get("device", "cpu")
-            )
+            get_engine("sensevoice_local")
             print(f"[SubtitleAssistant] Model loaded after download: {config['model']['onnx_path']}")
         except Exception as e:
-            print(f"[SubtitleAssistant] Failed to load model after download: {e}")
-            download_status["status"] = "error"
-            download_status["error"] = str(e)
+            if "Unknown engine" not in str(e):
+                print(f"[SubtitleAssistant] Failed to load model after download: {e}")
+                download_status["status"] = "error"
+                download_status["error"] = str(e)
 
-    engine_ready = engine is not None
+    local_entry = _transcriber_registry.get("sensevoice_local")
+    engine_ready = local_entry and local_entry["instance"] is not None
     model_path = get_model_dir() / "model.onnx"
     model_size = model_path.stat().st_size if model_path.exists() else 0
 
@@ -153,10 +251,15 @@ async def open_logs_folder():
     return {"status": "error", "msg": "Directory not found"}
 
 
+@app.get("/engines")
+async def list_engines():
+    """Return list of registered ASR engines with availability status."""
+    return {"engines": get_available_engines()}
+
+
 @app.post("/model/download")
 async def trigger_model_download():
     """Trigger or retry model download. Resets error state and starts fresh download."""
-    global engine
     status = ensure_model()
     return status
 
@@ -188,7 +291,8 @@ async def transcribe_file(
     file: UploadFile = File(...),
     language: str = Form("auto"),
     output_format: str = Form("srt"),
-    glossary: str = Form("{}")
+    glossary: str = Form("{}"),
+    engine_mode: str = Form("local"),
 ):
     """Transcribe audio/video file and return subtitle content.
 
@@ -196,19 +300,15 @@ async def transcribe_file(
         file: Audio or video file
         language: Target language (auto/zh/en/ja/ko/yue)
         output_format: srt / lrc / ass
+        engine_mode: Engine identifier (local, cloud)
 
     Returns:
         Plain text subtitle content
     """
-    if engine is None:
-        raise HTTPException(503, "Model not loaded")
-
-    # Validate format
     fmt = output_format.lower()
     if fmt not in ("srt", "lrc", "ass"):
         raise HTTPException(400, f"Unsupported format: {output_format}")
 
-    # Save uploaded file to temp
     suffix = Path(file.filename).suffix or ".tmp"
     tmp_dir = tempfile.mkdtemp()
     tmp_path = Path(tmp_dir) / f"input{suffix}"
@@ -217,57 +317,43 @@ async def transcribe_file(
         with open(tmp_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # Check if video
-        video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"}
-        is_video = tmp_path.suffix.lower() in video_exts
-
-        # Preprocess and load audio
-        audio_cfg = config["audio"]
-
-        import librosa
-        if is_video:
-            from app.core.audio_processor import extract_audio_from_video
-            audio_path = extract_audio_from_video(str(tmp_path))
-        else:
-            audio_path = str(tmp_path)
-
-        waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
-        duration_sec = len(waveform) / sr
-
-        import json
         try:
             custom_glossary = json.loads(glossary)
-        except:
+        except json.JSONDecodeError:
             custom_glossary = {}
 
-        # Run inference with VAD chunking
-        segments_raw = engine.transcribe_waveform_with_vad(
-            waveform=waveform,
-            sample_rate=sr,
-            audio_cfg=audio_cfg,
-            duration_sec=duration_sec,
-            language=language,
-            custom_glossary=custom_glossary
+        # Resolve engine and transcribe
+        transcriber = get_engine(engine_mode)
+        audio_path = _extract_audio_for_transcribe(tmp_path, config.get("audio") if config else None)
+        result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
+
+        # Format output
+        segments = result.to_segments_list()
+        from app.core.subtitle_formatter import (
+            generate_srt, generate_lrc, generate_ass,
+            segments_from_transcription,
         )
+        srt_segments = segments_from_transcription(segments)
 
-        # Convert to subtitle segments
-        segments = segments_from_transcription(segments_raw)
-
-        # Generate subtitle
         if fmt == "srt":
-            content = generate_srt(segments)
+            content = generate_srt(srt_segments)
         elif fmt == "lrc":
-            content = generate_lrc(segments)
-        else:  # ass
-            content = generate_ass(segments, title=file.filename)
+            content = generate_lrc(srt_segments)
+        else:
+            content = generate_ass(srt_segments, title=file.filename)
 
         return PlainTextResponse(content)
 
+    except PermissionError as e:
+        raise HTTPException(401, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
 
     finally:
-        # Cleanup temp files
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -275,12 +361,10 @@ async def transcribe_file(
 async def transcribe_json(
     file: UploadFile = File(...),
     language: str = Form("auto"),
-    glossary: str = Form("{}")
+    glossary: str = Form("{}"),
+    engine_mode: str = Form("local"),
 ):
     """Transcribe and return raw JSON with segments."""
-    if engine is None:
-        raise HTTPException(503, "Model not loaded")
-
     suffix = Path(file.filename).suffix or ".tmp"
     tmp_dir = tempfile.mkdtemp()
     tmp_path = Path(tmp_dir) / f"input{suffix}"
@@ -289,43 +373,33 @@ async def transcribe_json(
         with open(tmp_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"}
-        is_video = tmp_path.suffix.lower() in video_exts
-
-        audio_cfg = config["audio"]
-
-        import librosa
-        if is_video:
-            from app.core.audio_processor import extract_audio_from_video
-            audio_path = extract_audio_from_video(str(tmp_path))
-        else:
-            audio_path = str(tmp_path)
-
-        waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
-        duration_sec = len(waveform) / sr
-
-        import json
         try:
             custom_glossary = json.loads(glossary)
-        except:
+        except json.JSONDecodeError:
             custom_glossary = {}
 
-        segments = engine.transcribe_waveform_with_vad(
-            waveform=waveform,
-            sample_rate=sr,
-            audio_cfg=audio_cfg,
-            duration_sec=duration_sec,
-            language=language,
-            custom_glossary=custom_glossary
-        )
+        # Resolve engine and transcribe
+        transcriber = get_engine(engine_mode)
+        audio_path = _extract_audio_for_transcribe(tmp_path, config.get("audio") if config else None)
+        result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
 
-        return {
-            "filename": file.filename,
-            "language": language,
-            "duration": duration_sec,
-            "segments": segments
-        }
+        segments = result.to_segments_list()
 
+        # Calculate actual duration for reference
+        import librosa
+        try:
+            total_duration = librosa.get_duration(path=audio_path)
+        except Exception:
+            total_duration = segments[-1]["end"] if segments else 0
+
+        return {"filename": file.filename, "language": language, "duration": total_duration, "segments": segments}
+
+    except PermissionError as e:
+        raise HTTPException(401, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
 
@@ -338,7 +412,8 @@ async def transcribe_local(
     path: str = Form(...),
     language: str = Form("auto"),
     output_format: str = Form("srt"),
-    glossary: str = Form("{}")
+    glossary: str = Form("{}"),
+    engine_mode: str = Form("local"),
 ):
     """Transcribe a local file by path (for Tauri drag-drop, no upload needed).
 
@@ -346,13 +421,11 @@ async def transcribe_local(
         path: Absolute path to the audio/video file on disk
         language: Target language (auto/zh/en/ja/ko/yue)
         output_format: srt / lrc / ass
+        engine_mode: Engine identifier (local, cloud)
 
     Returns:
         JSON with subtitle content and segments for preview
     """
-    if engine is None:
-        raise HTTPException(503, "Model not loaded")
-
     file_path = Path(path)
     if not file_path.exists():
         raise HTTPException(400, f"File not found: {path}")
@@ -362,53 +435,53 @@ async def transcribe_local(
         raise HTTPException(400, f"Unsupported format: {output_format}")
 
     try:
-        video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"}
-        is_video = file_path.suffix.lower() in video_exts
-
-        audio_cfg = config["audio"]
-
-        import librosa
-        if is_video:
-            from app.core.audio_processor import extract_audio_from_video
-            audio_path = extract_audio_from_video(str(file_path))
-        else:
-            audio_path = str(file_path)
-
-        waveform, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"])
-        duration_sec = len(waveform) / sr
-
-        import json
         try:
             custom_glossary = json.loads(glossary)
-        except:
+        except json.JSONDecodeError:
             custom_glossary = {}
 
-        # Run inference once, get both segments and formatted content using VAD
-        segments_raw = engine.transcribe_waveform_with_vad(
-            waveform=waveform,
-            sample_rate=sr,
-            audio_cfg=audio_cfg,
-            duration_sec=duration_sec,
-            language=language,
-            custom_glossary=custom_glossary
+        # Resolve engine and transcribe
+        transcriber = get_engine(engine_mode)
+        audio_path = _extract_audio_for_transcribe(file_path, config.get("audio") if config else None)
+        result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
+
+        segments = result.to_segments_list()
+
+        # Calculate actual duration for reference
+        import librosa
+        try:
+            total_duration = librosa.get_duration(path=audio_path)
+        except Exception:
+            total_duration = segments[-1]["end"] if segments else 0
+
+        # Format output if requested
+        from app.core.subtitle_formatter import (
+            generate_srt, generate_lrc, generate_ass,
+            segments_from_transcription,
         )
-        segments = segments_from_transcription(segments_raw)
+        srt_segments = segments_from_transcription(segments)
 
         if fmt == "srt":
-            content = generate_srt(segments)
+            content = generate_srt(srt_segments)
         elif fmt == "lrc":
-            content = generate_lrc(segments)
+            content = generate_lrc(srt_segments)
         else:
-            content = generate_ass(segments, title=file_path.name)
+            content = generate_ass(srt_segments, title=file_path.name)
 
         return {
             "content": content,
-            "segments": segments_raw,
+            "segments": segments,
             "filename": file_path.name,
-            "duration": duration_sec,
+            "duration": total_duration,
             "language": language,
         }
 
+    except PermissionError as e:
+        raise HTTPException(401, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
 
@@ -433,6 +506,35 @@ async def set_log_level(level: str = Form("info")):
         logging.getLogger(name).setLevel(lvl)
     
     return {"status": "ok", "level": level}
+
+
+@app.get("/settings/engine")
+async def get_engine_settings():
+    """Return cloud engine config (without api_key plaintext)."""
+    cfg = load_engine_config()
+    return {
+        "api_url": cfg.get("api_url", ""),
+        "model": cfg.get("model", "whisper-1"),
+        "has_key": bool(cfg.get("api_key")),
+        "enabled": bool(cfg.get("enabled", False)),
+    }
+
+
+@app.post("/settings/engine")
+async def set_engine_settings(
+    api_url: str = Form(...),
+    api_key: str = Form(...),
+    model: str = Form("whisper-1"),
+    enabled: str = Form("false"),
+):
+    """Save cloud engine configuration."""
+    save_engine_config(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        enabled=enabled.lower() == "true",
+    )
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

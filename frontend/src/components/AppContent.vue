@@ -39,6 +39,7 @@
             </div>
 
             <n-upload
+              :key="uploadKey"
               :max="1"
               accept="audio/*,video/*"
               :show-file-list="false"
@@ -50,6 +51,19 @@
               </button>
             </n-upload>
           </div>
+        </div>
+
+        <!-- 引擎选择器 -->
+        <div class="engine-selector" v-if="engines.length > 0">
+          <label class="engine-label">识别引擎</label>
+          <select v-model="selectedEngine" class="engine-select" :disabled="isProcessing">
+            <option v-for="eng in engines" :key="eng.name" :value="eng.name">
+              {{ eng.display_name }}{{ eng.available ? '' : ' ⚠️ 不可用' }}
+            </option>
+          </select>
+          <span v-if="selectedEngine && !getEngineInfo(selectedEngine)?.available" class="engine-warning">
+            该引擎当前网络不可达，尝试连接可能失败
+          </span>
         </div>
 
         <!-- 列表头部 -->
@@ -294,80 +308,132 @@
             <X :size="18" />
           </button>
         </div>
-        <div class="custom-modal-body">
-          <div class="setting-item">
-            <div class="setting-label">开机自动启动</div>
-            <n-switch v-model:value="appSettings.autostart" />
-          </div>
-          <div class="setting-item">
-            <div class="setting-label">启动时最小化到托盘</div>
-            <n-switch v-model:value="appSettings.startMinimized" />
-          </div>
-          <div class="setting-item col">
-            <div class="setting-label">默认字幕导出目录</div>
-            <div class="path-picker">
-              <n-input
-                v-model:value="appSettings.defaultSavePath"
-                placeholder="默认将与源文件同目录..."
-                readonly
-              />
-              <button class="secondary-btn small-btn" @click="selectDefaultDir">
-                选择
-              </button>
-              <button
-                class="secondary-btn small-btn"
-                @click="appSettings.defaultSavePath = ''"
-              >
-                清除
-              </button>
+        <div class="custom-modal-body nav-layout">
+          <div class="settings-sidebar">
+            <div
+              v-for="tab in settingsTabs"
+              :key="tab.key"
+              class="settings-nav-item"
+              :class="{ active: currentSettingsTab === tab.key }"
+              @click="currentSettingsTab = tab.key"
+            >
+              <span class="nav-icon">{{ tab.icon }}</span>
+              <span class="nav-label">{{ tab.label }}</span>
             </div>
           </div>
-          <div class="setting-item col">
-            <div class="setting-label">
-              自定义极客字典 (一行一个，如: 错词=对词)
+          <div class="settings-panel">
+            <!-- 通用 -->
+            <template v-if="currentSettingsTab === 'general'">
+              <div class="setting-item">
+                <div class="setting-label">开机自动启动</div>
+                <n-switch v-model:value="appSettings.autostart" />
+              </div>
+              <div class="setting-item">
+                <div class="setting-label">启动时最小化到托盘</div>
+                <n-switch v-model:value="appSettings.startMinimized" />
+              </div>
+              <div class="setting-item col">
+                <div class="setting-label">默认字幕导出目录</div>
+                <div class="path-picker">
+                  <n-input
+                    v-model:value="appSettings.defaultSavePath"
+                    placeholder="默认将与源文件同目录..."
+                    readonly
+                  />
+                  <button class="secondary-btn small-btn" @click="selectDefaultDir">
+                    选择
+                  </button>
+                  <button
+                    class="secondary-btn small-btn"
+                    @click="appSettings.defaultSavePath = ''"
+                  >
+                    清除
+                  </button>
+                </div>
+              </div>
+              <div class="setting-item col">
+                <div class="setting-label">
+                  自定义极客字典 (一行一个，如: 错词=对词)
+                </div>
+                <n-input
+                  v-model:value="appSettings.customGlossaryText"
+                  type="textarea"
+                  placeholder="goold it=Godot&#10;思家家=C++&#10;微优伊=Vue"
+                  :autosize="{ minRows: 3, maxRows: 6 }"
+                />
+              </div>
+            </template>
+
+            <!-- 模型 -->
+            <template v-if="currentSettingsTab === 'model'">
+              <div class="setting-item col">
+                <div class="setting-label">语音模型</div>
+                <div class="model-status-row">
+                  <span class="model-status-dot" :class="modelInfoClass"></span>
+                  <span class="model-status-text">{{ modelInfoText }}</span>
+                </div>
+                <div class="path-picker" v-if="modelPath">
+                  <n-input
+                    v-model:value="modelPath"
+                    placeholder="模型路径"
+                    readonly
+                  />
+                  <button class="secondary-btn small-btn" @click="openModelDir">
+                    打开文件夹
+                  </button>
+                </div>
+              </div>
+            </template>
+
+            <!-- 云端 -->
+            <template v-if="currentSettingsTab === 'cloud'">
+              <div class="setting-item col">
+                <div class="setting-label">API 地址</div>
+                <n-input v-model:value="appSettings.engineApiUrl"
+                  placeholder="https://api.openai.com/v1" />
+              </div>
+              <div class="setting-item col">
+                <div class="setting-label">API Key</div>
+                <n-input v-model:value="appSettings.engineApiKey"
+                  type="password" placeholder="sk-..." />
+              </div>
+              <div class="setting-item col">
+                <div class="setting-label">模型名</div>
+                <n-input v-model:value="appSettings.engineModel"
+                  placeholder="whisper-1" />
+              </div>
+              <div class="setting-item">
+                <div class="setting-label">启用云端引擎</div>
+                <n-switch v-model:value="appSettings.engineEnabled" />
+              </div>
+              <div class="setting-item">
+                <button class="secondary-btn" @click="onSaveEngineSettings">保存云端配置</button>
+                <span v-if="engineSettingsStatus" class="setting-status">{{ engineSettingsStatus }}</span>
+              </div>
+            </template>
+
+            <!-- 日志 -->
+            <template v-if="currentSettingsTab === 'log'">
+              <div class="setting-item">
+                <div class="setting-label">排错日志</div>
+                <button class="secondary-btn small-btn" @click="openLogDir">
+                  打开日志文件夹
+                </button>
+              </div>
+              <div class="setting-item">
+                <div class="setting-label">日志级别</div>
+                <select class="log-level-select" v-model="appSettings.logLevel" @change="onLogLevelChange">
+                  <option value="debug">DEBUG</option>
+                  <option value="info">INFO</option>
+                  <option value="warning">WARNING</option>
+                  <option value="error">ERROR</option>
+                </select>
+              </div>
+            </template>
+
+            <div class="copyright-info">
+              © 2026 时语 Shiyu Subtitle v1.1.0. All rights reserved.
             </div>
-            <n-input
-              v-model:value="appSettings.customGlossaryText"
-              type="textarea"
-              placeholder="goold it=Godot&#10;思家家=C++&#10;微优伊=Vue"
-              :autosize="{ minRows: 3, maxRows: 6 }"
-            />
-          </div>
-          <!-- 模型状态 -->
-          <div class="setting-item col">
-            <div class="setting-label">语音模型</div>
-            <div class="model-status-row">
-              <span class="model-status-dot" :class="modelInfoClass"></span>
-              <span class="model-status-text">{{ modelInfoText }}</span>
-            </div>
-            <div class="path-picker" v-if="modelPath">
-              <n-input
-                v-model:value="modelPath"
-                placeholder="模型路径"
-                readonly
-              />
-              <button class="secondary-btn small-btn" @click="openModelDir">
-                打开文件夹
-              </button>
-            </div>
-          </div>
-          <div class="setting-item">
-            <div class="setting-label">排错日志</div>
-            <button class="secondary-btn small-btn" @click="openLogDir">
-              打开日志文件夹
-            </button>
-          </div>
-          <div class="setting-item">
-            <div class="setting-label">日志级别</div>
-            <select class="log-level-select" v-model="appSettings.logLevel" @change="onLogLevelChange">
-              <option value="debug">DEBUG</option>
-              <option value="info">INFO</option>
-              <option value="warning">WARNING</option>
-              <option value="error">ERROR</option>
-            </select>
-          </div>
-          <div class="copyright-info">
-            © 2026 时语 Shiyu Subtitle v1.1.0. All rights reserved.
           </div>
         </div>
       </div>
@@ -452,6 +518,9 @@ import {
   restartModelDownload,
   openModelFolder,
   setLogLevel,
+  getEngineSettings,
+  saveEngineSettings,
+  getEngines,
 } from "../api.js";
 
 const message = useMessage();
@@ -463,6 +532,10 @@ const audioUrl = ref(null);
 const isVideo = ref(false);
 const isProcessing = ref(false);
 const backendOnline = ref(false);
+
+// Engine selector state
+const engines = ref([]);
+const selectedEngine = ref("sensevoice_local");
 
 // Model download state
 const modelStatus = ref("idle"); // idle, downloading, loading, ready, error
@@ -497,16 +570,28 @@ const format = ref("srt");
 const language = ref("zh");
 
 const resultSegments = ref([]);
+const uploadKey = ref(0);
 const currentSegIndex = ref(-1);
 const currentSegmentText = ref("");
 
 // Settings state
 const showSettings = ref(false);
+const currentSettingsTab = ref("general");
+const settingsTabs = [
+  { key: "general", icon: "⚙️", label: "通用" },
+  { key: "model", icon: "🎙️", label: "模型" },
+  { key: "cloud", icon: "☁️", label: "云端" },
+  { key: "log", icon: "📋", label: "日志" },
+];
 const appSettings = ref({
   autostart: false,
   startMinimized: false,
   defaultSavePath: "",
   logLevel: "info",
+  engineEnabled: false,
+  engineApiUrl: "",
+  engineApiKey: "",
+  engineModel: "whisper-1",
 });
 
 // Player State
@@ -575,6 +660,24 @@ watch(currentSegIndex, (idx) => {
   }
 });
 
+const engineSettingsStatus = ref("");
+
+async function onSaveEngineSettings() {
+  try {
+    engineSettingsStatus.value = "保存中...";
+    await saveEngineSettings({
+      api_url: appSettings.value.engineApiUrl,
+      api_key: appSettings.value.engineApiKey,
+      model: appSettings.value.engineModel,
+      enabled: appSettings.value.engineEnabled,
+    });
+    engineSettingsStatus.value = "✓ 已保存";
+    setTimeout(() => { engineSettingsStatus.value = ""; }, 3000);
+  } catch (err) {
+    engineSettingsStatus.value = "保存失败: " + (err.message || err);
+  }
+}
+
 // Load settings
 onMounted(async () => {
   const saved = localStorage.getItem("shiyu_settings");
@@ -591,10 +694,27 @@ onMounted(async () => {
     }
   }
 
+  // Sync cloud engine settings from backend
+  try {
+    const cfg = await getEngineSettings();
+    appSettings.value.engineApiUrl = cfg.api_url || "";
+    appSettings.value.engineModel = cfg.model || "whisper-1";
+    appSettings.value.engineEnabled = cfg.enabled || false;
+  } catch {
+    // Backend may not have engine endpoint yet during dev
+  }
+
+  // Fetch available engines
+  await fetchEngines();
+
   pollTimer = setInterval(async () => {
     try {
       await healthCheck();
-      backendOnline.value = true;
+      if (!backendOnline.value) {
+        backendOnline.value = true;
+        // Fetch engines once backend comes online
+        fetchEngines();
+      }
       // Once backend is online, start checking model status
       if (modelStatus.value !== "ready") {
         checkModelStatus();
@@ -648,6 +768,7 @@ onBeforeUnmount(() => {
 });
 
 function handleFileSelected(filePathOrFile, isTauriPath = false) {
+  uploadKey.value++;
   if (audioUrl.value && !localFilePath.value)
     URL.revokeObjectURL(audioUrl.value);
 
@@ -674,8 +795,14 @@ function handleFileSelected(filePathOrFile, isTauriPath = false) {
   message.info(`已加载文件: ${selectedFile.value.name}`);
 }
 
-function handleUpload({ file }) {
-  handleFileSelected(file.file, false);
+function handleUpload({ file, onFinish, onError }) {
+  try {
+    handleFileSelected(file.file, false);
+    onFinish();
+  } catch (e) {
+    onError();
+    message.error("导入文件失败");
+  }
 }
 
 async function startTranscribe() {
@@ -698,12 +825,14 @@ async function startTranscribe() {
       }
     }
     const glossaryStr = JSON.stringify(glossaryDict);
+    const currentEngine = selectedEngine.value || (appSettings.value.engineEnabled ? "cloud" : "local");
 
     if (localFilePath.value) {
       const result = await transcribeLocal(localFilePath.value, {
         language: language.value,
         output_format: format.value,
         glossary: glossaryStr,
+        engine: currentEngine,
       });
       if (result.segments) {
         resultSegments.value = result.segments;
@@ -713,6 +842,7 @@ async function startTranscribe() {
         selectedFile.value,
         language.value,
         glossaryStr,
+        currentEngine,
       );
       if (json?.segments) {
         resultSegments.value = json.segments;
@@ -849,13 +979,30 @@ function autoUpdateSegmentIndex(time) {
   if (Date.now() - lastManualSeekTime < 800) return;
   if (parsedSegments.value.length === 0) return;
 
-  // Try to find the segment corresponding to the current time
+  // Step 1: Handle fallback for untimestamped subtitles (all start/end are 0)
+  const isAllZero = parsedSegments.value.every(seg => seg.start === 0 && seg.end === 0);
+  if (isAllZero && mediaDuration.value > 0) {
+    const totalChars = parsedSegments.value.reduce((sum, seg) => sum + (seg.text || "").length, 0) || 1;
+    let accumulatedTime = 0;
+    for (let i = 0; i < parsedSegments.value.length; i++) {
+      const seg = parsedSegments.value[i];
+      const duration = ((seg.text || "").length / totalChars) * mediaDuration.value;
+      const segStart = accumulatedTime;
+      const segEnd = accumulatedTime + duration;
+      if (time >= segStart && time <= segEnd) {
+        currentSegIndex.value = i;
+        return;
+      }
+      accumulatedTime = segEnd;
+    }
+    return;
+  }
+
+  // Step 2: Standard time-range match for timestamped subtitles
   const idx = parsedSegments.value.findIndex(
     (seg) => time >= seg.start && time <= seg.end,
   );
   if (idx !== -1) {
-    // Only auto-update if we are not actively editing a different one
-    // or we could just strictly follow the playback head
     currentSegIndex.value = idx;
   }
 }
@@ -864,8 +1011,18 @@ function seekToSegment(idx) {
   lastManualSeekTime = Date.now();
   currentSegIndex.value = idx;
   if (mediaPlayer.value && parsedSegments.value[idx]) {
-    mediaPlayer.value.currentTime = parsedSegments.value[idx].start;
-    // Don't auto play, just seek
+    // Step 1: Seek proportionally if all timestamps are 0
+    const isAllZero = parsedSegments.value.every(seg => seg.start === 0 && seg.end === 0);
+    if (isAllZero && mediaDuration.value > 0) {
+      const totalChars = parsedSegments.value.reduce((sum, seg) => sum + (seg.text || "").length, 0) || 1;
+      let accumulatedTime = 0;
+      for (let i = 0; i < idx; i++) {
+        accumulatedTime += ((parsedSegments.value[i].text || "").length / totalChars) * mediaDuration.value;
+      }
+      mediaPlayer.value.currentTime = accumulatedTime;
+    } else {
+      mediaPlayer.value.currentTime = parsedSegments.value[idx].start;
+    }
   }
 
   // 滚动列表定位
@@ -967,6 +1124,25 @@ async function onLogLevelChange() {
     await setLogLevel(appSettings.value.logLevel);
   } catch (err) {
     message.error("设置日志级别失败: " + err);
+  }
+}
+
+function getEngineInfo(name) {
+  return engines.value.find(e => e.name === name) || null;
+}
+
+async function fetchEngines() {
+  try {
+    const data = await getEngines();
+    if (data && data.engines && data.engines.length > 0) {
+      engines.value = data.engines;
+      // Migrate selected engine: if current selection not in list, pick first
+      if (!data.engines.some(e => e.name === selectedEngine.value)) {
+        selectedEngine.value = data.engines[0].name;
+      }
+    }
+  } catch {
+    // Backend may not have /engines endpoint (old version)
   }
 }
 
@@ -1122,6 +1298,45 @@ function fmtTimeSrt(sec) {
 
 .file-zone {
   flex-shrink: 0;
+}
+
+/* ─── Engine Selector ─── */
+.engine-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.engine-label {
+  font-size: 0.75rem;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.engine-select {
+  background: #111;
+  color: #e0e0e0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s;
+  width: 100%;
+}
+.engine-select:focus {
+  border-color: #1fbc5b;
+}
+.engine-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.engine-warning {
+  font-size: 0.7rem;
+  color: #e8a838;
+  margin-top: 2px;
 }
 
 .upload-container :deep(.n-upload-dragger) {
@@ -1453,6 +1668,27 @@ function fmtTimeSrt(sec) {
   border-color: #1fbc5b;
 }
 
+.divider {
+  height: 1px;
+  background: #333;
+  margin: 16px 0;
+}
+
+.setting-label-group {
+  font-size: 13px;
+  font-weight: 600;
+  color: #888;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.setting-status {
+  font-size: 12px;
+  color: #1fbc5b;
+  margin-left: 8px;
+}
+
 .primary-btn,
 .secondary-btn {
   padding: 8px 16px;
@@ -1641,7 +1877,7 @@ function fmtTimeSrt(sec) {
   z-index: 1000;
 }
 .custom-modal {
-  width: 480px;
+  width: 680px;
   background: #1c1c1c;
   border: 1px solid #333;
   border-radius: 10px;
@@ -1663,11 +1899,68 @@ function fmtTimeSrt(sec) {
   color: #eee;
 }
 .custom-modal-body {
-  padding: 24px;
+  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 20px;
 }
+.custom-modal-body.nav-layout {
+  flex-direction: row;
+  gap: 0;
+  min-height: 320px;
+}
+
+/* ─── Settings Sidebar ─── */
+.settings-sidebar {
+  width: 130px;
+  flex-shrink: 0;
+  background: #161616;
+  border-right: 1px solid #2a2a2a;
+  border-radius: 10px 0 0 10px;
+  padding: 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: #999;
+  transition: all 0.15s;
+  user-select: none;
+}
+.settings-nav-item:hover {
+  color: #ddd;
+  background: rgba(255, 255, 255, 0.04);
+}
+.settings-nav-item.active {
+  color: #1fbc5b;
+  background: rgba(31, 188, 91, 0.08);
+  border-right: 2px solid #1fbc5b;
+}
+.nav-icon {
+  font-size: 1rem;
+  line-height: 1;
+}
+.nav-label {
+  line-height: 1;
+}
+
+/* ─── Settings Panel ─── */
+.settings-panel {
+  flex: 1;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  overflow-y: auto;
+  max-height: 400px;
+}
+
 .setting-item {
   display: flex;
   justify-content: space-between;

@@ -11,7 +11,31 @@ import re
 import numpy as np
 import onnxruntime as ort
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
+
+# 内置术语纠错表 (Built-in glossary)
+BASE_GLOSSARY: Dict[str, str] = {
+    "labelbel": "Label",
+    "go it": "Godot",
+    "goold it": "Godot",
+    "good it": "Godot",
+    "goold": "Godot",
+    "个到特": "Godot",
+    "高到特": "Godot",
+    "狗道特": "Godot",
+    "狗到特": "Godot",
+    "c家家": "C++",
+    "思家家": "C++",
+    "c加加": "C++",
+    "拍森": "Python",
+    "泰普斯克里普特": "TypeScript",
+    "加瓦": "Java",
+    "瑞阿克特": "React",
+    "微优伊": "Vue",
+    "维优伊": "Vue",
+    "尤尼提": "Unity",
+    "昂瑞尔": "Unreal",
+}
 
 
 class SenseVoiceEngine:
@@ -414,8 +438,12 @@ class SenseVoiceEngine:
 
     def transcribe_waveform_with_vad(self, waveform: np.ndarray, sample_rate: int, audio_cfg: dict,
                                      duration_sec: float, language: str = "zh",
-                                     custom_glossary: dict = None) -> List[dict]:
+                                     custom_glossary: dict = None,
+                                     overlap_sec: float = 0.0) -> List[dict]:
         """Process long audio by splitting into safe chunks using energy-based VAD.
+        
+        When overlap_sec > 0, creates overlapping chunks and merges via text-based
+        ChunkMerger. This eliminates boundary artifacts for continuous audio (rap/music).
         
         Features:
         - Energy VAD to find silence boundaries
@@ -439,34 +467,10 @@ class SenseVoiceEngine:
         
         cmvn = load_cmvn(cmvn_file) if cmvn_file and os.path.exists(cmvn_file) else None
         
-        # 术语纠错表 Glossary
-        base_glossary = {
-            "labelbel": "Label",
-            "go it": "Godot",
-            "goold it": "Godot",
-            "good it": "Godot",
-            "goold": "Godot",
-            "个到特": "Godot",
-            "高到特": "Godot",
-            "狗道特": "Godot",
-            "狗到特": "Godot",
-            "c家家": "C++",
-            "思家家": "C++",
-            "c加加": "C++",
-            "拍森": "Python",
-            "泰普斯克里普特": "TypeScript",
-            "加瓦": "Java",
-            "瑞阿克特": "React",
-            "微优伊": "Vue",
-            "维优伊": "Vue",
-            "尤尼提": "Unity",
-            "昂瑞尔": "Unreal"
-        }
-        
+        # 使用模块级常量 + 合并自定义字典
+        glossary = BASE_GLOSSARY.copy()
         if custom_glossary:
-            base_glossary.update(custom_glossary)
-            
-        glossary = base_glossary
+            glossary.update(custom_glossary)
         
         # 2. 将 VAD 区间转换为静音缝隙 (Silences)
         silences = []
@@ -482,7 +486,7 @@ class SenseVoiceEngine:
         chunks = []
         current_start = 0
         min_chunk_sec = 8.0   # 最小切片长度，低于这个不切
-        max_chunk_sec = 28.0  # 极限长度（备用）
+        max_chunk_sec = 28.0  # 硬上限——任何 chunk 不能超过此值
         
         for sil_start, sil_end in silences:
             cut_point = (sil_start + sil_end) // 2
@@ -503,40 +507,239 @@ class SenseVoiceEngine:
                 
         if not chunks:
             chunks = [(0, len(waveform))]
-
-        all_segments = []
         
-        for start_idx, end_idx in chunks:
-            # 因为已经是 100% 无缝切割（且切点在静音中），不再需要激进的 padding
-            # 加极小的 padding (50ms) 以免爆音边界
-            pad = int(sample_rate * 0.05)
-            s_idx = max(0, start_idx - pad)
-            e_idx = min(len(waveform), end_idx + pad)
-            
-            chunk_wave = waveform[s_idx:e_idx]
-            chunk_duration = len(chunk_wave) / sample_rate
-            
-            fbank = compute_fbank_kaldi(chunk_wave, sample_rate, n_mels, frame_length, frame_shift)
-            features = apply_lfr(fbank, lfr_m, lfr_n)
-            if cmvn is not None:
-                features = apply_cmvn(features, cmvn).astype(np.float32)
-            features = np.expand_dims(features, axis=0)
-            
-            # 对单个分段强制进行高质量推理
-            chunk_segments = self.transcribe_with_timestamps(features, chunk_duration, language)
-            
-            chunk_start_sec = s_idx / sample_rate
-            for seg in chunk_segments:
-                # 合并时间戳
-                seg["start"] = round(seg["start"] + chunk_start_sec, 3)
-                seg["end"] = round(seg["end"] + chunk_start_sec, 3)
-                
-                # 术语纠错后处理
-                text = seg["text"]
-                for bad, good in glossary.items():
-                    text = text.replace(bad, good)
-                seg["text"] = text
-                
-                all_segments.append(seg)
-                
-        return all_segments
+        # 4. 硬上限强制切割：任何超过 max_chunk_sec 的 chunk 都要被切分
+        # 这对连续音频（说唱/纯音乐/无静音音频）至关重要——VAD 找不到切分点时退化为均匀切分
+        # 改进：找能量最低点下刀而不是盲均匀切分，尽量不切在歌词/语音中间
+        max_chunk_samples = int(max_chunk_sec * sample_rate)
+        final_chunks = []
+        for c_start, c_end in chunks:
+            if c_end - c_start <= max_chunk_samples:
+                final_chunks.append((c_start, c_end))
+            else:
+                # 智能切分：在目标边界附近找能量最低点
+                t = c_start
+                min_split_samples = int(5.0 * sample_rate)  # 每块至少 5s，避免过碎
+                while t < c_end:
+                    remaining = c_end - t
+                    if remaining <= max_chunk_samples:
+                        final_chunks.append((t, c_end))
+                        break
+                    # 在 [target - 1.5s, target + 1.5s] 窗口内找能量最低点
+                    target = t + max_chunk_samples
+                    split_pos = self._find_energy_dip(
+                        waveform, target, sample_rate, window_sec=1.5, hop_length=512
+                    )
+                    # 钳位：不能超出边界，也不能让尾巴太碎
+                    split_pos = min(split_pos, c_end - min_split_samples)
+                    if split_pos <= t:
+                        # 能量找不到合理切点 → 回到均匀切分
+                        split_pos = min(t + max_chunk_samples, c_end)
+                    final_chunks.append((t, split_pos))
+                    t = split_pos
+        chunks = final_chunks
+
+        # 如果启用重叠合并（overlap_sec > 0），将 chunks 扩展为重叠窗口
+        if overlap_sec > 0 and len(chunks) > 1:
+            half_overlap = int(overlap_sec * sample_rate / 2)
+            windows = []
+            for c_start, c_end in chunks:
+                w_start = max(0, c_start - half_overlap)
+                w_end = min(len(waveform), c_end + half_overlap)
+                windows.append((w_start, w_end))
+        else:
+            windows = chunks
+        
+        if overlap_sec > 0 and len(windows) > 1:
+            from .engine_base import Segment, TranscribeResult
+            from .chunk_merger import ChunkMerger
+
+            chunk_results: List[TranscribeResult] = []
+            for start_idx, end_idx in windows:
+                # 50ms padding to prevent click artifacts
+                pad = int(sample_rate * 0.05)
+                s_idx = max(0, start_idx - pad)
+                e_idx = min(len(waveform), end_idx + pad)
+
+                chunk_wave = waveform[s_idx:e_idx]
+                chunk_duration = len(chunk_wave) / sample_rate
+
+                fbank = compute_fbank_kaldi(chunk_wave, sample_rate, n_mels, frame_length, frame_shift)
+                features = apply_lfr(fbank, lfr_m, lfr_n)
+                if cmvn is not None:
+                    features = apply_cmvn(features, cmvn).astype(np.float32)
+                features = np.expand_dims(features, axis=0)
+
+                chunk_segments = self.transcribe_with_timestamps(features, chunk_duration, language)
+
+                chunk_start_sec = s_idx / sample_rate
+                typed_segments = []
+                for seg in chunk_segments:
+                    s = Segment(
+                        start=round(seg["start"] + chunk_start_sec, 3),
+                        end=round(seg["end"] + chunk_start_sec, 3),
+                        text=seg["text"],
+                    )
+                    # 术语纠错
+                    for bad, good in glossary.items():
+                        s.text = s.text.replace(bad, good)
+                    typed_segments.append(s)
+
+                chunk_results.append(TranscribeResult(segments=typed_segments))
+
+            # 用 ChunkMerger 做滑动窗口文本匹配合并
+            merger = ChunkMerger(min_matches=1, fuzzy_threshold=0.6)
+            merged = merger.merge(chunk_results, overlap_duration=overlap_sec)
+
+            return [
+                {"start": s.start, "end": s.end, "text": s.text}
+                for s in merged.segments
+            ]
+        else:
+            # 原有的非重叠处理逻辑
+            all_segments = []
+
+            for start_idx, end_idx in windows:
+                # 50ms padding 以免爆音边界
+                pad = int(sample_rate * 0.05)
+                s_idx = max(0, start_idx - pad)
+                e_idx = min(len(waveform), end_idx + pad)
+
+                chunk_wave = waveform[s_idx:e_idx]
+                chunk_duration = len(chunk_wave) / sample_rate
+
+                fbank = compute_fbank_kaldi(chunk_wave, sample_rate, n_mels, frame_length, frame_shift)
+                features = apply_lfr(fbank, lfr_m, lfr_n)
+                if cmvn is not None:
+                    features = apply_cmvn(features, cmvn).astype(np.float32)
+                features = np.expand_dims(features, axis=0)
+
+                chunk_segments = self.transcribe_with_timestamps(features, chunk_duration, language)
+
+                chunk_start_sec = s_idx / sample_rate
+                for seg in chunk_segments:
+                    seg["start"] = round(seg["start"] + chunk_start_sec, 3)
+                    seg["end"] = round(seg["end"] + chunk_start_sec, 3)
+
+                    text = seg["text"]
+                    for bad, good in glossary.items():
+                        text = text.replace(bad, good)
+                    seg["text"] = text
+
+                    all_segments.append(seg)
+
+            return all_segments
+
+    @staticmethod
+    def _find_energy_dip(
+        waveform: np.ndarray, target_idx: int, sample_rate: int,
+        window_sec: float = 1.5, hop_length: int = 512
+    ) -> int:
+        """在 target_idx 附近找帧能量最低点作为切点。
+
+        对于连续音频（歌曲、说唱），VAD 找不到静音间隙，
+        需要用能量最低点来把切分点尽量落在节拍间隙。
+
+        Args:
+            waveform: 单声道 float32 波形
+            target_idx: 目标切分点（样本索引）
+            sample_rate: 采样率
+            window_sec: 搜索窗口（±几秒）
+            hop_length: 帧移
+
+        Returns:
+            能量最低点的样本索引
+        """
+        window_samples = int(window_sec * sample_rate)
+        search_start = max(0, target_idx - window_samples)
+        search_end = min(len(waveform), target_idx + window_samples)
+
+        best_idx = target_idx
+        best_energy = float("inf")
+
+        pos = search_start
+        while pos + hop_length <= search_end:
+            frame = waveform[pos:pos + hop_length]
+            # RMS 能量
+            energy = np.sqrt(np.mean(frame ** 2))
+            if energy < best_energy:
+                best_energy = energy
+                best_idx = pos
+            pos += hop_length
+
+        return best_idx
+
+
+# ── BaseTranscriber Adapter ────────────────────────────────────────
+
+from .engine_base import BaseTranscriber, TranscribeResult, Segment
+
+
+class SenseVoiceTranscriber(BaseTranscriber):
+    """Adapter wrapping SenseVoiceEngine as a BaseTranscriber.
+
+    Loads audio, runs VAD chunking, and returns typed TranscribeResult.
+    """
+
+    name = "sensevoice_local"
+    display_name = "SenseVoice (Local)"
+    requires_network = False
+    is_local = True
+
+    def __init__(self, model_path: str, tokens_path: str, device: str = "cpu",
+                 audio_cfg: dict = None):
+        self._engine = SenseVoiceEngine(model_path, tokens_path, device)
+        self._audio_cfg = audio_cfg or {}
+        self._device = device
+
+    @classmethod
+    def from_config(cls, config: dict) -> "SenseVoiceTranscriber":
+        """Factory: create from application config dict."""
+        import os
+        from app.core.config_loader import get_model_dir
+        model_dir = get_model_dir()
+        model_path = os.path.join(model_dir, "model.onnx")
+        tokens_path = os.path.join(model_dir, "tokens.json")
+        device = config.get("device", "cpu")
+        audio_cfg = config.get("audio", {})
+        return cls(model_path=model_path, tokens_path=tokens_path,
+                   device=device, audio_cfg=audio_cfg)
+
+    def transcribe(
+        self,
+        audio_path: str,
+        language: str = "auto",
+        **kwargs,
+    ) -> TranscribeResult:
+        import librosa
+        waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
+        duration_sec = len(waveform) / sr
+
+        custom_glossary = kwargs.get("glossary", {})
+
+        # overlap_sec=3.0 启用重叠窗口 + ChunkMerger 合并
+        # 对连续音频（rap/歌曲）显著减少切分边界乱码
+        segments = self._engine.transcribe_waveform_with_vad(
+            waveform=waveform,
+            sample_rate=int(sr),
+            audio_cfg=self._audio_cfg,
+            duration_sec=duration_sec,
+            language=language,
+            custom_glossary=custom_glossary,
+            overlap_sec=3.0,
+        )
+
+        typed_segments = [
+            Segment(start=s["start"], end=s["end"], text=s["text"])
+            for s in segments
+        ]
+        return TranscribeResult(segments=typed_segments)
+
+    def is_available(self):
+        try:
+            import onnxruntime
+            return True, ""
+        except ImportError:
+            return False, "onnxruntime not installed"
+        except Exception as e:
+            return False, str(e)
