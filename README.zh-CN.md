@@ -31,8 +31,8 @@
 * **智能断句与排版**：内置中英文双语高精度智能断句算法，彻底解决语音模型原生的长句粘连问题，排版更符合人类阅读习惯。
 * **CTC 峰值时值补偿**：自动应用精准的 -150ms 时间戳偏移补偿，完美对齐声音波形，消除语音模型特有的 CTC 峰值延迟。
 * **现代极简美学 UI**：精心打磨的深色磨砂玻璃微动效界面，配合波形同步预览、点击时间码快捷跳转与顺滑的快捷键精修体验。
-* **静默后台守护管理**：采用 Rust 原生句柄控制，自动、无框、无感地随 GUI 启动或终止 Python 识别服务，告别烦人的黑框。
-* **企业级 CI/CD 支持**：预置高水准 GitHub Actions 自动构建脚本，一键在云端自动编译出 Windows (.msi)、macOS (.dmg) 和 Linux (.deb) 原生安装包。
+* **静默后台守护管理**：后端打包为 PyInstaller 单文件可执行程序，无需安装 Python 运行时，没有烦人的终端窗口闪现。
+* **CI/CD 一键发布**：预置 GitHub Actions 自动构建脚本，推送 Tag 即自动编译生成 Windows (.exe)、macOS (.dmg) 和 Linux (.deb) 安装包。
 
 ---
 
@@ -41,15 +41,16 @@
 时语采用高性能的前后端分离桌面架构：
 ```mermaid
 graph TD
-    A[Tauri GUI - Vue 3 / Vite] <-->|本地 Localhost API| B[Python 守护进程 - FastAPI]
-    B -->|ONNX Runtime 推理| C[SenseVoice-Small 模型]
-    A -->|Tauri 命令| D[静默进程控制器]
+    A[Tauri GUI - Vue 3 / Vite] <-->|本地 Localhost API| B[后端: PyInstaller 单文件]
+    B -->|ONNX Runtime 推理| C[SenseVoice-Small 模型 ~/.shiyu/models/]
+    A -->|Tauri 命令| D[Rust 进程控制器]
     D -->|拉起 / 销毁| B
 ```
 
-* **前端 (GUI)**：Vue 3, Vite, Naive UI, Lucide Icons (负责交互与音视频时间轴控制)
-* **Tauri 核心**：Rust (负责系统级窗口操作、后台 Python 静默守护进程拉起与注册表隔离)
-* **后端 (推理引擎)**：FastAPI, Uvicorn, Python 3.10 (负责调用 ONNX 引擎执行 SenseVoice 本地推理)
+* **前端 (GUI)**：Vue 3, Vite, Naive UI, Lucide Icons (交互与音视频时间轴控制)
+* **Tauri 核心**：Rust (系统窗口管理、静默进程守护、进程生命周期控制)
+* **后端 (推理引擎)**：FastAPI, Uvicorn, PyInstaller 单文件可执行程序 (ONNX Runtime + SenseVoice 推理)
+* **模型存储**：首次启动自动下载至 `~/.shiyu/models/sensevoice-small/`
 
 ---
 
@@ -77,16 +78,8 @@ graph TD
    ```bash
    pip install -r requirements.txt
    ```
-4. 下载 SenseVoice-Small 模型文件（约 230MB），放入 `models/sensevoice-small/` 目录：
-   ```bash
-   # 从 HuggingFace 下载
-   huggingface-cli download SenseVoiceSmall/model-onnx --local-dir models/sensevoice-small/
-   
-   # 或直接下载 ONNX 模型文件
-   # 下载地址: https://huggingface.co/SenseVoiceSmall/model-onnx/resolve/main/model.onnx
-   # 保存至: models/sensevoice-small/model.onnx
-   ```
-   > ⚠️ 模型文件较大（约 230MB），未包含在 Git 仓库中，需手动下载。
+   > SenseVoice-Small 模型（约 230MB）会在首次启动时**自动下载**，无需手动操作。
+   > 模型存放位置：`~/.shiyu/models/sensevoice-small/`
 
 #### 2. 初始化前端并启动开发服务
 1. 进入前端目录：
@@ -106,14 +99,25 @@ graph TD
 
 ### 打包与发布
 
-本项目支持基于 GitHub Actions 的一键自动打包：
-1. 将您的代码推送到 GitHub。
-2. 在本地创建并推送版本 Tag：
+GitHub Actions 工作流 (`.github/workflows/release.yml`) 可自动构建 Windows (.exe)、macOS (.dmg) 和 Linux (.deb) 安装包。
+
+触发发布流程：
+1. 将代码推送到 GitHub。
+2. 创建并推送版本 Tag：
    ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v1.1.0
+   git push origin v1.1.0
    ```
-3. GitHub 虚拟机将自动从 HuggingFace 下载模型文件，分别在原生系统下构建，并在 Releases 中自动生成各平台的草稿包！
+3. Runner 将编译 Rust (Tauri) 代码、将 Python 后端打包为 PyInstaller 单文件可执行程序、整合为原生安装包，并发布为草稿 Release。
+4. 模型在用户首次启动时**自动下载**，安装包不包含模型文件。
+
+> 💡 如需本地构建后端可执行程序进行生产测试：
+> ```bash
+> cd backend
+> pip install pyinstaller
+> python build.py
+> # 输出: dist/shiyu-backend.exe
+> ```
 
 ---
 

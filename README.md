@@ -31,8 +31,8 @@ Shiyu Subtitle is an ultra-fast, lightweight, and 100% offline local AI subtitle
 * **Smart Speech Segmentation**: Advanced bilingual segmenting algorithms for natural, human-readable line breaks, bypassing model-native limitations.
 * **Temporal Offset Compensation**: Integrated -150ms latency compensation, perfectly aligning subtitles to the audio waveform and correcting SenseVoice CTC peak delays.
 * **Modern & Sleek UI**: A premium dark-mode glassmorphism interface featuring smooth micro-animations, synchronized wave previews, and seamless timing navigation.
-* **Silent Daemon Management**: Seamless, headless backend process lifecycle control. The Python API starts and terminates invisibly alongside the Tauri GUI—no annoying command prompt windows.
-* **CI/CD Ready**: Ready-to-go GitHub Actions configuration for automated multi-platform compilation (Windows, macOS, and Linux) with platform-native Python packaging.
+* **Silent Daemon Management**: Seamless, headless backend process lifecycle control. The backend runs as a PyInstaller onefile executable—no Python runtime required, no annoying terminal windows.
+* **CI/CD Ready**: Ready-to-go GitHub Actions configuration for automated multi-platform compilation (Windows, macOS, and Linux). One push of a tag triggers the full build pipeline with zero manual steps.
 
 ---
 
@@ -40,15 +40,16 @@ Shiyu Subtitle is an ultra-fast, lightweight, and 100% offline local AI subtitle
 
 ```mermaid
 graph TD
-    A[Tauri GUI - Vue 3 / Vite] <-->|Local Localhost API| B[Python Daemon - FastAPI]
-    B -->|ONNX Runtime Inference| C[SenseVoice-Small Model]
-    A -->|Tauri Command| D[Silent Process Controller]
+    A[Tauri GUI - Vue 3 / Vite] <-->|Local Localhost API| B[Backend: PyInstaller Onefile]
+    B -->|ONNX Runtime Inference| C[SenseVoice-Small Model ~/.shiyu/models/]
+    A -->|Tauri Command| D[Rust Process Controller]
     D -->|Spawns / Terminates| B
 ```
 
 * **Frontend**: Vue 3, Vite, Naive UI, Lucide Icons, Web Audio API
-* **Tauri Core**: Rust (System windowing, silent process daemonization, registry isolation)
-* **Backend**: FastAPI, Uvicorn, Python 3.10, ONNX Runtime (SenseVoice inference)
+* **Tauri Core**: Rust (system windowing, silent process daemonization, process lifecycle)
+* **Backend**: FastAPI, Uvicorn, PyInstaller onefile executable (ONNX Runtime + SenseVoice inference)
+* **Model Storage**: Auto-downloaded to `~/.shiyu/models/sensevoice-small/` on first launch
 
 ---
 
@@ -76,16 +77,8 @@ graph TD
    ```bash
    pip install -r requirements.txt
    ```
-4. Download the SenseVoice-Small model (~230 MB) and place it in `models/sensevoice-small/`:
-   ```bash
-   # From HuggingFace
-   huggingface-cli download SenseVoiceSmall/model-onnx --local-dir models/sensevoice-small/
-   
-   # Or download the ONNX model directly:
-   # Download URL: https://huggingface.co/SenseVoiceSmall/model-onnx/resolve/main/model.onnx
-   # Save to: models/sensevoice-small/model.onnx
-   ```
-   > ⚠️ The model file is ~230 MB and is not included in the Git repository — download it separately.
+   > The SenseVoice-Small model (~230 MB) is **auto-downloaded** on first app launch. No manual download needed.
+   > Model location: `~/.shiyu/models/sensevoice-small/`
 
 #### 2. Setup Frontend & Run Dev
 1. Navigate to the frontend directory:
@@ -105,16 +98,25 @@ graph TD
 
 ### Packaging and Releasing
 
-This repository includes a professional GitHub Actions workflow located at `.github/workflows/release.yml`. 
+A GitHub Actions workflow (`.github/workflows/release.yml`) automates building installers for Windows (.exe), macOS (.dmg), and Linux (.deb).
 
-To compile and package installers for Windows (.msi/.exe), macOS (.dmg), and Linux (.deb) simultaneously:
+To trigger a release:
 1. Push your code to GitHub.
 2. Create and push a version tag:
    ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v1.1.0
+   git push origin v1.1.0
    ```
-3. The runner will download the model from HuggingFace, compile Rust code, bundle native Python environments, and publish draft installers to your GitHub Releases.
+3. The runner will compile Rust (Tauri), build the Python backend into a PyInstaller onefile executable, bundle everything into native installers, and publish them as draft releases.
+4. The model is **auto-downloaded** at runtime on first launch — no model files are included in the installer.
+
+> 💡 To build the backend executable locally for production testing:
+> ```bash
+> cd backend
+> pip install pyinstaller
+> python build.py
+> # Output: dist/shiyu-backend.exe
+> ```
 
 ---
 
