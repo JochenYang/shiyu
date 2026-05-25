@@ -176,6 +176,51 @@ export async function getEngineSettings() {
 }
 
 /**
+ * Apply LLM correction to transcription segments.
+ * @param {Array} segments - [{start, end, text}, ...]
+ * @param {string} engineMode - "local" or "cloud"
+ * @returns {Promise<{segments: Array, llm_corrected: boolean}>}
+ */
+export async function correctTranscription(segments, engineMode) {
+  const res = await fetch(`${API_BASE}/transcribe/correct`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ segments, engine_mode: engineMode }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/**
+ * Get LLM correction settings from backend.
+ * @returns {Promise<Object>} { enabled, provider, api_url, has_key, model }
+ */
+export async function getLlmCorrectionSettings() {
+  const res = await fetch(`${API_BASE}/settings/llm-correction`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/**
+ * Save LLM correction configuration to backend.
+ * @param {Object} settings - { enabled, provider, api_url, api_key, model }
+ */
+export async function saveLlmCorrectionSettings(settings) {
+  const formData = new FormData();
+  formData.append("enabled", settings.enabled ? "true" : "false");
+  formData.append("provider", settings.provider || "openai");
+  formData.append("api_url", settings.api_url || "");
+  formData.append("api_key", settings.api_key || "");
+  formData.append("model", settings.model || "");
+  const res = await fetch(`${API_BASE}/settings/llm-correction`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/**
  * Save cloud engine configuration to backend.
  * @param {Object} settings - { api_url, api_key, model, enabled }
  */

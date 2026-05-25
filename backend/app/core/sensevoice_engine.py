@@ -63,22 +63,29 @@ class SenseVoiceEngine:
     # Each CTC frame = LFR_N * FRAME_SHIFT_MS = 60ms
     FRAME_TO_SEC = LFR_N * FRAME_SHIFT_MS / 1000.0  # 0.06
     
-    def __init__(self, model_path: str, tokens_path: str, device: str = "cpu"):
+    def __init__(self, model_path: str, tokens_path: str, device: str = "cpu",
+                 model_dir: str = None):
         """Initialize ONNX session.
         
         Args:
             model_path: Path to model.onnx
             tokens_path: Path to tokens.json
             device: "cpu" or "cuda"
+            model_dir: Model directory (for loading SentencePiece BPE model)
         """
         self.model_path = model_path
         self.tokens_path = tokens_path
+        self.sp_model = None
         
         # Load tokens
         with open(tokens_path, "r", encoding="utf-8") as f:
             self.tokens = json.load(f)
         self.token_to_id = {t: i for i, t in enumerate(self.tokens)}
         self.id_to_token = {i: t for i, t in enumerate(self.tokens)}
+        
+        # Load SentencePiece model for CTC forced alignment
+        if model_dir:
+            self._load_sp_model(model_dir)
         
         # Setup ONNX session
         providers = ["CUDAExecutionProvider"] if device == "cuda" and self._has_cuda() else ["CPUExecutionProvider"]
@@ -90,6 +97,65 @@ class SenseVoiceEngine:
     
     def _has_cuda(self) -> bool:
         return "CUDAExecutionProvider" in ort.get_available_providers()
+    
+    def _load_sp_model(self, model_dir: str):
+        """Load SentencePiece BPE model for CTC forced alignment."""
+        import sentencepiece as spm
+        import os
+        for fname in os.listdir(model_dir):
+            if fname.endswith(".bpe.model"):
+                path = os.path.join(model_dir, fname)
+                self.sp_model = spm.SentencePieceProcessor()
+                self.sp_model.Load(path)
+                break
+    
+    def _ctc_forced_decode(self, logits: np.ndarray,
+                            input_length: int,
+                            external_text: str = None) -> List[Tuple[int, int]]:
+        """CTC forced alignment decode using Viterbi.
+
+        If external_text is provided, aligns that text onto logits.
+        Otherwise, uses greedy decode text as reference (self-alignment).
+        Falls back to greedy decode if SentencePiece model unavailable.
+
+        Returns:
+            List of (token_id, frame_idx) tuples matching _ctc_greedy_decode format,
+            where frame_idx is the START frame of each token.
+        """
+        if self.sp_model is None:
+            # Fall back to greedy decode
+            return self._ctc_greedy_decode(logits, input_length)
+        
+        from app.core.ctc_aligner import ctc_viterbi_align
+        
+        # Get reference text
+        if external_text is None:
+            # Use greedy decode text
+            greedy_pairs = self._ctc_greedy_decode(logits, input_length)
+            raw_tokens = [p[0] for p in greedy_pairs]
+            # Decode to text
+            raw_text = "".join(self.id_to_token.get(t, "") for t in raw_tokens)
+            raw_text = self.RICH_TAGS.sub("", raw_text).strip()
+            if not raw_text:
+                return greedy_pairs
+            ref_text = raw_text
+        else:
+            ref_text = external_text
+        
+        # Tokenize reference text
+        token_ids = self.sp_model.EncodeAsIds(ref_text)
+        if not token_ids:
+            return self._ctc_greedy_decode(logits, input_length) if external_text is None else []
+        
+        # Run Viterbi alignment
+        aligned = ctc_viterbi_align(logits[:input_length], token_ids, blank_id=0)
+        
+        # Convert to same output format as _ctc_greedy_decode: [(token_id, frame_idx)]
+        result = []
+        for tid, start_f, end_f in aligned:
+            if start_f < end_f:
+                result.append((tid, start_f))
+        return result
     
     def _ctc_greedy_decode(self, logits: np.ndarray, input_length: int) -> List[Tuple[int, int]]:
         """CTC greedy decode: argmax + deduplicate blanks.
@@ -257,20 +323,35 @@ class SenseVoiceEngine:
 
     def transcribe_with_timestamps(self, features: np.ndarray,
                                     audio_duration_sec: float,
-                                    language: str = "auto") -> List[dict]:
+                                    language: str = "auto",
+                                    external_text: str = None) -> List[dict]:
         """Transcribe with CTC frame-level timestamps.
         
-        Uses actual CTC frame emission positions for accurate segment timing.
-        Compensates for CTC peak delay (~150ms) by shifting start times earlier.
-        Detects text language to use word-aware splitting for English.
+        Uses CTC forced alignment (Viterbi) for more accurate timing.
+        Supports external text (e.g., from Cloud API) for better timestamp
+        alignment when the model's own transcription is inaccurate.
+        Falls back to greedy decode if SentencePiece model unavailable.
+        
+        Args:
+            features: Fbank features for inference.
+            audio_duration_sec: Total audio duration in seconds.
+            language: Language code.
+            external_text: Optional external text to align instead of model output.
+                           When None, uses the model's own greedy transcription.
+        
+        Returns:
+            List of segment dicts with start/end timestamps and text.
         """
         # Step 1: Run inference
         inputs = self._build_inputs(features, language, use_itn=True)
         outputs = self.session.run(self.output_names, inputs)
         logits = outputs[0][0]  # [T, V]
         
-        # Step 2: CTC decode with frame positions
-        id_frame_pairs = self._ctc_greedy_decode(logits, features.shape[1])
+        # Step 2: CTC decode with forced alignment (Viterbi)
+        id_frame_pairs = self._ctc_forced_decode(logits, features.shape[1], external_text)
+        if not id_frame_pairs and external_text:
+            # Forced alignment failed with external text; retry with greedy
+            id_frame_pairs = self._ctc_greedy_decode(logits, features.shape[1])
         text, detected_lang, char_frames = self._decode_with_frames(id_frame_pairs)
         
         if not text or not char_frames:
@@ -687,8 +768,8 @@ class SenseVoiceTranscriber(BaseTranscriber):
     is_local = True
 
     def __init__(self, model_path: str, tokens_path: str, device: str = "cpu",
-                 audio_cfg: dict = None):
-        self._engine = SenseVoiceEngine(model_path, tokens_path, device)
+                 audio_cfg: dict = None, model_dir: str = None):
+        self._engine = SenseVoiceEngine(model_path, tokens_path, device, model_dir)
         self._audio_cfg = audio_cfg or {}
         self._device = device
 
@@ -703,7 +784,7 @@ class SenseVoiceTranscriber(BaseTranscriber):
         device = config.get("device", "cpu")
         audio_cfg = config.get("audio", {})
         return cls(model_path=model_path, tokens_path=tokens_path,
-                   device=device, audio_cfg=audio_cfg)
+                   device=device, audio_cfg=audio_cfg, model_dir=model_dir)
 
     def transcribe(
         self,
@@ -717,8 +798,7 @@ class SenseVoiceTranscriber(BaseTranscriber):
 
         custom_glossary = kwargs.get("glossary", {})
 
-        # overlap_sec=3.0 启用重叠窗口 + ChunkMerger 合并
-        # 对连续音频（rap/歌曲）显著减少切分边界乱码
+        # Normal speech: use SenseVoice (overlap_sec=3.0 for ChunkMerger)
         segments = self._engine.transcribe_waveform_with_vad(
             waveform=waveform,
             sample_rate=int(sr),
@@ -729,10 +809,17 @@ class SenseVoiceTranscriber(BaseTranscriber):
             overlap_sec=3.0,
         )
 
-        typed_segments = [
-            Segment(start=s["start"], end=s["end"], text=s["text"])
-            for s in segments
-        ]
+        # Defensive zhconv: regardless of engine path, ensure Simplified Chinese
+        typed_segments = []
+        for s in segments:
+            text = s["text"]
+            try:
+                # zhconv may not be imported yet; import on demand
+                from zhconv import convert as _z
+                text = _z(text, "zh-cn")
+            except Exception:
+                pass
+            typed_segments.append(Segment(start=s["start"], end=s["end"], text=text))
         return TranscribeResult(segments=typed_segments)
 
     def is_available(self):

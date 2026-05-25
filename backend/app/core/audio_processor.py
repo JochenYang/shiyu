@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 import numpy as np
 import librosa
 import kaldi_native_fbank as knf
@@ -23,30 +24,74 @@ def _run_hidden(cmd, **kwargs):
     subprocess.run(cmd, **opts)
 
 
+def find_ffmpeg() -> str:
+    """Locate ffmpeg executable.
+
+    Search order:
+      1. backend/bin/ffmpeg (or .exe on Windows) — bundled with app
+      2. FFMPEG_PATH environment variable
+      3. System PATH
+      4. Windows: known WinGet installation path (fallback)
+    Returns the path string, or 'ffmpeg' as last resort.
+    """
+    # 1. Bundled binary (next to backend/ in backend/bin/)
+    backend_dir = Path(__file__).resolve().parent.parent.parent
+    exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    bundled = backend_dir / "bin" / exe_name
+    if bundled.is_file():
+        return str(bundled)
+
+    # 2. Environment variable override
+    env_ffmpeg = os.environ.get("FFMPEG_PATH")
+    if env_ffmpeg:
+        # Quick check it works
+        try:
+            subprocess.run(
+                [env_ffmpeg, "-version"],
+                capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            return env_ffmpeg
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # 3. System PATH
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        return "ffmpeg"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # 4. Windows: WinGet fallback
+    if sys.platform == "win32":
+        winget_path = (
+            r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages"
+            r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+            r"\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
+        )
+        if os.path.exists(winget_path):
+            return winget_path
+
+    return "ffmpeg"  # Let it fail naturally
+
+
 def extract_audio_from_video(video_path: str, output_wav: str = None, sample_rate: int = 16000) -> str:
     """Extract audio from video using ffmpeg. Returns path to wav file."""
     if output_wav is None:
         output_wav = tempfile.mktemp(suffix=".wav")
-    
-    # Try to find ffmpeg in PATH or via environment variable
-    ffmpeg_exe = os.environ.get("FFMPEG_PATH", "ffmpeg")
-    
+
+    ffmpeg_exe = find_ffmpeg()
     cmd = [
         ffmpeg_exe, "-y", "-i", video_path,
         "-vn", "-acodec", "pcm_s16le",
         "-ac", "1", "-ar", str(sample_rate),
         output_wav
     ]
-    try:
-        _run_hidden(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        # Fallback for common WinGet path if not in PATH
-        winget_ffmpeg = r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
-        if os.path.exists(winget_ffmpeg):
-            cmd[0] = winget_ffmpeg
-            _run_hidden(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        else:
-            raise
+    _run_hidden(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return output_wav
 
 

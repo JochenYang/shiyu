@@ -116,28 +116,42 @@ fn start_backend(backend_dir: &std::path::Path) -> Option<std::process::Child> {
     }
 }
 
-fn kill_backend(_app_handle: &tauri::AppHandle) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Kill by image name to reliably catch all subprocesses (PyInstaller onefile
-        // creates a launcher parent + Python child — PID-based kill can miss orphans).
-        let _ = std::process::Command::new("taskkill")
-            .args(&["/F", "/IM", "shiyu-backend.exe"])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .output();
-    }
-
-    #[cfg(not(windows))]
-    {
-        // On Unix, Child::kill() uses SIGKILL, which is sufficient.
-        if let Some(state) = _app_handle.try_state::<AppState>() {
-            if let Ok(mut guard) = state.backend_process.lock() {
-                if let Some(ref mut c) = *guard {
+fn kill_backend(app_handle: &tauri::AppHandle) {
+    // 1. Kill the tracked child process by PID (works on all platforms).
+    //    In dev mode the process is `python.exe`, which taskkill /IM won't catch.
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        if let Ok(mut guard) = state.backend_process.lock() {
+            if let Some(ref mut c) = *guard {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    // On Windows, use taskkill /T to kill the entire process tree.
+                    let pid = c.id();
+                    let _ = std::process::Command::new("taskkill")
+                        .args(&["/F", "/T", "/PID", &pid.to_string()])
+                        .creation_flags(0x08000000)
+                        .output();
+                    let _ = c.wait(); // reap the child handle
+                }
+                #[cfg(not(windows))]
+                {
+                    // On Unix: SIGKILL + wait to prevent zombie processes.
                     let _ = c.kill();
+                    let _ = c.wait();
                 }
             }
         }
+    }
+
+    // 2. Windows-only safety net: kill any orphaned shiyu-backend processes
+    //    (e.g. from a previous session where the Child handle was lost).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/T", "/IM", "shiyu-backend.exe"])
+            .creation_flags(0x08000000)
+            .output();
     }
 }
 

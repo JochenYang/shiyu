@@ -66,6 +66,13 @@
           </span>
         </div>
 
+        <!-- LLM 修正按钮 -->
+        <div class="llm-correct-row" v-if="parsedSegments.length > 0 && appSettings.llmApiUrl">
+          <button class="secondary-btn llm-correct-btn" @click="onCorrectWithLLM" :disabled="isCorrecting">
+            <BrainCircuit :size="16" /> {{ isCorrecting ? '修正中...' : 'LLM 修正' }}
+          </button>
+        </div>
+
         <!-- 列表头部 -->
         <div class="list-header">
           <span class="list-title">字幕列表</span>
@@ -83,6 +90,9 @@
           >
             <span class="item-time">{{ fmtTimeFull(seg.start) }}</span>
             <span class="item-text">{{ seg.text }}</span>
+            <button class="item-delete" @click.stop="removeSegment(idx)" title="删除此字幕">
+              <Trash2 :size="14" />
+            </button>
           </div>
           <div class="list-empty" v-if="parsedSegments.length === 0">
             暂无字幕
@@ -317,7 +327,7 @@
               :class="{ active: currentSettingsTab === tab.key }"
               @click="currentSettingsTab = tab.key"
             >
-              <span class="nav-icon">{{ tab.icon }}</span>
+              <component :is="tab.icon" :size="18" class="nav-icon" />
               <span class="nav-label">{{ tab.label }}</span>
             </div>
           </div>
@@ -395,7 +405,14 @@
               <div class="setting-item col">
                 <div class="setting-label">API Key</div>
                 <n-input v-model:value="appSettings.engineApiKey"
-                  type="password" placeholder="sk-..." />
+                  :type="showEngineApiKey ? 'text' : 'password'" placeholder="sk-...">
+                  <template #suffix>
+                    <button class="icon-btn" @click="showEngineApiKey = !showEngineApiKey" tabindex="-1">
+                      <Eye v-if="!showEngineApiKey" :size="16" />
+                      <EyeOff v-else :size="16" />
+                    </button>
+                  </template>
+                </n-input>
               </div>
               <div class="setting-item col">
                 <div class="setting-label">模型名</div>
@@ -409,6 +426,58 @@
               <div class="setting-item">
                 <button class="secondary-btn" @click="onSaveEngineSettings">保存云端配置</button>
                 <span v-if="engineSettingsStatus" class="setting-status">{{ engineSettingsStatus }}</span>
+              </div>
+            </template>
+
+            <!-- LLM 修正 -->
+            <template v-if="currentSettingsTab === 'llm'">
+              <div class="setting-item">
+                <div class="setting-label">启用 LLM 修正</div>
+                <n-switch v-model:value="appSettings.llmEnabled" @update:value="onToggleLlmEnabled" />
+              </div>
+              <div class="setting-item" v-if="appSettings.llmEnabled">
+                <div class="setting-label">状态</div>
+                <span class="llm-status" v-if="appSettings.llmApiUrl && appSettings.llmModel">
+                  <span class="model-status-dot active"></span>
+                  已配置 {{ appSettings.llmProvider === 'ollama' ? 'Ollama 本地' : '云端' }} ({{ appSettings.llmModel }})
+                </span>
+                <span class="llm-status" v-else>
+                  <span class="model-status-dot inactive"></span>
+                  配置不完整（需填写 API 地址和模型名）
+                </span>
+              </div>
+  <div class="setting-item col">
+    <div class="setting-label">提供商</div>
+    <select class="log-level-select" v-model="appSettings.llmProvider">
+      <option value="openai">OpenAI 兼容</option>
+      <option value="ollama">Ollama </option>
+    </select>
+  </div>
+  <div class="setting-item col">
+    <div class="setting-label">API 地址</div>
+    <n-input v-model:value="appSettings.llmApiUrl"
+      placeholder="例: https://api.openai.com/v1 / https://ark.cn-beijing.volces.com/api/v3 / http://localhost:11434/v1" />
+  </div>
+  <div class="setting-item col">
+    <div class="setting-label">API Key</div>
+    <n-input v-model:value="appSettings.llmApiKey"
+      :type="showLlmApiKey ? 'text' : 'password'" placeholder="Ollama 可留空，其余必填">
+      <template #suffix>
+        <button class="icon-btn" @click="showLlmApiKey = !showLlmApiKey" tabindex="-1">
+          <Eye v-if="!showLlmApiKey" :size="16" />
+          <EyeOff v-else :size="16" />
+        </button>
+      </template>
+    </n-input>
+  </div>
+  <div class="setting-item col">
+    <div class="setting-label">模型名</div>
+    <n-input v-model:value="appSettings.llmModel"
+      placeholder="例: gpt-4o / deepseek-v4-flash / qwen-plus" />
+  </div>
+              <div class="setting-item">
+                <button class="secondary-btn" @click="onSaveLlmCorrectionSettings">保存 LLM 配置</button>
+                <span v-if="llmSettingsStatus" class="setting-status">{{ llmSettingsStatus }}</span>
               </div>
             </template>
 
@@ -495,13 +564,20 @@ import {
   Upload,
   Film,
   Music,
-  Play,
-  Pause,
   Rewind,
+  Play,
   FastForward,
   Volume2,
   VolumeX,
   X,
+  Trash2,
+  Mic,
+  Cloud,
+  BrainCircuit,
+  FileText,
+  Pause,
+  Eye,
+  EyeOff,
 } from "lucide-vue-next";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
@@ -521,6 +597,9 @@ import {
   getEngineSettings,
   saveEngineSettings,
   getEngines,
+  getLlmCorrectionSettings,
+  saveLlmCorrectionSettings,
+  correctTranscription,
 } from "../api.js";
 
 const message = useMessage();
@@ -531,6 +610,7 @@ const localFilePath = ref(null);
 const audioUrl = ref(null);
 const isVideo = ref(false);
 const isProcessing = ref(false);
+const isCorrecting = ref(false);
 const backendOnline = ref(false);
 
 // Engine selector state
@@ -573,15 +653,18 @@ const resultSegments = ref([]);
 const uploadKey = ref(0);
 const currentSegIndex = ref(-1);
 const currentSegmentText = ref("");
+const showEngineApiKey = ref(false);
+const showLlmApiKey = ref(false);
 
 // Settings state
 const showSettings = ref(false);
 const currentSettingsTab = ref("general");
 const settingsTabs = [
-  { key: "general", icon: "⚙️", label: "通用" },
-  { key: "model", icon: "🎙️", label: "模型" },
-  { key: "cloud", icon: "☁️", label: "云端" },
-  { key: "log", icon: "📋", label: "日志" },
+  { key: "general", icon: Settings, label: "通用" },
+  { key: "model", icon: Mic, label: "模型" },
+  { key: "cloud", icon: Cloud, label: "云端" },
+  { key: "llm", icon: BrainCircuit, label: "LLM" },
+  { key: "log", icon: FileText, label: "日志" },
 ];
 const appSettings = ref({
   autostart: false,
@@ -592,6 +675,11 @@ const appSettings = ref({
   engineApiUrl: "",
   engineApiKey: "",
   engineModel: "whisper-1",
+  llmEnabled: false,
+  llmProvider: "openai",
+  llmApiUrl: "",
+  llmApiKey: "",
+  llmModel: "",
 });
 
 // Player State
@@ -678,6 +766,44 @@ async function onSaveEngineSettings() {
   }
 }
 
+const llmSettingsStatus = ref("");
+
+async function syncLlmCorrectionSettings() {
+  try {
+    const data = await getLlmCorrectionSettings();
+    appSettings.value.llmEnabled = data.enabled || false;
+    appSettings.value.llmProvider = data.provider || "openai";
+    appSettings.value.llmApiUrl = data.api_url || "";
+    appSettings.value.llmApiKey = data.api_key || "";
+    appSettings.value.llmModel = data.model || "";
+  } catch (e) {
+    console.warn("Failed to load LLM correction settings:", e);
+  }
+}
+
+async function onToggleLlmEnabled(val) {
+  // Auto-save on toggle
+  appSettings.value.llmEnabled = val;
+  await onSaveLlmCorrectionSettings();
+}
+async function onSaveLlmCorrectionSettings() {
+  llmSettingsStatus.value = "";
+  try {
+    const settings = {
+      enabled: appSettings.value.llmEnabled,
+      provider: appSettings.value.llmProvider,
+      api_url: appSettings.value.llmApiUrl,
+      api_key: appSettings.value.llmApiKey === "********" ? "" : appSettings.value.llmApiKey,
+      model: appSettings.value.llmModel,
+    };
+    await saveLlmCorrectionSettings(settings);
+    llmSettingsStatus.value = "保存成功 ✓";
+    setTimeout(() => { llmSettingsStatus.value = ""; }, 3000);
+  } catch (e) {
+    llmSettingsStatus.value = "保存失败: " + e.message;
+  }
+}
+
 // Load settings
 onMounted(async () => {
   const saved = localStorage.getItem("shiyu_settings");
@@ -703,6 +829,9 @@ onMounted(async () => {
   } catch {
     // Backend may not have engine endpoint yet during dev
   }
+
+  // Sync LLM correction settings from backend
+  syncLlmCorrectionSettings();
 
   // Fetch available engines
   await fetchEngines();
@@ -805,6 +934,24 @@ function handleUpload({ file, onFinish, onError }) {
   }
 }
 
+async function onCorrectWithLLM() {
+  isCorrecting.value = true;
+  try {
+    const data = await correctTranscription(parsedSegments.value, selectedEngine.value);
+    if (data.segments) {
+      resultSegments.value = data.segments;
+      if (data.llm_corrected) {
+        message.success(`LLM 已修正 ${data.segments.length} 条字幕`);
+      } else {
+        message.info("LLM 修正无变化");
+      }
+    }
+  } catch (e) {
+    message.error("LLM 修正失败: " + e.message);
+  } finally {
+    isCorrecting.value = false;
+  }
+}
 async function startTranscribe() {
   if (!selectedFile.value) return;
   isProcessing.value = true;
@@ -826,6 +973,7 @@ async function startTranscribe() {
     }
     const glossaryStr = JSON.stringify(glossaryDict);
     const currentEngine = selectedEngine.value || (appSettings.value.engineEnabled ? "cloud" : "local");
+    let llmApplied = false;
 
     if (localFilePath.value) {
       const result = await transcribeLocal(localFilePath.value, {
@@ -837,6 +985,7 @@ async function startTranscribe() {
       if (result.segments) {
         resultSegments.value = result.segments;
       }
+      llmApplied = result.llm_corrected;
     } else {
       const json = await transcribeJson(
         selectedFile.value,
@@ -847,11 +996,12 @@ async function startTranscribe() {
       if (json?.segments) {
         resultSegments.value = json.segments;
       }
+      llmApplied = json?.llm_corrected;
     }
     if (resultSegments.value.length > 0) {
       currentSegIndex.value = 0;
     }
-    message.success("字幕生成完成");
+    message.success(llmApplied ? "✓ 已修正" : "字幕生成完成");
   } catch (err) {
     message.error(err.message || "处理失败，请检查后端服务");
   } finally {
@@ -1039,6 +1189,15 @@ function seekToSegment(idx) {
 function prevSegment() {
   if (currentSegIndex.value > 0) {
     seekToSegment(currentSegIndex.value - 1);
+  }
+}
+function removeSegment(idx) {
+  if (idx < 0 || idx >= parsedSegments.value.length) return;
+  parsedSegments.value.splice(idx, 1);
+  if (currentSegIndex.value === idx) {
+    currentSegIndex.value = -1;
+  } else if (currentSegIndex.value > idx) {
+    currentSegIndex.value--;
   }
 }
 function nextSegment() {
@@ -1407,6 +1566,17 @@ function fmtTimeSrt(sec) {
   width: 100%;
 }
 
+.llm-correct-row {
+  padding: 0 0 8px;
+}
+.llm-correct-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
 .list-header {
   display: flex;
   justify-content: space-between;
@@ -1466,6 +1636,28 @@ function fmtTimeSrt(sec) {
 }
 .list-item.active .item-text {
   color: var(--text-active, #1fbc5b);
+}
+.item-delete {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: #666;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  margin-left: auto;
+  align-self: flex-start;
+  transition: color 0.15s, background 0.15s;
+}
+.list-item:hover .item-delete {
+  display: flex;
+}
+.item-delete:hover {
+  color: #ff4757;
+  background: rgba(255, 71, 87, 0.1);
 }
 
 .list-empty {
@@ -1943,8 +2135,11 @@ function fmtTimeSrt(sec) {
   border-right: 2px solid #1fbc5b;
 }
 .nav-icon {
-  font-size: 1rem;
-  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
 }
 .nav-label {
   line-height: 1;
@@ -2011,6 +2206,8 @@ function fmtTimeSrt(sec) {
   border-radius: 50%;
   flex-shrink: 0;
 }
+.model-status-dot.active  { background: #1fbc5b; box-shadow: 0 0 6px rgba(31,188,91,0.5); }
+.model-status-dot.inactive { background: #666; }
 .model-status-dot.dot-green { background: #1fbc5b; box-shadow: 0 0 6px rgba(31,188,91,0.5); }
 .model-status-dot.dot-yellow { background: #f0ad4e; box-shadow: 0 0 6px rgba(240,173,78,0.5); }
 .model-status-dot.dot-red    { background: #e74c3c; box-shadow: 0 0 6px rgba(231,76,60,0.5); }
@@ -2018,6 +2215,40 @@ function fmtTimeSrt(sec) {
 .model-status-text {
   font-size: 0.85rem;
   color: #aaa;
+}
+
+.api-key-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.api-key-row .n-input {
+  flex: 1;
+}
+.api-key-row .icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  color: #888;
+  cursor: pointer;
+  padding: 6px;
+  transition: color 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+}
+.api-key-row .icon-btn:hover {
+  color: #1fbc5b;
+  border-color: #1fbc5b;
+}
+
+.llm-status {
+  font-size: 0.85rem;
+  color: #aaa;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* ─── Model Download Overlay ─── */

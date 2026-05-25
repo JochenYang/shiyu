@@ -24,7 +24,25 @@ function preventContextMenu(e) {
 
 onMounted(() => {
   document.addEventListener('contextmenu', preventContextMenu);
+  // Global error handler — catches Tauri IPC errors, unhandled rejections
+  window.addEventListener('error', _onGlobalError);
+  window.addEventListener('unhandledrejection', _onGlobalError);
 });
+
+onBeforeUnmount(() => {
+  window.removeEventListener('unhandledrejection', _onGlobalError);
+  window.removeEventListener('error', _onGlobalError);
+});
+
+function _onGlobalError(e) {
+  const msg = e?.message || e?.reason || '';
+  // Suppress Tauri invoke errors (runtime IPC noise, not actionable)
+  if (msg.includes('invoke') || msg.includes('__TAURI__')) {
+    console.warn('[Tauri IPC]', msg);
+    e.preventDefault?.();
+    return;
+  }
+}
 
 onBeforeUnmount(() => {
   document.removeEventListener('contextmenu', preventContextMenu);

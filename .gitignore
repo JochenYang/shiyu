@@ -52,3 +52,4 @@ models/sensevoice-small/model.onnx
 
 # Repo progress (handoff artifacts)
 repo/
+tasks

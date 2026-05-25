@@ -53,6 +53,8 @@ def main():
         "pydantic",
         # Subtitle
         "pysubs2",
+        # zhconv: Traditional → Simplified Chinese (dynamic import in engines)
+        "zhconv",
     ]
 
     for mod in hidden:

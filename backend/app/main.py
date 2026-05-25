@@ -29,6 +29,9 @@ _transcriber_registry: Dict[str, BaseTranscriber] = {}
 # Global state (backward compat)
 config = None
 
+# LLM correction applied flag (set by _apply_llm_correction, returned in API response)
+_llm_corrected: bool = False
+
 
 def _register_default_engines():
     """Register all available ASR engines in the global registry."""
@@ -56,7 +59,7 @@ def _register_default_engines():
     except ImportError:
         pass
 
-    # Note: Bcut (必剪) and Jianying (剪映) free ASR engines were removed
+    # Bcut (必剪) and Jianying (剪映) free ASR engines were removed
     # in May 2026 because their reverse-engineered API endpoints became
     # permanently unreachable (DNS resolution failure).
 
@@ -110,6 +113,51 @@ def get_available_engines() -> list:
             "reason": reason,
         })
     return results
+
+
+def _apply_llm_correction(segments: list) -> list:
+    """If LLM correction is enabled, correct text recognition errors in segments.
+
+    Sets global flag _llm_corrected for UI feedback.
+    Three-red-lines principle:
+    - Don't change timestamp (start/end fields)
+    - Don't add/remove segments
+    - Don't rewrite semantics, only fix transcription errors
+    """
+    global _llm_corrected
+    _llm_corrected = False
+    from app.core.cloud_engine import load_llm_correction_config
+    cfg = load_llm_correction_config()
+    if not cfg.get("enabled"):
+        return segments
+    try:
+        from app.core.llm_corrector import create_corrector, CorrectionConfig
+        corr_config = CorrectionConfig(
+            enabled=True,
+            provider=cfg.get("provider", "openai"),
+            api_url=cfg.get("api_url", ""),
+            api_key=cfg.get("api_key", ""),
+            model=cfg.get("model", ""),
+        )
+        corrector = create_corrector(corr_config)
+        if corrector:
+            print(f"[LLM Correction] Correcting {len(segments)} segments via {corr_config.provider}")
+            corrected = corrector.correct(segments)
+            # Sort by start time
+            corrected.sort(key=lambda s: s.get("start", 0))
+            # Only mark corrected if text actually changed
+            _llm_corrected = any(
+                seg["text"] != orig["text"]
+                for seg, orig in zip(corrected, segments)
+            )
+            if _llm_corrected:
+                print(f"[LLM Correction] Done — {sum(1 for s,o in zip(corrected,segments) if s['text']!=o['text'])}/{len(segments)} segments changed")
+            else:
+                print(f"[LLM Correction] Done — no changes (correction returned original)")
+            return corrected
+    except Exception as e:
+        print(f"[LLM Correction] Failed: {e}")
+    return segments
 
 
 def _extract_audio_for_transcribe(file_path: Path, audio_config: dict = None) -> str:
@@ -535,6 +583,132 @@ async def set_engine_settings(
         enabled=enabled.lower() == "true",
     )
     return {"status": "ok"}
+
+
+@app.get("/settings/llm-correction")
+async def get_llm_correction_settings():
+    """返回 LLM 修正配置（不含 api_key 明文）。"""
+    from app.core.cloud_engine import load_llm_correction_config_masked
+    return load_llm_correction_config_masked()
+
+
+@app.post("/settings/llm-correction")
+async def set_llm_correction_settings(
+    enabled: str = Form("false"),
+    provider: str = Form("openai"),
+    api_url: str = Form(""),
+    api_key: str = Form(""),
+    model: str = Form(""),
+):
+    """保存 LLM 修正配置。"""
+    from app.core.cloud_engine import save_llm_correction_config
+    save_llm_correction_config(
+        enabled=enabled.lower() == "true",
+        provider=provider,
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+    )
+    return {"status": "ok"}
+
+
+@app.post("/transcribe/correct")
+async def correct_transcription(body: dict):
+    """Apply determinisic + optional LLM correction to transcription segments.
+
+    Accepts JSON: {"segments": [...], "engine_mode": "local"}
+
+    Two-layer architecture:
+      Layer 1: Deterministic correction (always runs, zero cost)
+      Layer 2: Optional LLM enhancement (on top of Layer 1 result)
+
+    Does NOT re-transcribe — only fixes text recognition errors.
+
+    Three-red-lines principle:
+    - Don't change timestamp (start/end fields)
+    - Don't add/remove segments
+    - Don't rewrite semantics, only fix transcription errors
+    """
+    segments = body.get("segments", [])
+    if not segments:
+        return {"segments": [], "llm_corrected": False}
+
+    # ── Layer 1: Deterministic correction (always runs) ──
+    from app.core.asr_corrector import deterministic_correct
+    layer1 = deterministic_correct(segments)
+    layer1.sort(key=lambda s: s.get("start", 0))
+
+    # ── Layer 2: Optional LLM enhancement ──
+    from app.core.cloud_engine import load_llm_correction_config
+    cfg = load_llm_correction_config()
+
+    if not cfg.get("enabled"):
+        # LLM disabled → use Layer 1 result directly
+        from app.core.segment_merger import split_long_segments
+        final = split_long_segments(layer1)
+        changed = any(
+            s["text"] != o["text"] for s, o in zip(layer1, segments)
+        )
+        print(f"[Deterministic] Corrected {len(layer1)} segments (LLM disabled)")
+        return {"segments": final, "llm_corrected": changed}
+
+    from app.core.llm_corrector import create_corrector, CorrectionConfig
+    corr_config = CorrectionConfig(
+        enabled=True,
+        provider=cfg.get("provider", "openai"),
+        api_url=cfg.get("api_url", ""),
+        api_key=cfg.get("api_key", ""),
+        model=cfg.get("model", ""),
+    )
+    corrector = create_corrector(corr_config)
+    if not corrector:
+        from app.core.segment_merger import split_long_segments
+        final = split_long_segments(layer1)
+        changed = any(
+            s["text"] != o["text"] for s, o in zip(layer1, segments)
+        )
+        print(f"[Deterministic] Corrected {len(layer1)} segments (LLM config missing)")
+        return {"segments": final, "llm_corrected": changed}
+
+    print(f"[LLM Enhancement] Enhancing {len(layer1)} segments via {corr_config.provider}")
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        # LLM corrects on top of Layer 1 result (already clean text)
+        llm_result = await loop.run_in_executor(None, corrector.correct, layer1)
+    except Exception as e:
+        print(f"[LLM Enhancement] Failed: {e}, falling back to deterministic result")
+        from app.core.segment_merger import split_long_segments
+        final = split_long_segments(layer1)
+        changed = any(
+            s["text"] != o["text"] for s, o in zip(layer1, segments)
+        )
+        return {"segments": final, "llm_corrected": changed}
+
+    llm_result.sort(key=lambda s: s.get("start", 0))
+
+    # Check if LLM improved anything beyond deterministic correction
+    llm_improved = any(
+        s["text"] != o["text"] for s, o in zip(llm_result, layer1)
+    )
+    if llm_improved:
+        print(f"[LLM Enhancement] Done — improvements applied")
+    else:
+        print(f"[LLM Enhancement] Done — no additional changes")
+
+    # Use LLM result if it improved text, otherwise fall back to Layer 1
+    final_source = llm_result if llm_improved else layer1
+
+    # Phase 3: Split any segments that are still too long
+    from app.core.segment_merger import split_long_segments
+    final = split_long_segments(final_source)
+    if len(final) != len(final_source):
+        print(f"[Segment Splitter] Split {len(final_source)} → {len(final)} segments")
+
+    changed = any(
+        s["text"] != o["text"] for s, o in zip(final, segments)
+    )
+    return {"segments": final, "llm_corrected": changed}
 
 
 if __name__ == "__main__":

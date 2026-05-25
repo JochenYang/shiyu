@@ -25,3 +25,9 @@ requests>=2.28.0
 
 # FFmpeg wrapper (optional, we use subprocess mainly)
 ffmpeg-python>=0.2.0
+
+# Traditional → Simplified Chinese conversion (dynamic import in engines)
+zhconv>=1.2.0
+
+# CTC forced alignment (loaded by sensevoice_engine, optional)
+sentencepiece>=0.2.0

@@ -6,8 +6,10 @@ Cloud transcription engine supporting both:
 2. DashScope compatible mode (POST /chat/completions, input_audio base64)
    - Provider: DashScope Qwen3-ASR-Flash
    - Returns plain text only; timestamps generated locally via VAD
+   - When available, uses SenseVoice CTC forced alignment for accurate timestamps
 """
 import base64
+import difflib
 import json
 import os
 import re
@@ -18,6 +20,8 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
 import requests
+
+from .audio_processor import find_ffmpeg
 
 CONFIG_FILE = Path.home() / ".shiyu" / "config.json"
 
@@ -33,14 +37,18 @@ _DASHSCOPE_MAX_B64_BYTES = int(9.5 * 1024 * 1024)
 
 def load_engine_config() -> Dict[str, Any]:
     """Load cloud engine config from ~/.shiyu/config.json"""
+    defaults = {"api_url": "", "api_key": "", "model": "", "enabled": False}
     if not CONFIG_FILE.exists():
-        return {"api_url": "", "api_key": "", "model": "whisper-1", "enabled": False}
+        return dict(defaults)
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("engine", {"api_url": "", "api_key": "", "model": "whisper-1", "enabled": False})
+        cfg = data.get("engine", {})
+        result = dict(defaults)
+        result.update({k: cfg[k] for k in result if k in cfg})
+        return result
     except (json.JSONDecodeError, IOError):
-        return {"api_url": "", "api_key": "", "model": "whisper-1", "enabled": False}
+        return dict(defaults)
 
 
 def save_engine_config(api_url: str, api_key: str, model: str, enabled: bool) -> None:
@@ -59,6 +67,81 @@ def save_engine_config(api_url: str, api_key: str, model: str, enabled: bool) ->
         os.chmod(CONFIG_FILE, 0o600)
     except OSError:
         pass  # Windows may not support chmod
+
+
+# ── LLM Correction Config ───────────────────────────────────────────
+
+
+def load_llm_correction_config() -> Dict[str, Any]:
+    """从 ~/.shiyu/config.json 加载 LLM 修正配置。
+
+    字段: enabled(bool), provider(str), api_url(str), api_key(str), model(str)
+    返回完整 dict（含 api_key 明文）。
+    """
+    defaults: Dict[str, Any] = {
+        "enabled": False,
+        "provider": "openai",
+        "api_url": "",
+        "api_key": "",
+        "model": "",
+    }
+    if not CONFIG_FILE.exists():
+        return dict(defaults)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cfg = data.get("llm_correction", {})
+        result = dict(defaults)
+        result.update({k: cfg[k] for k in result if k in cfg})
+        return result
+    except (json.JSONDecodeError, IOError):
+        return dict(defaults)
+
+
+def load_llm_correction_config_masked() -> Dict[str, Any]:
+    """返回 LLM 修正配置（含 api_key 原文）。
+    
+    注意：api_key 随配置返回，前端可回显。本地配置文件本身明文存储。
+    """
+    cfg = load_llm_correction_config()
+    return {
+        "enabled": cfg["enabled"],
+        "provider": cfg["provider"],
+        "api_url": cfg["api_url"],
+        "api_key": cfg["api_key"],
+        "has_key": bool(cfg["api_key"]),
+        "model": cfg["model"],
+    }
+
+
+def save_llm_correction_config(enabled: bool, provider: str, api_url: str,
+                                api_key: str, model: str) -> None:
+    """保存 LLM 修正配置到 ~/.shiyu/config.json data["llm_correction"]。
+
+    如果 api_key 为空字符串，保留已有的 key 不覆盖（避免前端掩码值清空密钥）。
+    """
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data: Dict[str, Any] = {}
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    existing = data.get("llm_correction", {})
+    resolved_key = api_key if api_key else existing.get("api_key", "")
+    data["llm_correction"] = {
+        "enabled": enabled,
+        "provider": provider,
+        "api_url": api_url,
+        "api_key": resolved_key,
+        "model": model,
+    }
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp.replace(CONFIG_FILE)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
 
 
 # ── Provider detection ──────────────────────────────────────────────
@@ -87,33 +170,6 @@ def _normalize_base_url(api_url: str) -> str:
     return url.rstrip("/")
 
 
-# ── ffmpeg helpers ──────────────────────────────────────────────────
-
-
-def _find_ffmpeg() -> str:
-    """Locate ffmpeg executable, with Windows fallback paths."""
-    ffmpeg_exe = os.environ.get("FFMPEG_PATH", "ffmpeg")
-    # Quick check if it's in PATH
-    try:
-        subprocess.run(
-            [ffmpeg_exe, "-version"],
-            capture_output=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        return ffmpeg_exe
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    # Fallback for common WinGet installation path
-    winget_ffmpeg = (
-        r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages"
-        r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
-        r"\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
-    )
-    if os.path.exists(winget_ffmpeg):
-        return winget_ffmpeg
-    return ffmpeg_exe  # Let it fail naturally with a clear error
-
-
 def _run_hidden(cmd, **kwargs):
     """Run subprocess without flashing a console window on Windows."""
     opts = dict(kwargs)
@@ -131,7 +187,7 @@ def _compress_audio_for_upload(audio_path: str, max_b64_bytes: int = _DASHSCOPE_
 
     A 60s 16kHz WAV (~1.9MB) compresses to ~240KB mp3 → ~320KB base64.
     """
-    ffmpeg_exe = _find_ffmpeg()
+    ffmpeg_exe = find_ffmpeg()
     compressed = tempfile.mktemp(suffix=".mp3")
 
     for bitrate in ["32k", "16k"]:
@@ -280,6 +336,13 @@ def _generate_timestamps_vad(audio_path: str, full_text: str) -> List[dict]:
     This works well because speech regions correspond to spoken content,
     and character count roughly correlates with speech duration.
     """
+    # Defensive zhconv: ensure full_text is Simplified Chinese
+    try:
+        from zhconv import convert as _z
+        full_text = _z(full_text, "zh-cn")
+    except Exception:
+        pass
+
     import librosa
 
     # Step 1: Load audio and detect speech regions
@@ -382,26 +445,38 @@ def transcribe_cloud(audio_path: str, language: str = "auto",
                      glossary: dict = None) -> Tuple[str, list]:
     """Transcribe audio using the configured cloud API provider.
 
-    Auto-detects DashScope vs standard Whisper-compatible providers.
-    For DashScope: compresses audio, gets plain text, generates VAD timestamps.
-    For Whisper: uses native verbose_json timestamps.
-
-    Returns:
-        Tuple of (srt_content, segments_list)
-        Each segment: {"start": float, "end": float, "text": str}
+    Priority:
+      1. OpenAI-compatible Whisper API (/audio/transcriptions)
+      2. DashScope-specific chat/completions with input_audio (last resort)
     """
     config = load_engine_config()
     api_url = config["api_url"].rstrip("/")
     api_key = config["api_key"]
-    model = config.get("model", "whisper-1")
+    model = (config.get("model") or "").strip()
 
     if not api_url or not api_key:
         raise ValueError("Cloud engine not configured. Set API URL and key in settings.")
 
-    if _is_dashscope_url(api_url):
-        return _transcribe_dashscope(audio_path, language, api_url, api_key, model, glossary or {})
-    else:
-        return _transcribe_whisper(audio_path, language, api_url, api_key, model, glossary or {})
+    segments = None
+
+    # Priority 1: Whisper API (standard /audio/transcriptions)
+    try:
+        _srt, segments = _transcribe_whisper(audio_path, language, api_url, api_key, model, glossary or {})
+    except Exception:
+        pass
+
+    # Priority 2: DashScope-specific chat/completions (last resort)
+    if segments is None and _is_dashscope_url(api_url):
+        _srt, segments = _transcribe_dashscope(audio_path, language, api_url, api_key, model, glossary or {})
+
+    if segments is None:
+        raise RuntimeError(
+            "Cloud API transcription failed. "
+            "Check that your API URL and key are correct."
+        )
+
+    srt_content = _segments_to_srt(segments)
+    return srt_content, segments
 
 
 # ── Standard Whisper API (OpenAI, Groq, DeepSeek, etc.) ─────────────
@@ -410,10 +485,14 @@ def transcribe_cloud(audio_path: str, language: str = "auto",
 def _transcribe_whisper(audio_path: str, language: str, api_url: str, api_key: str,
                         model: str, glossary: dict) -> Tuple[str, list]:
     """Transcribe via standard OpenAI Whisper /audio/transcriptions with multipart file upload."""
-    endpoint = f"{api_url}/audio/transcriptions"
+    # Normalize base URL (strip /chat/completions if present)
+    base = _normalize_base_url(api_url)
+    endpoint = f"{base}/audio/transcriptions"
     headers = {"Authorization": f"Bearer {api_key}"}
 
-    form_fields = {"model": model, "response_format": "verbose_json"}
+    form_fields = {"response_format": "verbose_json"}
+    if model:
+        form_fields["model"] = model
     if language and language != "auto":
         form_fields["language"] = language
 
@@ -422,7 +501,7 @@ def _transcribe_whisper(audio_path: str, language: str, api_url: str, api_key: s
     else:
         with open(audio_path, "rb") as f:
             files = {"file": f}
-            resp = requests.post(endpoint, headers=headers, files=files, data=form_fields, timeout=300)
+            resp = requests.post(endpoint, headers=headers, files=files, data=form_fields, timeout=120)
             if resp.status_code == 401:
                 raise PermissionError("Cloud API authentication failed. Check your API key.")
             if resp.status_code != 200:
@@ -435,6 +514,12 @@ def _transcribe_whisper(audio_path: str, language: str, api_url: str, api_key: s
         text = result.get("text", "") or ""
         if text:
             text = text.strip()
+            # zhconv: Traditional → Simplified
+            try:
+                from zhconv import convert as _z
+                text = _z(text, "zh-cn")
+            except Exception:
+                pass
             if glossary:
                 for bad, good in glossary.items():
                     text = text.replace(bad, good)
@@ -482,12 +567,11 @@ def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_k
     }
     mime = mime_map.get(ext, "audio/wav")
 
-    # Build chat completions request body
-    # IMPORTANT: Must include a text instruction alongside the audio.
-    # Without one, the model may return empty (no output) for non-speech audio
-    # like songs, music, or rap.
+    # Build chat completions request body (DashScope compatible-mode)
+    # Per DashScope docs: content array should contain ONLY one input_audio element,
+    # NO additional text elements alongside it.
     body = {
-        "model": model or "qwen3-asr-flash",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -497,15 +581,14 @@ def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_k
                         "input_audio": {
                             "data": f"data:{mime};base64,{audio_b64}"
                         }
-                    },
-                    {
-                        "type": "text",
-                        "text": "请将音频中的语音转写为文字，包括歌曲歌词。"
                     }
-                ]
+                ],
             }
         ],
         "stream": False,
+        "asr_options": {
+            "enable_itn": False,
+        },
     }
 
     # Normalize URL and build endpoint
@@ -515,7 +598,7 @@ def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_k
     auth_header = f"Bearer {api_key}"
 
     headers = {"Authorization": auth_header, "Content-Type": "application/json"}
-    resp = requests.post(endpoint, headers=headers, json=body, timeout=300)
+    resp = requests.post(endpoint, headers=headers, json=body, timeout=120)
     if resp.status_code == 401:
         raise PermissionError("Cloud API authentication failed. Check your API key.")
     if resp.status_code != 200:
@@ -546,54 +629,244 @@ def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_k
         text = content.strip() if isinstance(content, str) else str(content)
     except Exception as e:
         raise RuntimeError(f"Failed to parse DashScope transcription content: {e}")
+
+    # Traditional Chinese → Simplified Chinese
+    try:
+        from zhconv import convert as _zhconv_convert
+        text = _zhconv_convert(text, "zh-cn")
+    except ImportError:
+        pass
+    except Exception:
+        pass
     return text
+
+
+def _refine_timestamps_with_ctc(audio_path: str, full_text: str,
+                                 sample_rate: int,
+                                 original_segments: list) -> list:
+    """Refine segment timestamps using SenseVoice CTC forced alignment.
+
+    When SenseVoice model is available, uses CTC Viterbi alignment to get
+    accurate frame-level timestamps for the DashScope-transcribed text.
+    Falls back to original segments if model or alignment fails.
+
+    Args:
+        audio_path: Path to the audio file.
+        full_text: Full transcription text from DashScope.
+        sample_rate: Audio sample rate.
+        original_segments: Original segments to fall back on.
+
+    Returns:
+        Refined segment list with improved timestamps, or None on failure.
+    """
+    import logging
+    import numpy as np
+    _log = logging.getLogger("shiyu")
+
+    # Try to load SenseVoice model + SentencePiece
+    try:
+        # 1. Load audio
+        import librosa
+        waveform, sr = librosa.load(audio_path, sr=sample_rate, mono=True)
+        audio_duration = len(waveform) / sr
+
+        # 2. Compute fbank features
+        from app.core.audio_processor import compute_fbank_kaldi, apply_lfr, apply_cmvn, load_cmvn
+        from app.core.config_loader import get_model_dir
+
+        model_dir = get_model_dir()
+        if not os.path.exists(os.path.join(model_dir, "model.onnx")):
+            return None
+
+        # 3. Load SentencePiece for forced alignment
+        import sentencepiece as spm
+        sp_model = None
+        for fname in os.listdir(model_dir):
+            if fname.endswith(".bpe.model"):
+                sp_model = spm.SentencePieceProcessor()
+                sp_model.Load(os.path.join(model_dir, fname))
+                break
+        if sp_model is None:
+            return None
+
+        # 4. Load ONNX and run encoder
+        import onnxruntime as ort
+        session = ort.InferenceSession(
+            os.path.join(model_dir, "model.onnx"),
+            providers=["CPUExecutionProvider"]
+        )
+
+        # 5. Compute fbank
+        audio_cfg = {"n_mels": 80, "frame_length": 25, "frame_shift": 10}
+        fbank = compute_fbank_kaldi(waveform, sr,
+                                     n_mels=audio_cfg["n_mels"],
+                                     frame_length=audio_cfg["frame_length"],
+                                     frame_shift=audio_cfg["frame_shift"])
+        lfr_features = apply_lfr(fbank, m=7, n=6)
+        cmvn_path = os.path.join(model_dir, "am.mvn")
+        if os.path.exists(cmvn_path):
+            cmvn = load_cmvn(cmvn_path)
+            features = apply_cmvn(lfr_features, cmvn)
+        else:
+            features = lfr_features
+        features = features[np.newaxis, :, :].astype(np.float32)
+        input_len = np.array([features.shape[1]], dtype=np.int32)
+
+        # Language = auto (id 0), text_norm = withitn (id 14)
+        lang_id = np.array([0], dtype=np.int64)
+        text_norm = np.array([14], dtype=np.int64)
+
+        input_names = [inp.name for inp in session.get_inputs()]
+        onnx_inputs = {
+            input_names[0]: features,
+            input_names[1]: input_len,
+            input_names[2]: lang_id,
+            input_names[3]: text_norm,
+        }
+        outputs = session.run(None, onnx_inputs)
+        logits = outputs[0][0]  # [T, V]
+
+        # 6. Run forced alignment
+        from app.core.ctc_aligner import align_text_to_timestamps
+        char_timestamps = align_text_to_timestamps(
+            logits, full_text, sp_model,
+            frame_to_sec=0.06, ctc_delay_sec=0.15
+        )
+
+        if not char_timestamps:
+            return None
+
+        # 7. Split text into subtitle segments
+        is_cjk = _is_mostly_cjk(full_text)
+        max_len = 25 if is_cjk else 42
+        sub_texts = _split_text_for_subtitles(full_text, max_len, is_cjk)
+        if not sub_texts:
+            return None
+
+        # 8. Map segments to aligned timestamps
+        # Build char-index → timestamp lookup
+        char_map = []
+        for ct in char_timestamps:
+            if ct["char"].strip():
+                char_map.append((ct["char"], ct["start"], ct["end"]))
+
+        # Walk through sub_texts sequentially, accumulating character positions
+        segments = []
+        char_pos = 0
+        for sub in sub_texts:
+            seg_chars = list(sub)
+            seg_len = len(seg_chars)
+            if seg_len == 0:
+                continue
+            end_pos = min(char_pos + seg_len, len(char_map))
+            if end_pos <= char_pos:
+                continue
+            start_sec = char_map[char_pos][1]
+            end_sec = char_map[end_pos - 1][2]
+            # Enforce minimum 0.5s duration
+            if end_sec - start_sec < 0.5:
+                end_sec = start_sec + 0.5
+            segments.append({
+                "start": round(start_sec, 3),
+                "end": round(end_sec, 3),
+                "text": sub
+            })
+            char_pos = end_pos
+
+        if segments:
+            # Fix boundaries: ensure no overlap
+            for i in range(len(segments) - 1):
+                if segments[i]["end"] < segments[i + 1]["start"]:
+                    segments[i]["end"] = segments[i + 1]["start"]
+                elif segments[i]["end"] > segments[i + 1]["start"]:
+                    segments[i]["end"] = segments[i + 1]["start"]
+            # Clamp last segment duration
+            if segments:
+                segments[-1]["end"] = min(
+                    max(segments[-1]["end"], segments[-1]["start"] + 0.5),
+                    audio_duration
+                )
+            _log.info(f"[CTC Align] Refined {len(segments)} segments with forced alignment")
+            return segments
+
+    except Exception as e:
+        _log.warning(f"[CTC Align] Failed, falling back to original: {e}")
+    return None
+
+
+def _find_energy_dip(
+    waveform, target_idx: int, sample_rate: int,
+    window_sec: float = 1.5, hop_length: int = 512
+) -> int:
+    """在 target_idx 附近找帧能量最低点作为切点。
+    """
+    import numpy as np
+    window_samples = int(window_sec * sample_rate)
+    search_start = max(0, target_idx - window_samples)
+    search_end = min(len(waveform), target_idx + window_samples)
+
+    best_idx = target_idx
+    best_energy = float("inf")
+
+    pos = search_start
+    while pos + hop_length <= search_end:
+        frame = waveform[pos:pos + hop_length]
+        energy = np.sqrt(np.mean(frame ** 2))
+        if energy < best_energy:
+            best_energy = energy
+            best_idx = pos
+        pos += hop_length
+    return best_idx
 
 
 def _transcribe_dashscope(audio_path: str, language: str, api_url: str, api_key: str,
                           model: str, glossary: dict) -> Tuple[str, list]:
-    """Transcribe via DashScope with accurate timestamps using VAD pre-chunking.
+    """Transcribe via DashScope with energy-dip aware chunking for accurate timestamps.
 
-    1. VAD on original audio → detect speech intervals (exact start/end)
-    2. For each interval: extract audio → compress → send to DashScope → get text
-    3. Each segment's timestamp = the VAD interval time range (accurate!)
-    4. Long text within a segment is split by punctuation and distributed proportionally
+    Uses fixed 30s windows shifted to nearest energy dip — ensures 100% coverage,
+    no gaps, and minimal sentence cutting.
     """
     import librosa
     import soundfile as sf
 
-    # Step 1: Load audio and run VAD
+    # Step 1: Load audio and create energy-dip aware chunks (no gaps, 100% coverage)
     waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
     audio_duration = len(waveform) / sr
 
-    intervals = librosa.effects.split(waveform, top_db=35, frame_length=2048, hop_length=512)
+    CHUNK_SEC = 30
+    chunk_samples = int(CHUNK_SEC * sr)
+    boundary_samples = set()
+    boundary_samples.add(0)
+    for start_sample in range(chunk_samples, len(waveform), chunk_samples):
+        dip = _find_energy_dip(waveform, start_sample, sr, window_sec=1.5)
+        boundary_samples.add(dip)
+    boundary_samples.add(len(waveform))
+    sorted_boundaries = sorted(boundary_samples)
 
-    # If no speech detected, treat entire audio as one segment
-    if len(intervals) == 0:
-        intervals = [(0, len(waveform))]
-
-    # Merge nearby intervals (gap < 0.5s of silence)
-    gap_threshold = int(0.5 * sr)
     merged = []
-    for start, end in intervals:
-        if merged and start - merged[-1][1] < gap_threshold:
-            merged[-1] = (merged[-1][0], end)
+    for i in range(len(sorted_boundaries) - 1):
+        start_sample = sorted_boundaries[i]
+        end_sample = sorted_boundaries[i + 1]
+        # Skip tiny gaps (<0.3s) — merge into previous chunk
+        if merged and (end_sample - start_sample) / sr < 0.3:
+            merged[-1] = (merged[-1][0], end_sample)
         else:
-            merged.append((start, end))
+            merged.append((start_sample, end_sample))
 
-    # Fallback: fixed-duration chunking for continuous audio (music/rap/etc.)
-    # When VAD finds no silence gaps, split into fixed 12-second chunks
-    FIXED_CHUNK_SEC = 12
-    if audio_duration > 30 and len(merged) < 3:
-        chunk_size = int(FIXED_CHUNK_SEC * sr)
-        merged = [(i, min(i + chunk_size, len(waveform)))
-                  for i in range(0, len(waveform), chunk_size)]
-
-    # Step 2: Transcribe each interval and build segments with accurate timestamps
+    # Step 2: Transcribe each interval via DashScope with accurate timestamps
+    import time as _time
     all_segments = []
     accumulated_text = []
     total_calls = len(merged)
+    _t0 = _time.time()
+    _MAX_TOTAL_SEC = 600  # 10 minutes total cap
 
     for idx, (start_sample, end_sample) in enumerate(merged):
+        if _time.time() - _t0 > _MAX_TOTAL_SEC:
+            raise TimeoutError(
+                f"Cloud API transcription timed out after {_MAX_TOTAL_SEC}s "
+                f"({idx}/{total_calls} chunks completed). Try splitting the audio file."
+            )
         seg_audio = waveform[start_sample:end_sample]
         seg_start = start_sample / sr
         seg_end = end_sample / sr
@@ -656,7 +929,12 @@ def _transcribe_dashscope(audio_path: str, language: str, api_url: str, api_key:
 
     full_text = " ".join(accumulated_text)
 
-    # Fallback: if VAD produced no segments but we have text, create single segment
+    # Refine timestamps with CTC forced alignment if SenseVoice model available
+    refined = _refine_timestamps_with_ctc(audio_path, full_text, sr, all_segments)
+    if refined:
+        all_segments = refined
+
+    # Fallback: if chunking produced no segments but we have text, create single segment
     if not all_segments and full_text.strip():
         all_segments = [{"start": 0.0, "end": audio_duration, "text": full_text}]
 
@@ -673,10 +951,25 @@ def _transcribe_dashscope(audio_path: str, language: str, api_url: str, api_key:
 def _extract_segments(result: dict) -> list:
     """Extract time-aligned segments from Whisper verbose_json response."""
     segments_raw = result.get("segments", [])
-    if segments_raw:
-        return [{"start": s["start"], "end": s["end"], "text": s["text"].strip()}
-                for s in segments_raw]
-    return []
+    if not segments_raw:
+        return []
+
+    # Traditional Chinese → Simplified Chinese
+    try:
+        from zhconv import convert as _zhconv_convert
+    except ImportError:
+        _zhconv_convert = None
+
+    out = []
+    for s in segments_raw:
+        text = s["text"].strip()
+        if _zhconv_convert:
+            try:
+                text = _zhconv_convert(text, "zh-cn")
+            except Exception:
+                pass
+        out.append({"start": s["start"], "end": s["end"], "text": text})
+    return out
 
 
 # ── HTTP helpers (curl / requests) ────────────────────────────────────
@@ -799,7 +1092,7 @@ class CloudTranscriber(BaseTranscriber):
     """
 
     name = "cloud"
-    display_name = "Cloud API"
+    display_name = "云模型"
     requires_network = True
     is_local = False
 
@@ -816,7 +1109,7 @@ class CloudTranscriber(BaseTranscriber):
         config = load_engine_config()
         api_url = config["api_url"].rstrip("/")
         api_key = config["api_key"]
-        model = config.get("model", "whisper-1")
+        model = (config.get("model") or "").strip()
 
         if not api_url or not api_key:
             raise ValueError("Cloud engine not configured.")
