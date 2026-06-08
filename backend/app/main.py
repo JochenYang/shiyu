@@ -3,6 +3,7 @@ Subtitle Assistant - FastAPI Backend Service.
 Provides REST API for audio/video transcription and subtitle generation.
 """
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -12,14 +13,15 @@ from typing import Dict, Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.core.config_loader import load_config
-from app.core.audio_processor import preprocess_audio
 from app.core.model_downloader import ensure_model, get_download_status, get_model_dir
 from app.core.cloud_engine import load_engine_config, save_engine_config
 from app.core.engine_base import BaseTranscriber, TranscribeResult, Segment
+
+logger = logging.getLogger(__name__)
 
 
 # ── Engine Registry ─────────────────────────────────────────────────
@@ -29,8 +31,10 @@ _transcriber_registry: Dict[str, BaseTranscriber] = {}
 # Global state (backward compat)
 config = None
 
-# LLM correction applied flag (set by _apply_llm_correction, returned in API response)
-_llm_corrected: bool = False
+# LLM correction status (set by _apply_llm_correction, returned in API response)
+# Values: "success" | "failed" | "skipped"
+_llm_status: str = "skipped"
+_llm_corrected: bool = False  # backward-compat boolean
 
 
 def _register_default_engines():
@@ -50,14 +54,14 @@ def _register_default_engines():
         else:
             register_engine(SenseVoiceTranscriber)
     except ImportError:
-        pass
+        logger.info("[Engine Registry] SenseVoice engine unavailable (import failed)")
 
     # 2. Cloud API
     try:
         from app.core.cloud_engine import CloudTranscriber
         register_engine(CloudTranscriber)
     except ImportError:
-        pass
+        logger.info("[Engine Registry] Cloud engine unavailable (import failed)")
 
     # Bcut (必剪) and Jianying (剪映) free ASR engines were removed
     # in May 2026 because their reverse-engineered API endpoints became
@@ -118,14 +122,15 @@ def get_available_engines() -> list:
 def _apply_llm_correction(segments: list) -> list:
     """If LLM correction is enabled, correct text recognition errors in segments.
 
-    Sets global flag _llm_corrected for UI feedback.
+    Sets global flags _llm_status / _llm_corrected for UI feedback.
     Three-red-lines principle:
     - Don't change timestamp (start/end fields)
     - Don't add/remove segments
     - Don't rewrite semantics, only fix transcription errors
     """
-    global _llm_corrected
+    global _llm_corrected, _llm_status
     _llm_corrected = False
+    _llm_status = "skipped"
     from app.core.cloud_engine import load_llm_correction_config
     cfg = load_llm_correction_config()
     if not cfg.get("enabled"):
@@ -141,22 +146,30 @@ def _apply_llm_correction(segments: list) -> list:
         )
         corrector = create_corrector(corr_config)
         if corrector:
-            print(f"[LLM Correction] Correcting {len(segments)} segments via {corr_config.provider}")
+            logger.info("[LLM Correction] Correcting %d segments via %s", len(segments), corr_config.provider)
             corrected = corrector.correct(segments)
             # Sort by start time
             corrected.sort(key=lambda s: s.get("start", 0))
             # Only mark corrected if text actually changed
-            _llm_corrected = any(
-                seg["text"] != orig["text"]
-                for seg, orig in zip(corrected, segments)
+            changed_count = sum(
+                1 for s, o in zip(corrected, segments) if s["text"] != o["text"]
             )
+            _llm_corrected = changed_count > 0
             if _llm_corrected:
-                print(f"[LLM Correction] Done — {sum(1 for s,o in zip(corrected,segments) if s['text']!=o['text'])}/{len(segments)} segments changed")
+                _llm_status = "success"
+                logger.info(
+                    "[LLM Correction] Done — %d/%d segments changed",
+                    changed_count, len(segments),
+                )
             else:
-                print(f"[LLM Correction] Done — no changes (correction returned original)")
+                _llm_status = "success"
+                logger.info("[LLM Correction] Done — no changes (correction returned original)")
             return corrected
+        _llm_status = "skipped"
+        logger.info("[LLM Correction] Skipped — no corrector available (provider/model missing)")
     except Exception as e:
-        print(f"[LLM Correction] Failed: {e}")
+        _llm_status = "failed"
+        logger.warning("[LLM Correction] Failed: %s", e)
     return segments
 
 
@@ -179,6 +192,64 @@ def _extract_audio_for_transcribe(file_path: Path, audio_config: dict = None) ->
     return str(file_path)
 
 
+# ── VAD 断句 Segmentation ─────────────────────────────────────────────
+
+
+def _apply_vad_sentence_segmentation(audio_path: str, segments: list) -> list:
+    """使用 VAD 停顿检测对 ASR 输出进行智能断句。
+
+    接受 ``List[Segment]`` 或 ``List[dict]``（有 ``start``/``end``/``text``）。
+    返回相同类型的列表。
+
+    Args:
+        audio_path: 音频 WAV 文件路径。
+        segments: ASR 输出的 segments（Segment 对象或 dict）。
+
+    Returns:
+        断句后的 segments。
+    """
+    if not segments:
+        return segments
+
+    try:
+        import librosa
+        from app.core.vad_detector import VADDetector
+        from app.core.sentence_splitter import split_segments_at_vad_boundaries
+
+        # 统一转为 dict 格式处理
+        is_obj = hasattr(segments[0], 'to_dict')
+        raw: list = [s.to_dict() if is_obj else dict(s) for s in segments]
+
+        # 加载音频用于 VAD
+        waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
+        if len(waveform) < sr * 0.5:  # < 0.5s: 没必要断句
+            return segments
+
+        # VAD 检测语音活动区间（停顿 >= 0.5s 自动切分句子）
+        detector = VADDetector()
+        speech_intervals = detector.detect_speech(
+            waveform, sr,
+            min_speech_duration=0.1,
+            min_silence_duration=0.5,  # >= 0.5s 停顿 → 句子边界
+        )
+
+        if not speech_intervals or len(speech_intervals) < 2:
+            return segments
+
+        # 用 VAD 语音区间合并 segments（每个区间对应一个字幕）
+        segmented = split_segments_at_vad_boundaries(raw, speech_intervals)
+
+        # 转回原始类型
+        if is_obj:
+            from app.core.engine_base import Segment as SegCls
+            return [SegCls(start=s["start"], end=s["end"], text=s["text"]) for s in segmented]
+        return segmented
+
+    except Exception as e:
+        logger.warning("[VAD SentenceSeg] Failed, falling back to original: %s", e)
+        return segments
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load config and register engines. Shutdown: cleanup."""
@@ -193,22 +264,36 @@ async def lifespan(app: FastAPI):
 
     # Try to init local SenseVoice
     model_status = ensure_model()
-    print(f"[SubtitleAssistant] Model status: {model_status['status']}")
+    logger.info("[SubtitleAssistant] Model status: %s", model_status['status'])
+
+    # Pre-download Silero-VAD model (background, lazy at first call)
+    try:
+        from app.core.vad_detector import ensure_model as ensure_vad_model
+        vad_status = ensure_vad_model()
+        if vad_status["status"] == "downloading":
+            logger.info("[SubtitleAssistant] Silero-VAD downloading in background...")
+        elif vad_status["status"] == "ready":
+            logger.info("[SubtitleAssistant] Silero-VAD model ready")
+    except Exception:
+        pass  # Non-blocking; VAD will download on first use
 
     if model_status["status"] == "ready":
         try:
             get_engine("sensevoice_local")
-            print(f"[SubtitleAssistant] Model loaded: {config['model']['onnx_path']}")
+            logger.info("[SubtitleAssistant] Model loaded: %s", config['model']['onnx_path'])
         except Exception as e:
-            print(f"[SubtitleAssistant] Failed to load model: {e}")
+            logger.warning("[SubtitleAssistant] Failed to load model: %s", e)
     else:
-        print(f"[SubtitleAssistant] Model not ready yet: {model_status['status']}")
+        logger.info("[SubtitleAssistant] Model not ready yet: %s", model_status['status'])
 
-    print(f"[SubtitleAssistant] Server ready at http://{config['server']['host']}:{config['server']['port']}")
+    logger.info(
+        "[SubtitleAssistant] Server ready at http://%s:%s",
+        config['server']['host'], config['server']['port'],
+    )
 
     yield
 
-    print("[SubtitleAssistant] Shutting down...")
+    logger.info("[SubtitleAssistant] Shutting down...")
 
 
 app = FastAPI(
@@ -256,10 +341,10 @@ async def model_status():
     if download_status["status"] == "ready":
         try:
             get_engine("sensevoice_local")
-            print(f"[SubtitleAssistant] Model loaded after download: {config['model']['onnx_path']}")
+            logger.info("[SubtitleAssistant] Model loaded after download: %s", config['model']['onnx_path'])
         except Exception as e:
             if "Unknown engine" not in str(e):
-                print(f"[SubtitleAssistant] Failed to load model after download: {e}")
+                logger.warning("[SubtitleAssistant] Failed to load model after download: %s", e)
                 download_status["status"] = "error"
                 download_status["error"] = str(e)
 
@@ -367,13 +452,20 @@ async def transcribe_file(
 
         try:
             custom_glossary = json.loads(glossary)
-        except json.JSONDecodeError:
-            custom_glossary = {}
+        except json.JSONDecodeError as exc:
+            logger.warning("[Transcribe] invalid glossary JSON: %s", exc)
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_glossary", "detail": str(exc)},
+            )
 
         # Resolve engine and transcribe
         transcriber = get_engine(engine_mode)
         audio_path = _extract_audio_for_transcribe(tmp_path, config.get("audio") if config else None)
         result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
+
+        # VAD 智能断句：按语流停顿合并为句子级 segments
+        result.segments = _apply_vad_sentence_segmentation(audio_path, result.segments)
 
         # Format output
         segments = result.to_segments_list()
@@ -423,13 +515,20 @@ async def transcribe_json(
 
         try:
             custom_glossary = json.loads(glossary)
-        except json.JSONDecodeError:
-            custom_glossary = {}
+        except json.JSONDecodeError as exc:
+            logger.warning("[Transcribe JSON] invalid glossary JSON: %s", exc)
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_glossary", "detail": str(exc)},
+            )
 
         # Resolve engine and transcribe
         transcriber = get_engine(engine_mode)
         audio_path = _extract_audio_for_transcribe(tmp_path, config.get("audio") if config else None)
         result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
+
+        # VAD 智能断句：按语流停顿合并为句子级 segments
+        result.segments = _apply_vad_sentence_segmentation(audio_path, result.segments)
 
         segments = result.to_segments_list()
 
@@ -440,7 +539,13 @@ async def transcribe_json(
         except Exception:
             total_duration = segments[-1]["end"] if segments else 0
 
-        return {"filename": file.filename, "language": language, "duration": total_duration, "segments": segments}
+        return {
+            "filename": file.filename,
+            "language": language,
+            "duration": total_duration,
+            "segments": segments,
+            "llm_status": _llm_status,
+        }
 
     except PermissionError as e:
         raise HTTPException(401, str(e))
@@ -485,13 +590,20 @@ async def transcribe_local(
     try:
         try:
             custom_glossary = json.loads(glossary)
-        except json.JSONDecodeError:
-            custom_glossary = {}
+        except json.JSONDecodeError as exc:
+            logger.warning("[Transcribe Local] invalid glossary JSON: %s", exc)
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_glossary", "detail": str(exc)},
+            )
 
         # Resolve engine and transcribe
         transcriber = get_engine(engine_mode)
         audio_path = _extract_audio_for_transcribe(file_path, config.get("audio") if config else None)
         result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
+
+        # VAD 智能断句：按语流停顿合并为句子级 segments
+        result.segments = _apply_vad_sentence_segmentation(audio_path, result.segments)
 
         segments = result.to_segments_list()
 
@@ -522,6 +634,7 @@ async def transcribe_local(
             "filename": file_path.name,
             "duration": total_duration,
             "language": language,
+            "llm_status": _llm_status,
         }
 
     except PermissionError as e:
@@ -617,10 +730,12 @@ async def correct_transcription(body: dict):
     """Apply determinisic + optional LLM correction to transcription segments.
 
     Accepts JSON: {"segments": [...], "engine_mode": "local"}
+    Optionally accepts "audio_path" for VAD-based sentence segmentation.
 
     Two-layer architecture:
       Layer 1: Deterministic correction (always runs, zero cost)
       Layer 2: Optional LLM enhancement (on top of Layer 1 result)
+      Phase 3: Optional VAD-based sentence segmentation (if audio_path provided)
 
     Does NOT re-transcribe — only fixes text recognition errors.
 
@@ -630,27 +745,55 @@ async def correct_transcription(body: dict):
     - Don't rewrite semantics, only fix transcription errors
     """
     segments = body.get("segments", [])
+    audio_path: Optional[str] = body.get("audio_path")
     if not segments:
         return {"segments": [], "llm_corrected": False}
+
+    # ── Phase 0: VAD-first sentence segmentation ──
+    # VAD runs FIRST to produce authoritative timestamps from audio.
+    # Uses VAD speech intervals (from detect_speech) rather than pause
+    # boundary midpoints — each speech interval between pauses >= 0.5s
+    # becomes one subtitle segment. This prevents text duplication that
+    # occurred with the old boundary-based approach.
+    if audio_path:
+        try:
+            from app.core.audio_processor import load_audio
+            from app.core.vad_detector import get_detector
+            from app.core.sentence_splitter import split_segments_at_vad_boundaries
+            waveform = load_audio(audio_path)
+            if len(waveform) >= 8000:
+                detector = get_detector()
+                speech_intervals = detector.detect_speech(
+                    waveform, sr=16000,
+                    min_speech_duration=0.1,
+                    min_silence_duration=0.5,
+                )
+                if speech_intervals and len(speech_intervals) >= 2:
+                    segments = split_segments_at_vad_boundaries(segments, speech_intervals)
+        except Exception as e:
+            logger.warning("[VAD] Failed to apply VAD segmentation: %s", e)
 
     # ── Layer 1: Deterministic correction (always runs) ──
     from app.core.asr_corrector import deterministic_correct
     layer1 = deterministic_correct(segments)
     layer1.sort(key=lambda s: s.get("start", 0))
 
+    # ── Helper: build final result (split long → return) ──
+    def _build_result(source: list, changed: bool, label: str):
+        from app.core.segment_merger import split_long_segments
+        final = split_long_segments(source)
+        if len(final) != len(source):
+            print(f"[Segment Splitter] Split {len(source)} → {len(final)} segments")
+        print(f"[{label}] Corrected {len(final)} segments")
+        return {"segments": final, "llm_corrected": changed}
+
     # ── Layer 2: Optional LLM enhancement ──
     from app.core.cloud_engine import load_llm_correction_config
     cfg = load_llm_correction_config()
 
     if not cfg.get("enabled"):
-        # LLM disabled → use Layer 1 result directly
-        from app.core.segment_merger import split_long_segments
-        final = split_long_segments(layer1)
-        changed = any(
-            s["text"] != o["text"] for s, o in zip(layer1, segments)
-        )
-        print(f"[Deterministic] Corrected {len(layer1)} segments (LLM disabled)")
-        return {"segments": final, "llm_corrected": changed}
+        changed = any(s["text"] != o["text"] for s, o in zip(layer1, segments))
+        return _build_result(layer1, changed, "Deterministic LLM-disabled")
 
     from app.core.llm_corrector import create_corrector, CorrectionConfig
     corr_config = CorrectionConfig(
@@ -662,32 +805,21 @@ async def correct_transcription(body: dict):
     )
     corrector = create_corrector(corr_config)
     if not corrector:
-        from app.core.segment_merger import split_long_segments
-        final = split_long_segments(layer1)
-        changed = any(
-            s["text"] != o["text"] for s, o in zip(layer1, segments)
-        )
-        print(f"[Deterministic] Corrected {len(layer1)} segments (LLM config missing)")
-        return {"segments": final, "llm_corrected": changed}
+        changed = any(s["text"] != o["text"] for s, o in zip(layer1, segments))
+        return _build_result(layer1, changed, "Deterministic LLM-config-missing")
 
     print(f"[LLM Enhancement] Enhancing {len(layer1)} segments via {corr_config.provider}")
     try:
         import asyncio
         loop = asyncio.get_event_loop()
-        # LLM corrects on top of Layer 1 result (already clean text)
         llm_result = await loop.run_in_executor(None, corrector.correct, layer1)
     except Exception as e:
         print(f"[LLM Enhancement] Failed: {e}, falling back to deterministic result")
-        from app.core.segment_merger import split_long_segments
-        final = split_long_segments(layer1)
-        changed = any(
-            s["text"] != o["text"] for s, o in zip(layer1, segments)
-        )
-        return {"segments": final, "llm_corrected": changed}
+        changed = any(s["text"] != o["text"] for s, o in zip(layer1, segments))
+        return _build_result(layer1, changed, "Deterministic LLM-fallback")
 
     llm_result.sort(key=lambda s: s.get("start", 0))
 
-    # Check if LLM improved anything beyond deterministic correction
     llm_improved = any(
         s["text"] != o["text"] for s, o in zip(llm_result, layer1)
     )
@@ -696,19 +828,8 @@ async def correct_transcription(body: dict):
     else:
         print(f"[LLM Enhancement] Done — no additional changes")
 
-    # Use LLM result if it improved text, otherwise fall back to Layer 1
     final_source = llm_result if llm_improved else layer1
-
-    # Phase 3: Split any segments that are still too long
-    from app.core.segment_merger import split_long_segments
-    final = split_long_segments(final_source)
-    if len(final) != len(final_source):
-        print(f"[Segment Splitter] Split {len(final_source)} → {len(final)} segments")
-
-    changed = any(
-        s["text"] != o["text"] for s, o in zip(final, segments)
-    )
-    return {"segments": final, "llm_corrected": changed}
+    return _build_result(final_source, llm_improved, "LLM")
 
 
 if __name__ == "__main__":
