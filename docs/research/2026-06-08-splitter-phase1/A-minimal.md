@@ -1,0 +1,33 @@
+{
+  "files_to_change": [
+    "D:\\codes\\Shiyu\\backend\\app\\core\\text_splitter.py",
+    "D:\\codes\\Shiyu\\backend\\app\\core\\cloud_engine.py",
+    "D:\\codes\\Shiyu\\backend\\app\\core\\segment_merger.py",
+    "D:\\codes\\Shiyu\\backend\\app\\core\\asr_corrector.py"
+  ],
+  "function_signatures": [
+    "text_splitter.py: DEFAULT_MAX_CHARS=25, DEFAULT_MAX_CHARS_EN=42, DEFAULT_MIN_CHARS=15, DEFAULT_MAX_DURATION=7.0, PUNCT_MIN_LEN_FOR_PERIOD=10; _assign_timestamps_with_overlap(seg, parts, duration, result)",
+    "cloud_engine.py: _transcribe_dashscope(audio_path, language, api_url, api_key, model, glossary) -> Tuple[str, list]",
+    "segment_merger.py: split_long_segments(segments, max_chars=text_splitter.DEFAULT_MAX_CHARS, min_chars=text_splitter.DEFAULT_MIN_CHARS, max_duration=text_splitter.DEFAULT_MAX_DURATION)",
+    "asr_corrector.py: _should_add_terminal_punct(self, text, seg_idx, total_segs) -> bool"
+  ],
+  "code_skeleton": "// FILE 1: text_splitter.py\n// BEFORE (line 25-28)\nDEFAULT_MAX_CHARS = 35\nDEFAULT_MAX_CHARS_EN = 50\nDEFAULT_MIN_CHARS = 15\nDEFAULT_MAX_DURATION = 7.0\n\n// AFTER\nDEFAULT_MAX_CHARS = 25  // 与 cloud/sensevoice 的 max_len=25 对齐\nDEFAULT_MAX_CHARS_EN = 42\nDEFAULT_MIN_CHARS = 15\nDEFAULT_MAX_DURATION = 7.0\nPUNCT_MIN_LEN_FOR_PERIOD = 10  // asr_corrector 共享\n\n// BEFORE _assign_timestamps (line 231-253)\ncursor = seg[\"start\"]\nfor idx, part_text in enumerate(merged_parts):\n    is_last = idx == len(merged_parts) - 1\n    part_ratio = len(part_text) / total_chars\n    part_end = seg[\"end\"] if is_last else cursor + duration * part_ratio\n    result.append({\"start\": round(cursor, 3), \"end\": round(part_end, 3), \"text\": part_text})\n    cursor = part_end\n\n// AFTER\ndef _assign_timestamps(seg, parts, duration, result):\n    _assign_timestamps_with_overlap(seg, parts, duration, result)\n\ndef _assign_timestamps_with_overlap(seg, parts, duration, result):\n    OVERLAP = 0.05\n    n = len(parts)\n    cursor = seg[\"start\"]\n    for idx, part_text in enumerate(parts):\n        is_last = idx == n - 1\n        part_ratio = len(part_text) / total_chars\n        part_end = seg[\"end\"] if is_last else cursor + duration * part_ratio\n        seg_start = max(seg[\"start\"], cursor - (OVERLAP if idx > 0 else 0.0))\n        result.append({\"start\": round(seg_start, 3), \"end\": round(part_end, 3), \"text\": part_text})\n        cursor = part_end\n\n// FILE 2: cloud_engine.py (line 810-826)\n// BEFORE\nis_cjk = text_splitter.is_mostly_cjk(text)\nmax_len = 25 if is_cjk else 42\nsub_texts = text_splitter.split_text_for_subtitles(text, max_len, is_cjk)\nif len(sub_texts) <= 1:\n    all_segments.append({\"start\": seg_start, \"end\": seg_end, \"text\": text})\nelse:\n    total_chars = sum(len(t) for t in sub_texts) or 1\n    offset = 0.0\n    for sub in sub_texts:\n        ratio = len(sub) / total_chars\n        sub_start = seg_start + offset\n        sub_end = seg_start + offset + ratio * seg_duration\n        offset += ratio * seg_duration\n        all_segments.append({\"start\": sub_start, \"end\": sub_end, \"text\": sub})\n\n// AFTER\nis_cjk = text_splitter.is_mostly_cjk(text)\nmax_len = text_splitter.DEFAULT_MAX_CHARS if is_cjk else text_splitter.DEFAULT_MAX_CHARS_EN\nsub_texts = text_splitter.split_text_for_subtitles(text, max_len, is_cjk)\nif len(sub_texts) <= 1:\n    all_segments.append({\"start\": seg_start, \"end\": seg_end, \"text\": text})\nelse:\n    chunk_seg = {\"start\": seg_start, \"end\": seg_end, \"text\": text}\n    sub_out: list = []\n    text_splitter._assign_timestamps_with_overlap(chunk_seg, sub_texts, seg_duration, sub_out)\n    all_segments.extend(sub_out)\n\n// FILE 3: segment_merger.py (line 119-124)\n// BEFORE\ndef split_long_segments(segments, max_chars=50, min_chars=15, max_duration=7.0):\n    return text_splitter.split_text_at_boundaries(segments, max_chars, min_chars, max_duration)\n\n// AFTER\ndef split_long_segments(segments,\n    max_chars: int = text_splitter.DEFAULT_MAX_CHARS,\n    min_chars: int = text_splitter.DEFAULT_MIN_CHARS,\n    max_duration: float = text_splitter.DEFAULT_MAX_DURATION):\n    return text_splitter.split_text_at_boundaries(segments, max_chars, min_chars, max_duration)\n\n// FILE 4: asr_corrector.py (line 793-796)\n// BEFORE\nif trimmed and len(trimmed) > 10:\n    last_ch = trimmed[-1]\n    if last_ch not in \"。！？.!?\":\n        text = text.rstrip() + \"。\"\n\n// AFTER\nfrom app.core import text_splitter\ndef _should_add_terminal_punct(self, text, seg_idx, total_segs):\n    if not text: return False\n    if len(text) < text_splitter.PUNCT_MIN_LEN_FOR_PERIOD: return False\n    if seg_idx >= total_segs - 1: return False\n    return True\n// 调用处\nif self._should_add_terminal_punct(trimmed, seg_idx, total_segs):\n    last_ch = trimmed[-1]\n    if last_ch not in \"。！？.!?\":\n        text = text.rstrip() + \"。\"",
+  "acceptance": [
+    "[回归测试] 现有 27 个测试用例全部通过 (pytest backend/tests/ --tb=short)",
+    "[无新依赖] diff pyproject.toml/requirements.txt 为空 (仅用已有模块 re, dataclass, typing)",
+    "[三红线保持] merge_segments 仍 buf.start=first.start / buf.end=last.end; ASR 修正仍浅拷贝 segments; 时间戳分配仍落在 [seg.start, seg.end] 区间内",
+    "[阈值统一] grep -E 'max_chars\\s*=\\s*[0-9]+' 应只在 text_splitter.py 命中 (静态扫描零硬编码)",
+    "[比例漂移消除] 单 chunk 内 3 段子段, 首段 start == chunk.start, 末段 end == chunk.end (无 +0.3s 累计漂移)",
+    "[时间戳误差 < 200ms] tests/test_phase1_timestamp.py: 10 段抽样, |auto - manual| < 200ms",
+    "[SRT 行数误差 < 5%] tests/test_phase1_linecount.py: 3 段音频 (30s/5min/20min), SRT 行数差异 < 5%"
+  ],
+  "risks": [
+    "[R1-overlap 视觉叠影] 0.05s 重叠让某些播放器字幕行切换时有叠影; 缓解: overlap_sec=0.0 关闭开关, 1 用户样本先回归",
+    "[R2-阈值变小] DEFAULT_MAX_CHARS 50→25 致 SRT 行数 +5~15%, 长视频导出略慢; 缓解: 统计行数变化 < 20% 才全量",
+    "[R3-末段不去标点] asr_corrector 跳过最后一段标点 → 字幕末尾可能缺句号; 缓解: subtitle_formatter 兜底补全",
+    "[R4-签名兼容] _assign_timestamps 保留旧实现, 外部可能误用; 缓解: @deprecated 注释, 下版本删",
+    "[R5-下游消费] cloud_engine 重构子段分配, 下游 (subtitle_formatter) 需重验证; 缓解: 字段名 {start,end,text} 不变",
+    "[R6-性能] 4 个 _assign_timestamps_with_overlap 调用 O(n), 单 chunk < 0.1ms, 可忽略"
+  ],
+  "rollback": "若 Phase 1 导致 SRT 行数误差 >= 5% 或时间戳误差 >= 200ms: (1) 立即回滚: git checkout HEAD -- text_splitter.py cloud_engine.py segment_merger.py asr_corrector.py; (2) 灰度: USE_OVERLAP_FIX=False + DEFAULT_MAX_CHARS=35 回退; (3) 灰度策略: 仅 _is_dashscope_url 走新逻辑, Whisper 走旧路径, 监控 24h P95<3% 后全量开启; (4) 实施前打 tag phase1-tactical-v1, 出问题 reset --hard 即可"
+}
