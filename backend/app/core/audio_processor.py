@@ -29,22 +29,29 @@ def find_ffmpeg() -> str:
 
     Search order:
       1. backend/bin/ffmpeg (or .exe on Windows) — bundled with app
-      2. FFMPEG_PATH environment variable
-      3. System PATH
-      4. Windows: known WinGet installation path (fallback)
+      2. ~/.shiyu/bin/ffmpeg — auto-downloaded by ffmpeg_downloader.py
+      3. FFMPEG_PATH environment variable
+      4. System PATH
+      5. Windows: known WinGet installation path (fallback)
+      6. Trigger background download to ~/.shiyu/bin/
     Returns the path string, or 'ffmpeg' as last resort.
     """
+    exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+
     # 1. Bundled binary (next to backend/ in backend/bin/)
     backend_dir = Path(__file__).resolve().parent.parent.parent
-    exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
     bundled = backend_dir / "bin" / exe_name
     if bundled.is_file():
         return str(bundled)
 
-    # 2. Environment variable override
+    # 2. User data dir (~/.shiyu/bin/) — auto-downloaded
+    shiyu_bin = Path.home() / ".shiyu" / "bin" / exe_name
+    if shiyu_bin.is_file():
+        return str(shiyu_bin)
+
+    # 3. Environment variable override
     env_ffmpeg = os.environ.get("FFMPEG_PATH")
     if env_ffmpeg:
-        # Quick check it works
         try:
             subprocess.run(
                 [env_ffmpeg, "-version"],
@@ -55,7 +62,7 @@ def find_ffmpeg() -> str:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
-    # 3. System PATH
+    # 4. System PATH
     try:
         subprocess.run(
             ["ffmpeg", "-version"],
@@ -66,7 +73,7 @@ def find_ffmpeg() -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # 4. Windows: WinGet fallback
+    # 5. Windows: WinGet fallback
     if sys.platform == "win32":
         winget_path = (
             r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages"
@@ -76,22 +83,82 @@ def find_ffmpeg() -> str:
         if os.path.exists(winget_path):
             return winget_path
 
+    # 6. Trigger background download to ~/.shiyu/bin/
+    try:
+        from app.core.ffmpeg_downloader import ensure_ffmpeg
+        ensure_ffmpeg()
+        # Return the expected path even if download hasn't finished yet
+        return str(shiyu_bin)
+    except Exception:
+        pass
+
     return "ffmpeg"  # Let it fail naturally
 
 
 def extract_audio_from_video(video_path: str, output_wav: str = None, sample_rate: int = 16000) -> str:
-    """Extract audio from video using ffmpeg. Returns path to wav file."""
+    """Extract audio from video using ffmpeg. Returns path to wav file.
+
+    Raises:
+        RuntimeError: if ffmpeg is not found, the conversion fails, or the
+            output wav file is empty. The error message includes the ffmpeg
+            stderr (truncated) so the user can diagnose codec/container issues
+            without grep-ing logs.
+    """
     if output_wav is None:
         output_wav = tempfile.mktemp(suffix=".wav")
 
     ffmpeg_exe = find_ffmpeg()
+    if ffmpeg_exe == "ffmpeg":
+        # Heuristic: the literal string "ffmpeg" is returned when no bundled
+        # binary, no env var, no PATH match, and no WinGet fallback found one.
+        # We don't know whether the next subprocess.run() will actually find
+        # one in PATH, so we let it run and surface a real error if it fails.
+        # But we do emit a hint so the user knows fallback was used.
+        print("[audio] Note: using system ffmpeg from PATH (no bundled binary found)")
+
     cmd = [
         ffmpeg_exe, "-y", "-i", video_path,
         "-vn", "-acodec", "pcm_s16le",
         "-ac", "1", "-ar", str(sample_rate),
         output_wav
     ]
-    _run_hidden(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        result = subprocess.run(
+            cmd, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"ffmpeg executable not found at '{ffmpeg_exe}'. "
+            f"Install ffmpeg or set FFMPEG_PATH env var. "
+            f"Underlying error: {e}"
+        )
+
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace")
+        # ffmpeg prints status to stderr; trim to last 800 chars for readability
+        stderr_tail = stderr.strip()[-800:] if stderr.strip() else "(no stderr)"
+        raise RuntimeError(
+            f"ffmpeg failed to extract audio from video. "
+            f"ffmpeg={ffmpeg_exe}, video={video_path}, output={output_wav}, "
+            f"returncode={result.returncode}. "
+            f"ffmpeg stderr (last 800 chars): {stderr_tail}"
+        )
+
+    # Verify the output file is non-empty (ffmpeg can exit 0 but produce a
+    # zero-byte file if the input has no audio track).
+    if not os.path.exists(output_wav):
+        raise RuntimeError(
+            f"ffmpeg reported success but output wav does not exist: {output_wav}. "
+            f"Check that the input video has an audio track."
+        )
+    if os.path.getsize(output_wav) < 1024:  # <1 KB is almost certainly empty WAV
+        raise RuntimeError(
+            f"ffmpeg produced a suspiciously small wav file ({os.path.getsize(output_wav)} bytes). "
+            f"Input video may have no audio track or use an unsupported codec. "
+            f"Output: {output_wav}"
+        )
+
     return output_wav
 
 
@@ -223,32 +290,3 @@ def apply_cmvn(features: np.ndarray, cmvn: np.ndarray) -> np.ndarray:
     return (features + means) * vars_
 
 
-def preprocess_audio(audio_path: str, is_video: bool = False, config: dict = None) -> np.ndarray:
-    """Full preprocessing pipeline: extract -> fbank -> LFR -> CMVN.
-
-    Returns:
-        features: [1, n_frames, feature_dim] float32, ready for ONNX
-    """
-    cfg = config or {}
-    sample_rate = cfg.get("sample_rate", 16000)
-    n_mels = cfg.get("n_mels", 80)
-    frame_length = cfg.get("frame_length", 25)
-    frame_shift = cfg.get("frame_shift", 10)
-    lfr_m = cfg.get("lfr_m", 7)
-    lfr_n = cfg.get("lfr_n", 6)
-    cmvn_file = cfg.get("cmvn_file", None)
-
-    if is_video:
-        audio_path = extract_audio_from_video(audio_path, sample_rate=sample_rate)
-
-    waveform = load_audio(audio_path, sample_rate)
-    fbank = compute_fbank_kaldi(waveform, sample_rate, n_mels, frame_length, frame_shift)
-    features = apply_lfr(fbank, lfr_m, lfr_n)
-
-    # Apply CMVN if available
-    if cmvn_file and os.path.exists(cmvn_file):
-        cmvn = load_cmvn(cmvn_file)
-        features = apply_cmvn(features, cmvn).astype(np.float32)
-
-    # Add batch dimension: [1, n_frames, feature_dim]
-    return np.expand_dims(features, axis=0)
