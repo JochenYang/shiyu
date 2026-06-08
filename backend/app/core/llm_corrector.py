@@ -9,7 +9,9 @@ All providers use the same /chat/completions endpoint format.
 Falls back to original text on any error.
 """
 import logging
+import os
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -52,7 +54,13 @@ CORRECTION_SYSTEM_PROMPT = """你是语音识别文本修正器。你的工作�
 6. 如果行以完整句子结尾，补句号；如果行明显被截断，末尾不加句号
 7. 遇到"en"+"gine"这种断词，在各自行内修正（不要跨行合并）"""
 
-DEFAULT_BATCH_SIZE = 50
+# ---------------------------------------------------------------------------
+# Phase 1B 性能/可靠性常量（env 可覆盖）
+# ---------------------------------------------------------------------------
+DEFAULT_BATCH_SIZE = 20           # 原 50: 较小批次降低单次响应延迟
+DEFAULT_MAX_WORKERS = int(os.environ.get("LLM_MAX_WORKERS", "5"))  # 原 3
+DEFAULT_TIMEOUT_SEC = int(os.environ.get("LLM_TIMEOUT_SEC", "90"))  # 原 180
+DEFAULT_RETRIES = 1               # 1 次立即重试（仅 timeout/network）
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +331,12 @@ class BaseCorrector(ABC):
         sends each batch to the LLM, parses the response, and
         replaces the ``text`` field in-place.
 
+        Phase 1B 调优:
+        - 默认 batch=20（原 50），单次响应更快、错误影响面更小
+        - max_workers 默认 5（原 3），并发度更高，可通过 LLM_MAX_WORKERS 覆盖
+        - 增加进度日志：每完成一个 batch 报告 (completed/total, elapsed)
+        - 单批失败不再阻塞其它批，失败的 segment 文本保持原文
+
         Args:
             segments: Input segments to correct.
             api_url: Full chat-completions URL.
@@ -349,9 +363,18 @@ class BaseCorrector(ABC):
             prompt_text = _build_correction_prompt(original_texts)
             batches.append((batch_start, batch_slice, original_texts, prompt_text))
 
-        # Process batches in parallel (up to 3 concurrent requests to avoid rate limiting)
+        total_batches = len(batches)
+        batch_size_actual = DEFAULT_BATCH_SIZE
+        max_workers = max(1, min(DEFAULT_MAX_WORKERS, total_batches))
+        logger.info(
+            "[LLM Correction] %d segments → %d batch(es) of ≤%d, workers=%d, timeout=%ds",
+            len(result), total_batches, batch_size_actual, max_workers, DEFAULT_TIMEOUT_SEC,
+        )
+
+        # Process batches in parallel
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for batch_start, batch_slice, original_texts, prompt_text in batches:
                 fut = executor.submit(
@@ -360,17 +383,30 @@ class BaseCorrector(ABC):
                 )
                 futures[fut] = (batch_start, batch_slice)
 
+            completed = 0
             for fut in concurrent.futures.as_completed(futures):
                 batch_start, batch_slice = futures[fut]
+                completed += 1
                 try:
                     corrected = fut.result()
                 except Exception as e:
-                    logger.warning("Batch correction failed (batch starting at %d): %s", batch_start, e)
-                    continue
-                if corrected is not None:
-                    for seg, new_text in zip(batch_slice, corrected):
-                        seg["text"] = new_text
+                    logger.warning(
+                        "[LLM Correction] batch %d failed (%d/%d): %s",
+                        batch_start, completed, total_batches, e,
+                    )
+                else:
+                    if corrected is not None:
+                        for seg, new_text in zip(batch_slice, corrected):
+                            seg["text"] = new_text
+                logger.info(
+                    "[LLM Correction] progress %d/%d batch(es) done in %.2fs",
+                    completed, total_batches, time.monotonic() - started,
+                )
 
+        logger.info(
+            "[LLM Correction] all batches done in %.2fs (ok=%d/%d)",
+            time.monotonic() - started, completed, total_batches,
+        )
         return result
 
     def _process_single_batch(self, api_url, api_key, model, prompt_text, original_texts):
@@ -399,6 +435,12 @@ class BaseCorrector(ABC):
     ) -> Optional[str]:
         """Call the OpenAI-compatible chat completions API.
 
+        Phase 1B 调优:
+        - 超时由 180s 调整为 DEFAULT_TIMEOUT_SEC (90s)
+        - timeout / network 错误时自动重试 1 次
+        - HTTP 4xx/5xx 不重试（立即失败）
+        - parse 错误不重试（说明响应格式问题）
+
         Args:
             api_url: Full chat-completions endpoint URL.
             api_key: API key (may be empty for local providers).
@@ -426,46 +468,60 @@ class BaseCorrector(ABC):
             # 客户端 _strip_thinking_blocks 已经能剥离 <think>...</think> 块, 不需要服务端关闭。
         }
 
-        try:
-            resp = requests.post(api_url, headers=headers, json=payload, timeout=180)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.exceptions.Timeout:
-            logger.warning("LLM correction request timed out (url=%s, model=%s)", api_url, model)
-            return None
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else "N/A"
-            logger.warning(
-                "LLM correction HTTP error (url=%s, model=%s, status=%s): %s",
-                api_url, model, status, exc,
-            )
-            return None
-        except requests.exceptions.RequestException as exc:
-            logger.warning(
-                "LLM correction request failed (url=%s, model=%s): %s",
-                api_url, model, exc,
-            )
-            return None
-        except (ValueError, KeyError, TypeError) as exc:
-            logger.warning(
-                "LLM correction response parse error (url=%s, model=%s): %s",
-                api_url, model, exc,
-            )
-            return None
+        last_error_kind: Optional[str] = None
+        for attempt in range(DEFAULT_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    api_url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT_SEC,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # success path
+                content = data["choices"][0]["message"]["content"]
+                if content:
+                    content = _strip_thinking_blocks(content)
+                    return content.strip() if content else None
+                return None
+            except requests.exceptions.Timeout as exc:
+                last_error_kind = "timeout"
+                logger.warning(
+                    "LLM correction timeout (url=%s, model=%s, attempt=%d/%d): %s",
+                    api_url, model, attempt + 1, DEFAULT_RETRIES + 1, exc,
+                )
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "N/A"
+                # 4xx/5xx 不重试 — 直接返回 None
+                logger.warning(
+                    "LLM correction HTTP error (url=%s, model=%s, status=%s): %s",
+                    api_url, model, status, exc,
+                )
+                return None
+            except requests.exceptions.RequestException as exc:
+                last_error_kind = "network"
+                logger.warning(
+                    "LLM correction request failed (url=%s, model=%s, attempt=%d/%d): %s",
+                    api_url, model, attempt + 1, DEFAULT_RETRIES + 1, exc,
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning(
+                    "LLM correction response parse error (url=%s, model=%s): %s",
+                    api_url, model, exc,
+                )
+                return None
+            except (KeyError, IndexError, TypeError) as exc:
+                logger.warning(
+                    "LLM correction response has unexpected format (url=%s, model=%s): %s",
+                    api_url, model, exc,
+                )
+                return None
 
-        # Extract content from standard OpenAI response format
-        try:
-            content = data["choices"][0]["message"]["content"]
-            if content:
-                content = _strip_thinking_blocks(content)
-                return content.strip() if content else None
-            return None
-        except (KeyError, IndexError, TypeError) as exc:
+        # exhausted retries
+        if last_error_kind in ("timeout", "network"):
             logger.warning(
-                "LLM correction response has unexpected format (url=%s, model=%s): %s",
-                api_url, model, exc,
+                "LLM correction gave up after %d attempt(s) (last_error=%s)",
+                DEFAULT_RETRIES + 1, last_error_kind,
             )
-            return None
+        return None
 
 
 # ---------------------------------------------------------------------------
