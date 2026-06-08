@@ -11,7 +11,9 @@ import re
 import numpy as np
 import onnxruntime as ort
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Dict
+
+from . import text_splitter
 
 # 内置术语纠错表 (Built-in glossary)
 BASE_GLOSSARY: Dict[str, str] = {
@@ -311,16 +313,6 @@ class SenseVoiceEngine:
     # CTC peak delay compensation (CTC emits tokens after seeing context)
     CTC_DELAY_SEC = 0.15
 
-    @staticmethod
-    def _is_mostly_cjk(text: str) -> bool:
-        """Check if text is primarily CJK (Chinese/Japanese/Korean)."""
-        cjk = sum(1 for c in text if (
-            '\u4e00' <= c <= '\u9fff' or   # CJK Unified
-            '\u3040' <= c <= '\u30ff' or   # Hiragana + Katakana
-            '\uac00' <= c <= '\ud7af'      # Hangul
-        ))
-        return cjk > len(text) * 0.3
-
     def transcribe_with_timestamps(self, features: np.ndarray,
                                     audio_duration_sec: float,
                                     language: str = "auto",
@@ -358,11 +350,11 @@ class SenseVoiceEngine:
             return []
         
         # Step 3: Detect language and choose splitting parameters
-        is_cjk = self._is_mostly_cjk(text)
-        max_len = 25 if is_cjk else 42  # English allows more chars per line
+        is_cjk = text_splitter.is_mostly_cjk(text)
+        max_len = text_splitter.DEFAULT_MAX_CHARS if is_cjk else text_splitter.DEFAULT_MAX_CHARS_EN  # Phase 1: 引用 text_splitter 共享常量,避免脱钩
         
         # Step 4: Split text into subtitle segments
-        segments_text = self._split_text_for_subtitles(text, max_len, is_cjk)
+        segments_text = text_splitter.split_text_for_subtitles(text, max_len, is_cjk)
         
         if not segments_text:
             return []
@@ -418,104 +410,6 @@ class SenseVoiceEngine:
             )
         
         return segments
-
-    def _split_text_for_subtitles(self, text: str, max_len: int = 25,
-                                   is_cjk: bool = True) -> List[str]:
-        """Split text into subtitle-friendly segments using 3-level strategy.
-        
-        Level 1: Split by sentence boundaries (。！？；!?;  .!? for English)
-        Level 2: Split long sentences at commas/colons
-        Level 3: Hard-cut fallback (word-aware for English, char-level for CJK)
-        """
-        # Level 1: Sentence boundary split
-        if is_cjk:
-            parts = re.split(r"([。！？；!?;.])", text)
-        else:
-            # For English: split at sentence-ending punctuation followed by space
-            parts = re.split(r"([.!?;](?:\s|$))", text)
-        
-        sentences = []
-        for i in range(0, len(parts) - 1, 2):
-            s = parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")
-            s = s.strip()
-            if s:
-                sentences.append(s)
-        if len(parts) % 2 == 1 and parts[-1].strip():
-            sentences.append(parts[-1].strip())
-
-        # Level 2: Comma/colon split for long segments
-        refined = []
-        for sent in sentences:
-            if len(sent) <= max_len:
-                refined.append(sent)
-                continue
-            if is_cjk:
-                sub_parts = re.split(r"([，、,：:、])", sent)
-            else:
-                # For English: split at commas
-                sub_parts = re.split(r"(,\s*)", sent)
-            current = ""
-            for j in range(0, len(sub_parts) - 1, 2):
-                clause = sub_parts[j] + (sub_parts[j + 1] if j + 1 < len(sub_parts) else "")
-                if not current:
-                    current = clause
-                elif len(current) + len(clause) <= max_len:
-                    current += clause
-                else:
-                    if current.strip():
-                        refined.append(current.strip())
-                    current = clause
-            if len(sub_parts) % 2 == 1 and sub_parts[-1]:
-                if current and len(current) + len(sub_parts[-1]) <= max_len:
-                    current += sub_parts[-1]
-                else:
-                    if current.strip():
-                        refined.append(current.strip())
-                    current = sub_parts[-1]
-            if current.strip():
-                refined.append(current.strip())
-
-        # Level 3: Hard-cut fallback
-        final = []
-        for seg in refined:
-            if len(seg) <= max_len:
-                final.append(seg)
-                continue
-            
-            if is_cjk:
-                # CJK: character-level cut with punctuation attachment
-                i = 0
-                while i < len(seg):
-                    end = min(i + max_len, len(seg))
-                    chunk = seg[i:end]
-                    if end < len(seg) and seg[end] in "，、,：:。！？；!?;":
-                        chunk += seg[end]
-                        end += 1
-                    final.append(chunk.strip())
-                    i = end
-            else:
-                # English: word-boundary-aware splitting
-                words = seg.split(" ")
-                current = ""
-                for word in words:
-                    if not word:
-                        continue
-                    if not current:
-                        current = word
-                    elif len(current) + 1 + len(word) <= max_len:
-                        current += " " + word
-                    else:
-                        if current.strip():
-                            final.append(current.strip())
-                        current = word
-                if current.strip():
-                    final.append(current.strip())
-
-        # Fallback: if no splitting happened
-        if not final:
-            final = [text.strip()] if text.strip() else []
-
-        return final
 
     def transcribe_waveform_with_vad(self, waveform: np.ndarray, sample_rate: int, audio_cfg: dict,
                                      duration_sec: float, language: str = "zh",

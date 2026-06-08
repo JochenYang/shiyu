@@ -21,7 +21,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +372,13 @@ class SmartDictionary:
     def apply_to_texts(self, texts: List[str]) -> List[str]:
         """批量应用验算替换。"""
         return [self.apply(t) for t in texts]
+
+
+# ---------------------------------------------------------------------------
+# 配置常量
+# Phase 1: PUNCT_MIN_LEN 从 _apply_punct_rules line 793 硬编码字面量 10 提为模块常量
+# ---------------------------------------------------------------------------
+PUNCT_MIN_LEN: int = 10  # 段尾无标点时,触发补句号的最小字符阈值(原硬编码 10)
 
 
 # ---------------------------------------------------------------------------
@@ -789,8 +796,8 @@ class ASRDeterministicCorrector:
         # 触发条件：
         #   - 段尾没有标点
         #   - 不是最后一段或者最后一段内容完整
-        #   - 段不太短（> 10 字符）
-        if trimmed and len(trimmed) > 10:
+        #   - 段不太短（> PUNCT_MIN_LEN 字符，Phase 1 提为常量，原硬编码 10）
+        if trimmed and len(trimmed) > PUNCT_MIN_LEN:
             last_ch = trimmed[-1]
             if last_ch not in "。！？.!?":
                 text = text.rstrip() + "。"
