@@ -25,6 +25,56 @@ from . import text_splitter
 
 CONFIG_FILE = Path.home() / ".shiyu" / "config.json"
 
+
+def _friendly_http_error(resp, endpoint: str, mode: str) -> RuntimeError:
+    """Build a user-readable error from a non-2xx HTTP response.
+
+    Inspects Content-Type to avoid dumping HTML bodies to the UI:
+    - ``text/html`` → likely wrong URL/path/port (gateway 404 page)
+    - ``application/json`` → parse the standard error envelope
+    - anything else → first 200 chars of the body
+
+    The error message always includes the endpoint so the user can verify
+    their ``api_url`` without grep-ing logs.
+    """
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    body = resp.text or ""
+    if "text/html" in ctype:
+        snippet = body.split(">", 1)[0].split("<", 1)[0] if body else ""
+        msg = (
+            f"Cloud API error {resp.status_code} (HTML response, likely wrong URL). "
+            f"Endpoint: {endpoint}. Mode: {mode}. "
+            f"Check that your api_url is correct and the path is supported by this provider. "
+            f"Server hint: {snippet[:120]!r}"
+        )
+    elif "application/json" in ctype:
+        try:
+            data = resp.json()
+            # Standard OpenAI-compatible error envelope
+            err_obj = data.get("error") if isinstance(data, dict) else None
+            if isinstance(err_obj, dict):
+                inner = err_obj.get("message") or err_obj.get("type") or str(err_obj)
+            elif err_obj is not None:
+                inner = str(err_obj)
+            else:
+                inner = str(data)[:200]
+            msg = (
+                f"Cloud API error {resp.status_code} ({mode}): {inner}. "
+                f"Endpoint: {endpoint}"
+            )
+        except (ValueError, KeyError, TypeError):
+            msg = (
+                f"Cloud API error {resp.status_code} ({mode}, malformed JSON). "
+                f"Endpoint: {endpoint}. Body: {body[:200]!r}"
+            )
+    else:
+        msg = (
+            f"Cloud API error {resp.status_code} ({mode}). "
+            f"Endpoint: {endpoint}. Content-Type: {ctype!r}. "
+            f"Body: {body[:200]!r}"
+        )
+    return RuntimeError(msg)
+
 # On Windows, curl (Schannel TLS) avoids OpenSSL SSLEOFError with some servers
 _USE_CURL = sys.platform == "win32"
 
@@ -148,8 +198,35 @@ def save_llm_correction_config(enabled: bool, provider: str, api_url: str,
 
 
 def _is_dashscope_url(api_url: str) -> bool:
-    """Detect if the API URL points to DashScope."""
+    """Detect if the API URL points to DashScope (legacy / backward-compat).
+
+    Kept for code paths that still special-case DashScope. New code should
+    rely on the ``request_mode`` config field instead of URL sniffing.
+    """
     return "dashscope.aliyuncs.com" in api_url
+
+
+def _resolve_auth_header(config: dict) -> dict:
+    """Build the HTTP auth header from engine config.
+
+    Default scheme matches OpenAI / OpenAI-compatible providers
+    (``Authorization: Bearer <api_key>``). Providers using a different
+    auth header can override via ``auth_header.name`` and
+    ``auth_header.value_template`` (``{api_key}`` is substituted with
+    the configured key).
+
+    Examples:
+      # OpenAI / DashScope compatible
+      (uses defaults)
+
+      # Xiaomi MiMo:
+      auth_header: {"name": "api-key", "value_template": "{api_key}"}
+    """
+    auth = config.get("auth_header") or {}
+    name = auth.get("name", "Authorization")
+    template = auth.get("value_template", "Bearer {api_key}")
+    value = template.format(api_key=config.get("api_key", ""))
+    return {name: value}
 
 
 def _normalize_base_url(api_url: str) -> str:
@@ -343,33 +420,56 @@ def transcribe_cloud(audio_path: str, language: str = "auto",
                      glossary: dict = None) -> Tuple[str, list]:
     """Transcribe audio using the configured cloud API provider.
 
-    Priority:
-      1. OpenAI-compatible Whisper API (/audio/transcriptions)
-      2. DashScope-specific chat/completions with input_audio (last resort)
+    Routing is **config-driven** via the ``request_mode`` field in
+    ``~/.shiyu/config.json`` (engine section):
+
+      * ``"whisper"``  (default) → OpenAI-compatible
+        ``POST {base}/audio/transcriptions`` (multipart upload). Works
+        with OpenAI, Groq, DeepSeek, and any provider exposing the
+        OpenAI Whisper endpoint.
+      * ``"chat_completions"`` → OpenAI-compatible
+        ``POST {base}/chat/completions`` with an ``input_audio`` message
+        part. Works with DashScope (Qwen-ASR), Xiaomi MiMo, and any
+        provider following the OpenAI multimodal chat shape.
+
+    Provider-specific quirks (auth header, asr_options) come from the
+    config rather than hard-coded URL sniffing. See ``_resolve_auth_header``
+    and the engine config schema for details.
     """
     config = load_engine_config()
     api_url = config["api_url"].rstrip("/")
     api_key = config["api_key"]
     model = (config.get("model") or "").strip()
+    request_mode = (config.get("request_mode") or "whisper").lower().strip()
 
     if not api_url or not api_key:
         raise ValueError("Cloud engine not configured. Set API URL and key in settings.")
 
-    segments = None
+    # Explicit config-driven routing
+    if request_mode == "chat_completions":
+        _srt, segments = _transcribe_dashscope(
+            audio_path, language, api_url, api_key, model, glossary or {}
+        )
+        srt_content = _segments_to_srt(segments)
+        return srt_content, segments
 
-    # Priority 1: Whisper API (standard /audio/transcriptions)
+    if request_mode != "whisper":
+        raise ValueError(
+            f"Unknown engine.request_mode: {request_mode!r}. "
+            f"Expected 'whisper' or 'chat_completions'."
+        )
+
+    # Default: OpenAI Whisper /audio/transcriptions
+    segments = None
     try:
         _srt, segments = _transcribe_whisper(audio_path, language, api_url, api_key, model, glossary or {})
     except Exception:
         pass
 
-    # Priority 2: DashScope-specific chat/completions (last resort)
-    if segments is None and _is_dashscope_url(api_url):
-        _srt, segments = _transcribe_dashscope(audio_path, language, api_url, api_key, model, glossary or {})
-
+    # Whisper path: error if no segments returned
     if segments is None:
         raise RuntimeError(
-            "Cloud API transcription failed. "
+            "Cloud API (whisper) transcription failed. "
             "Check that your API URL and key are correct."
         )
 
@@ -403,7 +503,7 @@ def _transcribe_whisper(audio_path: str, language: str, api_url: str, api_key: s
             if resp.status_code == 401:
                 raise PermissionError("Cloud API authentication failed. Check your API key.")
             if resp.status_code != 200:
-                raise RuntimeError(f"Cloud API error ({resp.status_code}): {resp.text[:500]}")
+                raise _friendly_http_error(resp, endpoint, "Whisper /audio/transcriptions")
             result = resp.json()
 
     segments = _extract_segments(result)
@@ -453,6 +553,20 @@ def _transcribe_dashscope_payload(compressed_path: str, api_url: str, api_key: s
 
 
 def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_key: str, model: str, _log) -> str:
+    """Generic OpenAI-compatible chat-completions + input_audio ASR call.
+
+    Works with any provider that follows the OpenAI chat completions
+    schema with an ``input_audio`` content part. Provider-specific quirks
+    (auth header, asr_options) come from the engine config rather than
+    hard-coded detection, so adding a new provider is a config-only
+    change — no code edits required.
+    """
+    # Re-load the full engine config to read auth_header / asr_options
+    full_cfg = load_engine_config()
+    auth_header = _resolve_auth_header(full_cfg)
+    asr_options = full_cfg.get("asr_options") or {}
+    provider_name = full_cfg.get("display_name", "Cloud")
+
     with open(compressed_path, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("ascii")
 
@@ -465,9 +579,9 @@ def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_k
     }
     mime = mime_map.get(ext, "audio/wav")
 
-    # Build chat completions request body (DashScope compatible-mode)
-    # Per DashScope docs: content array should contain ONLY one input_audio element,
-    # NO additional text elements alongside it.
+    # Build chat completions request body.
+    # Per OpenAI-compatible docs: content array should contain ONLY one
+    # input_audio element, NO additional text elements alongside it.
     body = {
         "model": model,
         "messages": [
@@ -484,39 +598,41 @@ def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_k
             }
         ],
         "stream": False,
-        "asr_options": {
-            "enable_itn": False,
-        },
     }
+    # Provider-specific ASR options (e.g. DashScope: enable_itn, MiMo: language)
+    if asr_options:
+        body["asr_options"] = asr_options
 
     # Normalize URL and build endpoint
     base = _normalize_base_url(api_url)
     endpoint = f"{base}/chat/completions"
 
-    auth_header = f"Bearer {api_key}"
-
-    headers = {"Authorization": auth_header, "Content-Type": "application/json"}
+    headers = {**auth_header, "Content-Type": "application/json"}
     resp = requests.post(endpoint, headers=headers, json=body, timeout=120)
     if resp.status_code == 401:
-        raise PermissionError("Cloud API authentication failed. Check your API key.")
+        raise PermissionError(f"{provider_name} authentication failed. Check your API key.")
     if resp.status_code != 200:
-        raise RuntimeError(f"Cloud API error ({resp.status_code}): {resp.text[:500]}")
+        raise _friendly_http_error(resp, endpoint, f"{provider_name} /chat/completions")
     result = resp.json()
 
     # Check for error response
     if "error" in result:
-        err_msg = result["error"].get("message", str(result["error"]))
-        raise RuntimeError(f"DashScope API error: {err_msg}")
+        err_obj = result["error"]
+        if isinstance(err_obj, dict):
+            err_msg = err_obj.get("message") or err_obj.get("type") or str(err_obj)
+        else:
+            err_msg = str(err_obj)
+        raise RuntimeError(f"{provider_name} API error: {err_msg}")
 
     # Parse chat completions response
-    _log.debug(f"[cloud_engine v3] Raw response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+    _log.debug(f"[cloud_engine v3/{provider_name}] Raw response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
     try:
         content = result["choices"][0]["message"]["content"]
-        _log.info(f"[cloud_engine v3] content type={type(content).__name__}, value={repr(content)[:200]}")
+        _log.info(f"[cloud_engine v3/{provider_name}] content type={type(content).__name__}, value={repr(content)[:200]}")
     except (KeyError, IndexError):
-        _log.error(f"[cloud_engine v3] Unexpected response: {json.dumps(result, ensure_ascii=False)[:1000]}")
+        _log.error(f"[cloud_engine v3/{provider_name}] Unexpected response: {json.dumps(result, ensure_ascii=False)[:1000]}")
         raise RuntimeError(
-            f"Unexpected DashScope response format: "
+            f"Unexpected {provider_name} response format: "
             f"{json.dumps(result, ensure_ascii=False)[:500]}"
         )
 
@@ -526,7 +642,7 @@ def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_k
     try:
         text = content.strip() if isinstance(content, str) else str(content)
     except Exception as e:
-        raise RuntimeError(f"Failed to parse DashScope transcription content: {e}")
+        raise RuntimeError(f"Failed to parse {provider_name} transcription content: {e}")
 
     # Traditional Chinese → Simplified Chinese
     try:
@@ -970,13 +1086,15 @@ class CloudTranscriber(BaseTranscriber):
         api_url = config["api_url"].rstrip("/")
         api_key = config["api_key"]
         model = (config.get("model") or "").strip()
+        request_mode = (config.get("request_mode") or "whisper").lower().strip()
 
         if not api_url or not api_key:
             raise ValueError("Cloud engine not configured.")
 
         glossary = kwargs.get("glossary", {})
 
-        if _is_dashscope_url(api_url):
+        if request_mode == "chat_completions":
+            # OpenAI-compatible chat completions + input_audio (DashScope / MiMo / etc.)
             if self._use_chunk_merger:
                 return self._transcribe_dashscope_merged(
                     audio_path, language, api_url, api_key, model, glossary
@@ -985,7 +1103,7 @@ class CloudTranscriber(BaseTranscriber):
                 _, segments = _transcribe_dashscope(
                     audio_path, language, api_url, api_key, model, glossary
                 )
-        else:
+        elif request_mode == "whisper":
             _, segments = _transcribe_whisper(
                 audio_path, language, api_url, api_key, model, glossary
             )
