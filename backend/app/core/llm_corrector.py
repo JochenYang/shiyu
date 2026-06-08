@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from app.core import text_splitter
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -35,7 +37,9 @@ CORRECTION_SYSTEM_PROMPT = """你是语音识别文本修正器。你的工作�
 绝对禁止的行为（违反将导致输出被丢弃）：
 - 禁止添加任何分析、注释、说明、引号、标记
 - 禁止在行首添加"被截断"、"注意"、"这里"、"需要"等词
-- 禁止改写句式、补充内容、重新组织语言
+- 禁止改写句式、补充内容、重新组织语言、润色文字
+- 禁止在原文基础上加任何词（包括"的"、"了"、"呢"、"吗"等语气词）
+- 禁止删除原文中的任何词
 - 禁止输出空行
 - 禁止输出任何文字以外的内容
 
@@ -43,7 +47,7 @@ CORRECTION_SYSTEM_PROMPT = """你是语音识别文本修正器。你的工作�
 1. 输出行数必须等于输入行数，每行对应输入的相同序号行
 2. 只修正错别字、断词、缺失标点
 3. 不改变原意和事实内容
-4. 如果某行原文正确，原样输出
+4. 如果某行原文正确，原样输出（一个字都不要改）
 5. 被截断的半句话不要加「…」前缀或后缀
 6. 如果行以完整句子结尾，补句号；如果行明显被截断，末尾不加句号
 7. 遇到"en"+"gine"这种断词，在各自行内修正（不要跨行合并）"""
@@ -172,9 +176,13 @@ def _build_correction_prompt(segment_texts: List[str]) -> str:
     """
     lines = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(segment_texts))
     return (
-        f"请修正以下 {len(segment_texts)} 行语音识别结果。\n"
-        f"输出 {len(segment_texts)} 行修正文本，每行对应输入的同序号行。\n"
-        f"不要分析，不要加注释，不要加引号，不要加标记。\n\n"
+        f"严格修正以下 {len(segment_texts)} 行语音识别错别字和断词。\n\n"
+        f"规则（违反将导致输出被丢弃）：\n"
+        f"1. 输出严格 {len(segment_texts)} 行，每行对应输入的同序号\n"
+        f"2. 只修正错别字和断词，不改句式、不加词、不减词\n"
+        f"3. 原文正确就原样输出，一个字都不要改\n"
+        f"4. 不要分析、不要注释、不要加引号、不要加标记\n"
+        f"5. 禁止在原文基础上添加任何话术或润色\n\n"
         f"{lines}"
     )
 
@@ -413,9 +421,9 @@ class BaseCorrector(ABC):
                 {"role": "user", "content": prompt_text},
             ],
             "temperature": 0.1,  # low temperature for deterministic correction
-            # 尝试关闭模型内置的思维链输出（MiniMax/DeepSeek 等支持此参数）
-            # 不支持此参数的服务商会忽略它
-            "thinking": False,
+            # NOTE: 不再传 `thinking: False` — MiniMax 服务端把它当作 ThinkingConfig 对象
+            # 期望(bool 类型不匹配, 直接返回 400 bad_request_error)。
+            # 客户端 _strip_thinking_blocks 已经能剥离 <think>...</think> 块, 不需要服务端关闭。
         }
 
         try:
@@ -587,12 +595,11 @@ def _split_text_into_segments(
 
     # -- Step 1: Split into sentences by terminal punctuation --
     # Terminal punctuation, but SKIP decimal points (e.g., "0.5")
-    _TERMINAL = frozenset("。！？.!?\n")
     sentences: list[str] = []
     buf_chars: list[str] = []
     for i, ch in enumerate(corrected_text):
         buf_chars.append(ch)
-        if ch in _TERMINAL:
+        if ch in text_splitter.TERMINAL_PUNCT:
             # Skip decimal point: period between two digits
             if ch == '.' and i > 0 and i < len(corrected_text) - 1:
                 if corrected_text[i - 1].isdigit() and corrected_text[i + 1].isdigit():
