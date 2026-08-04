@@ -1,10 +1,10 @@
 """
 Subtitle format generators: SRT, LRC, ASS.
 """
-import re
-import math
 from typing import List, Dict
 from dataclasses import dataclass
+
+from .text_splitter import is_mostly_cjk
 
 
 @dataclass
@@ -41,15 +41,19 @@ def _format_ass_time(seconds: float) -> str:
 
 
 def _split_long_lines(text: str, max_length: int = 40, max_lines: int = 2) -> str:
-    """Split long text into multiple lines for subtitle display.
-    
+    """将长文本切分为多行字幕（行间用 \\N 连接）。
+
+    中文（CJK 占比 >30%）按字符切分、行内不插空格；英文按单词切分、词间保留空格。
     When text exceeds max_lines, remaining content is appended to the last line
     rather than discarded, ensuring no content is lost.
     """
     if len(text) <= max_length:
         return text
 
-    words = text.split(" ") if " " in text else list(text)
+    is_cjk = is_mostly_cjk(text)
+    # 中文按字符切分；英文优先按单词切分，无空格时退化为字符级
+    words = text.split(" ") if (not is_cjk and " " in text) else list(text)
+    sep = "" if is_cjk else " "
     lines = []
     current_line = ""
     overflow = False
@@ -57,17 +61,17 @@ def _split_long_lines(text: str, max_length: int = 40, max_lines: int = 2) -> st
     for word in words:
         if overflow:
             # Append remaining words to the last line
-            lines[-1] = lines[-1] + " " + word
+            lines[-1] = lines[-1] + sep + word
             continue
-        if len(current_line) + len(word) + 1 <= max_length:
-            current_line += (" " + word if current_line else word)
+        if len(current_line) + len(word) + (len(sep) if current_line else 0) <= max_length:
+            current_line += (sep + word if current_line else word)
         else:
             if current_line:
                 lines.append(current_line)
             current_line = word
             if len(lines) >= max_lines:
                 # Exceeded max lines: start appending to last line
-                lines[-1] = lines[-1] + " " + current_line
+                lines[-1] = lines[-1] + sep + current_line
                 overflow = True
 
     if not overflow and current_line and len(lines) < max_lines:
@@ -100,7 +104,7 @@ def generate_srt(segments: List[SubtitleSegment],
         lines.append(f"{_format_srt_time(seg.start)} --> {_format_srt_time(seg.end)}")
         lines.append(text)
         lines.append("")
-    return "\n".join(lines)
+    return "\ufeff" + "\n".join(lines)
 
 
 def generate_lrc(segments: List[SubtitleSegment]) -> str:
@@ -152,6 +156,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + "\n".join(event_lines)
 
 
+def _join_text(prev_text: str, curr_text: str) -> str:
+    """合并相邻段文本：prev 以中文为主时直接拼接，英文/混合场景保留空格分隔。"""
+    sep = "" if is_mostly_cjk(prev_text) else " "
+    return prev_text + sep + curr_text
+
+
 def segments_from_transcription(segments_raw: List[Dict],
                                  merge_gap: float = 0.5) -> List[SubtitleSegment]:
     """Convert raw transcription segments to SubtitleSegment objects.
@@ -159,6 +169,9 @@ def segments_from_transcription(segments_raw: List[Dict],
     merge_gap=0.5 re-joins nearby short segments into natural subtitle
     events (especially important for mixed Chinese-English speech where
     CTC splitting can be too granular).
+
+    Also merges segments that are too short (< 1.5s) to be readable
+    on screen, even if they exceed the 80-char combined limit.
     """
     result = []
     for seg in segments_raw:
@@ -170,17 +183,55 @@ def segments_from_transcription(segments_raw: List[Dict],
         if s.text:
             result.append(s)
 
-    # Merge segments with small gaps (disabled by default)
+    # Multi-pass merge: keep merging while any segment is too short
     if len(result) > 1 and merge_gap > 0:
-        merged = [result[0]]
-        for curr in result[1:]:
-            prev = merged[-1]
-            gap = curr.start - prev.end
-            if gap <= merge_gap and len(prev.text) + len(curr.text) < 80:
-                prev.end = curr.end
-                prev.text += " " + curr.text
-            else:
+        MIN_READABLE_DURATION = 1.5  # seconds — anything shorter is unreadable
+        MAX_COMBINED_LEN = 80  # max combined text length
+
+        # First pass: merge if gap small AND combined text <= 80 chars
+        for _ in range(10):  # cap iterations to avoid infinite loop
+            merged = [result[0]]
+            changed = False
+            for curr in result[1:]:
+                prev = merged[-1]
+                gap = curr.start - prev.end
+                prev_duration = prev.end - prev.start
+
+                # Normal merge: small gap AND text not too long
+                if gap <= merge_gap and len(prev.text) + len(curr.text) < MAX_COMBINED_LEN:
+                    prev.end = curr.end
+                    if curr.text and curr.text not in prev.text:
+                        prev.text = _join_text(prev.text, curr.text)
+                    changed = True
+                else:
+                    merged.append(curr)
+            result = merged
+            if not changed:
+                break
+
+        # Second pass: merge SHORT segments with their neighbor
+        # (but stop once a segment reaches MAX_COMBINED_LEN or MIN_READABLE_DURATION)
+        for _ in range(5):
+            merged = [result[0]]
+            changed = False
+            for curr in result[1:]:
+                prev = merged[-1]
+                gap = curr.start - prev.end
+                prev_duration = prev.end - prev.start
+                prev_len = len(prev.text)
+
+                # Merge prev into curr if prev is too short and prev hasn't grown too long
+                if prev_duration < MIN_READABLE_DURATION and gap <= merge_gap * 2:
+                    # Cap: don't let prev exceed MAX_COMBINED_LEN
+                    if prev_len < MAX_COMBINED_LEN:
+                        prev.end = curr.end
+                        if curr.text and curr.text not in prev.text:
+                            prev.text = _join_text(prev.text, curr.text)
+                        changed = True
+                        continue  # don't append curr, it's merged
                 merged.append(curr)
-        result = merged
+            result = merged
+            if not changed:
+                break
 
     return result

@@ -9,7 +9,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,9 +17,14 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.core.config_loader import load_config
-from app.core.model_downloader import ensure_model, get_download_status, get_model_dir
+from app.core.model_downloader import (
+    ensure_model, get_download_status, get_model_dir,
+    ensure_punctuation_model, get_punctuation_status,
+    get_all_status,
+)
 from app.core.cloud_engine import load_engine_config, save_engine_config
 from app.core.engine_base import BaseTranscriber, TranscribeResult, Segment
+from app.core.pipeline import PipelineContext, SubtitlePipeline
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +32,8 @@ logger = logging.getLogger(__name__)
 # ── Engine Registry ─────────────────────────────────────────────────
 # Maps engine_mode string → transcriber instance
 _transcriber_registry: Dict[str, BaseTranscriber] = {}
+# 注册失败的引擎列表 (PyInstaller 漏打包等), 在 /engines 返回给前端
+_engines_failed: List[Tuple[str, str]] = []  # [(name, reason), ...]  type: ignore[name-defined]  # noqa: F821
 
 # Global state (backward compat)
 config = None
@@ -38,11 +45,37 @@ _llm_corrected: bool = False  # backward-compat boolean
 
 
 def _register_default_engines():
-    """Register all available ASR engines in the global registry."""
-    global _transcriber_registry, config
-    _transcriber_registry = {}
+    """Register all available ASR engines in the global registry.
 
-    # 1. Local SenseVoice
+    本地引擎: Zipformer-CTC-zh / SenseVoice-Small / Paraformer-large,
+    另注册 Cloud (OpenAI 兼容 API). 前端引擎选择器按名字取用.
+    """
+    global _transcriber_registry, config
+    global _engines_failed
+    _transcriber_registry = {}
+    _engines_failed = []  # 记录注册失败的引擎 (PyInstaller 缺模块时兜底)
+
+    # 1. Local Zipformer (sherpa-onnx, 中文 SOTA)
+    try:
+        from app.core.zipformer_engine import ZipformerTranscriber
+        engines_cfg = (config or {}).get("engines", {}) if config else {}
+        if engines_cfg.get("zipformer", {}).get("enabled", True):  # default enabled
+            zf_kwargs = ZipformerTranscriber.from_config(engines_cfg.get("zipformer", {}))
+            # from_config 返回实例, 提取 kwargs
+            from app.core.zipformer_engine import ZipformerEngine
+            init_kwargs = ZipformerEngine.init_kwargs_from_config(engines_cfg.get("zipformer", {}))
+            register_engine(ZipformerTranscriber, **init_kwargs)
+            logger.info("[Engine Registry] Zipformer registered (sherpa-onnx)")
+        else:
+            logger.info("[Engine Registry] Zipformer disabled (set engines.zipformer.enabled=true in config.yaml)")
+    except ImportError as e:
+        _engines_failed.append(("zipformer_local", f"import failed: {e}"))
+        logger.warning("[Engine Registry] Zipformer unavailable: %s (PyInstaller 可能漏打包 zipformer_engine)", e)
+    except Exception as e:
+        _engines_failed.append(("zipformer_local", f"load failed: {e}"))
+        logger.warning("[Engine Registry] Zipformer load failed: %s", e)
+
+    # 2. Local SenseVoice (多语言备选 zh/en/ja/ko/yue 5 语言)
     try:
         from app.core.sensevoice_engine import SenseVoiceTranscriber
         if config:
@@ -56,12 +89,28 @@ def _register_default_engines():
     except ImportError:
         logger.info("[Engine Registry] SenseVoice engine unavailable (import failed)")
 
-    # 2. Cloud API
+    # 3. Cloud API (OpenAI 兼容通用, 用户自己填 endpoint + key)
     try:
         from app.core.cloud_engine import CloudTranscriber
         register_engine(CloudTranscriber)
     except ImportError:
         logger.info("[Engine Registry] Cloud engine unavailable (import failed)")
+
+    # 4. Local Paraformer (v2.1 主走, sherpa-onnx Paraformer-large int8, CIF 边界)
+    try:
+        from app.core.paraformer_engine import ParaformerTranscriber
+        from app.core.paraformer_engine import ParaformerEngine
+        engines_cfg = (config or {}).get("engines", {}) if config else {}
+        if engines_cfg.get("paraformer", {}).get("enabled", True):  # default enabled
+            init_kwargs = ParaformerEngine.init_kwargs_from_config(engines_cfg.get("paraformer", {}))
+            register_engine(ParaformerTranscriber, **init_kwargs)
+            logger.info("[Engine Registry] Paraformer registered (v2.1 primary, sherpa-onnx CIF)")
+    except ImportError as e:
+        _engines_failed.append(("paraformer_local", f"import failed: {e}"))
+        logger.warning("[Engine Registry] Paraformer unavailable: %s (PyInstaller 可能漏打包 paraformer_engine)", e)
+    except Exception as e:
+        _engines_failed.append(("paraformer_local", f"load failed: {e}"))
+        logger.warning("[Engine Registry] Paraformer load failed: %s", e)
 
     # Bcut (必剪) and Jianying (剪映) free ASR engines were removed
     # in May 2026 because their reverse-engineered API endpoints became
@@ -106,8 +155,29 @@ def get_available_engines() -> list:
     """Return list of registered engine metadata and availability."""
     results = []
     for name, entry in _transcriber_registry.items():
-        inst = entry["instance"] or entry["cls"]()
-        avail, reason = inst.is_available()
+        inst = entry["instance"]
+        if inst is None:
+            # Lazy-instantiate — always try, even with no kwargs
+            try:
+                inst = entry["cls"](**entry["kwargs"])
+            except Exception as e:
+                inst = None
+        if inst is None:
+            # Fall back to class-level metadata if no instance
+            cls = entry["cls"]
+            results.append({
+                "name": name,
+                "display_name": getattr(cls, "display_name", name),
+                "requires_network": getattr(cls, "requires_network", False),
+                "is_local": getattr(cls, "is_local", True),
+                "available": False,
+                "reason": "cannot instantiate (missing config or model)",
+            })
+            continue
+        try:
+            avail, reason = inst.is_available()
+        except Exception as e:
+            avail, reason = False, f"is_available() raised: {e}"
         results.append({
             "name": name,
             "display_name": inst.display_name if hasattr(inst, "display_name") else name,
@@ -119,58 +189,36 @@ def get_available_engines() -> list:
     return results
 
 
-def _apply_llm_correction(segments: list) -> list:
-    """If LLM correction is enabled, correct text recognition errors in segments.
+def _resolve_engines_list(config=None, engine_mode: str = "local") -> list:
+    """解析本次转录要使用的 ASR 引擎列表.
 
-    Sets global flags _llm_status / _llm_corrected for UI feedback.
-    Three-red-lines principle:
-    - Don't change timestamp (start/end fields)
-    - Don't add/remove segments
-    - Don't rewrite semantics, only fix transcription errors
+    行为:
+      1. engine_mode='cloud' → ['cloud'] (OpenAI 兼容云端 API)
+      2. engine_mode=zipformer_local/sensevoice_local/paraformer_local → [该引擎]
+      3. 其他值 (默认 'local') → ['zipformer_local'],
+         若 config["engines"]["sensevoice"]["enabled"] == True 则追加 'sensevoice_local'
+
+    Returns:
+        引擎名列表, e.g. ["zipformer_local"] 或 ["zipformer_local", "sensevoice_local"]
     """
-    global _llm_corrected, _llm_status
-    _llm_corrected = False
-    _llm_status = "skipped"
-    from app.core.cloud_engine import load_llm_correction_config
-    cfg = load_llm_correction_config()
-    if not cfg.get("enabled"):
-        return segments
-    try:
-        from app.core.llm_corrector import create_corrector, CorrectionConfig
-        corr_config = CorrectionConfig(
-            enabled=True,
-            provider=cfg.get("provider", "openai"),
-            api_url=cfg.get("api_url", ""),
-            api_key=cfg.get("api_key", ""),
-            model=cfg.get("model", ""),
-        )
-        corrector = create_corrector(corr_config)
-        if corrector:
-            logger.info("[LLM Correction] Correcting %d segments via %s", len(segments), corr_config.provider)
-            corrected = corrector.correct(segments)
-            # Sort by start time
-            corrected.sort(key=lambda s: s.get("start", 0))
-            # Only mark corrected if text actually changed
-            changed_count = sum(
-                1 for s, o in zip(corrected, segments) if s["text"] != o["text"]
-            )
-            _llm_corrected = changed_count > 0
-            if _llm_corrected:
-                _llm_status = "success"
-                logger.info(
-                    "[LLM Correction] Done — %d/%d segments changed",
-                    changed_count, len(segments),
-                )
-            else:
-                _llm_status = "success"
-                logger.info("[LLM Correction] Done — no changes (correction returned original)")
-            return corrected
-        _llm_status = "skipped"
-        logger.info("[LLM Correction] Skipped — no corrector available (provider/model missing)")
-    except Exception as e:
-        _llm_status = "failed"
-        logger.warning("[LLM Correction] Failed: %s", e)
-    return segments
+    if engine_mode == "cloud":
+        return ["cloud"]
+    known_local = {"zipformer_local", "sensevoice_local", "paraformer_local"}
+    if engine_mode in known_local:
+        return [engine_mode]
+
+    engines = ["zipformer_local"]
+    if not config:
+        return engines
+    engines_cfg = config.get("engines", {}) or {}
+    if engines_cfg.get("sensevoice", {}).get("enabled", False):
+        engines.append("sensevoice_local")
+    return engines
+
+
+# v2.0: _apply_llm_correction removed (LLM layer dropped, owner decision #2)
+# Module-level _llm_status / _llm_corrected flags kept for UI backward-compat
+# (always "skipped" / False now)
 
 
 def _extract_audio_for_transcribe(file_path: Path, audio_config: dict = None) -> str:
@@ -195,59 +243,7 @@ def _extract_audio_for_transcribe(file_path: Path, audio_config: dict = None) ->
 # ── VAD 断句 Segmentation ─────────────────────────────────────────────
 
 
-def _apply_vad_sentence_segmentation(audio_path: str, segments: list) -> list:
-    """使用 VAD 停顿检测对 ASR 输出进行智能断句。
-
-    接受 ``List[Segment]`` 或 ``List[dict]``（有 ``start``/``end``/``text``）。
-    返回相同类型的列表。
-
-    Args:
-        audio_path: 音频 WAV 文件路径。
-        segments: ASR 输出的 segments（Segment 对象或 dict）。
-
-    Returns:
-        断句后的 segments。
-    """
-    if not segments:
-        return segments
-
-    try:
-        import librosa
-        from app.core.vad_detector import VADDetector
-        from app.core.sentence_splitter import split_segments_at_vad_boundaries
-
-        # 统一转为 dict 格式处理
-        is_obj = hasattr(segments[0], 'to_dict')
-        raw: list = [s.to_dict() if is_obj else dict(s) for s in segments]
-
-        # 加载音频用于 VAD
-        waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
-        if len(waveform) < sr * 0.5:  # < 0.5s: 没必要断句
-            return segments
-
-        # VAD 检测语音活动区间（停顿 >= 0.5s 自动切分句子）
-        detector = VADDetector()
-        speech_intervals = detector.detect_speech(
-            waveform, sr,
-            min_speech_duration=0.1,
-            min_silence_duration=0.5,  # >= 0.5s 停顿 → 句子边界
-        )
-
-        if not speech_intervals or len(speech_intervals) < 2:
-            return segments
-
-        # 用 VAD 语音区间合并 segments（每个区间对应一个字幕）
-        segmented = split_segments_at_vad_boundaries(raw, speech_intervals)
-
-        # 转回原始类型
-        if is_obj:
-            from app.core.engine_base import Segment as SegCls
-            return [SegCls(start=s["start"], end=s["end"], text=s["text"]) for s in segmented]
-        return segmented
-
-    except Exception as e:
-        logger.warning("[VAD SentenceSeg] Failed, falling back to original: %s", e)
-        return segments
+# v2.0: _apply_vad_sentence_segmentation removed (clause_processor 模块已删, VAD 走 pipeline)
 
 
 @asynccontextmanager
@@ -276,6 +272,15 @@ async def lifespan(app: FastAPI):
             logger.info("[SubtitleAssistant] Silero-VAD model ready")
     except Exception:
         pass  # Non-blocking; VAD will download on first use
+
+    # Paraformer/Zipformer 模型由 sherpa-onnx 自带 downloader 管理, 不经过 model_downloader
+
+    # Pre-download Punctuation model (always check; NN engine auto-fallback if missing)
+    try:
+        punc_status = ensure_punctuation_model()
+        logger.info("[SubtitleAssistant] Punctuation model status: %s", punc_status["status"])
+    except Exception as e:
+        logger.debug("[SubtitleAssistant] Punctuation ensure failed: %s", e)
 
     if model_status["status"] == "ready":
         try:
@@ -322,7 +327,11 @@ class TranscribeRequest(BaseModel):
 async def health_check():
     log_dir = os.environ.get("SHIYU_LOG_DIR", "")
     engines = get_available_engines()
-    local_ready = any(e["name"] == "sensevoice_local" and e["available"] for e in engines)
+    local_ready = any(
+        e["name"] in ("zipformer_local", "sensevoice_local", "paraformer_local")
+        and e["available"]
+        for e in engines
+    )
     return {
         "status": "ok",
         "model_loaded": local_ready,
@@ -387,7 +396,10 @@ async def open_logs_folder():
 @app.get("/engines")
 async def list_engines():
     """Return list of registered ASR engines with availability status."""
-    return {"engines": get_available_engines()}
+    return {
+        "engines": get_available_engines(),
+        "failed": _engines_failed,  # 注册失败的引擎 (PyInstaller 漏打包等)
+    }
 
 
 @app.post("/model/download")
@@ -395,6 +407,42 @@ async def trigger_model_download():
     """Trigger or retry model download. Resets error state and starts fresh download."""
     status = ensure_model()
     return status
+
+
+@app.post("/model/download/zipformer")
+async def trigger_zipformer_download():
+    """Trigger Zipformer-CTC-zh model download.
+
+    Non-blocking. Returns current status. Use /model/status/all to monitor.
+    """
+    # Zipformer 模型目前由 sherpa-onnx 单独管理 (不经过 model_downloader)
+    return {"status": "ready", "progress": 100, "error": "",
+            "note": "Zipformer 模型请用 sherpa-onnx 1.10+ 自带的 model downloader"}
+
+
+@app.post("/model/download/punctuation")
+async def trigger_punctuation_download():
+    """Trigger PunctuationCtTransformer model download.
+
+    Non-blocking. Returns current status.
+    """
+    status = ensure_punctuation_model()
+    return status
+
+
+@app.get("/model/status/all")
+async def get_all_model_status():
+    """统一查询所有模型 (SenseVoice / Zipformer / Punctuation / VAD) 的下载状态。
+
+    Returns:
+        {
+            "sensevoice": {"status": "...", "progress": ..., "error": "..."},
+            "zipformer": {...},
+            "punctuation": {...},
+            "vad": {...}
+        }
+    """
+    return get_all_status()
 
 
 @app.get("/model/open")
@@ -426,6 +474,7 @@ async def transcribe_file(
     output_format: str = Form("srt"),
     glossary: str = Form("{}"),
     engine_mode: str = Form("local"),
+    subtitle_offset_sec: float = Form(0.0),
 ):
     """Transcribe audio/video file and return subtitle content.
 
@@ -433,7 +482,8 @@ async def transcribe_file(
         file: Audio or video file
         language: Target language (auto/zh/en/ja/ko/yue)
         output_format: srt / lrc / ass
-        engine_mode: Engine identifier (local, cloud)
+        engine_mode: Engine identifier (local/zipformer_local/sensevoice_local/paraformer_local/cloud)
+        subtitle_offset_sec: 主人前端滑块, 正=字幕提前, 负=字幕推后
 
     Returns:
         Plain text subtitle content
@@ -449,7 +499,6 @@ async def transcribe_file(
     try:
         with open(tmp_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-
         try:
             custom_glossary = json.loads(glossary)
         except json.JSONDecodeError as exc:
@@ -459,30 +508,31 @@ async def transcribe_file(
                 content={"error": "invalid_glossary", "detail": str(exc)},
             )
 
-        # Resolve engine and transcribe
-        transcriber = get_engine(engine_mode)
-        audio_path = _extract_audio_for_transcribe(tmp_path, config.get("audio") if config else None)
-        result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
-
-        # VAD 智能断句：按语流停顿合并为句子级 segments
-        result.segments = _apply_vad_sentence_segmentation(audio_path, result.segments)
-
-        # Format output
-        segments = result.to_segments_list()
-        from app.core.subtitle_formatter import (
-            generate_srt, generate_lrc, generate_ass,
-            segments_from_transcription,
+        audio_path = _extract_audio_for_transcribe(
+            tmp_path, config.get("audio") if config else None,
         )
-        srt_segments = segments_from_transcription(segments)
 
-        if fmt == "srt":
-            content = generate_srt(srt_segments)
-        elif fmt == "lrc":
-            content = generate_lrc(srt_segments)
-        else:
-            content = generate_ass(srt_segments, title=file.filename)
+        ctx = PipelineContext(
+            audio_path=audio_path,
+            audio_cfg=config.get("audio") if config else None,
+            engines=_resolve_engines_list(config, engine_mode),
+            language=language,
+            glossary=custom_glossary,
+            output_format=fmt,
+            title=file.filename or "Subtitle",
+            enable_deterministic_correction=True,
+            # v2.0: LLM correction removed (owner decision #2)
+            # enable_llm_correction=False,
+            subtitle_offset_sec=subtitle_offset_sec,  # 主人前端滑块传过来
+        )
+        ctx = SubtitlePipeline(ctx).run()
 
-        return PlainTextResponse(content)
+        if not ctx.engines_results:
+            raise HTTPException(
+                500, "No ASR engine available or all engines failed to transcribe"
+            )
+
+        return PlainTextResponse(ctx.output_content)
 
     except PermissionError as e:
         raise HTTPException(401, str(e))
@@ -503,6 +553,7 @@ async def transcribe_json(
     language: str = Form("auto"),
     glossary: str = Form("{}"),
     engine_mode: str = Form("local"),
+    subtitle_offset_sec: float = Form(0.0),
 ):
     """Transcribe and return raw JSON with segments."""
     suffix = Path(file.filename).suffix or ".tmp"
@@ -522,29 +573,37 @@ async def transcribe_json(
                 content={"error": "invalid_glossary", "detail": str(exc)},
             )
 
-        # Resolve engine and transcribe
-        transcriber = get_engine(engine_mode)
-        audio_path = _extract_audio_for_transcribe(tmp_path, config.get("audio") if config else None)
-        result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
+        audio_path = _extract_audio_for_transcribe(
+            tmp_path, config.get("audio") if config else None,
+        )
 
-        # VAD 智能断句：按语流停顿合并为句子级 segments
-        result.segments = _apply_vad_sentence_segmentation(audio_path, result.segments)
+        ctx = PipelineContext(
+            audio_path=audio_path,
+            audio_cfg=config.get("audio") if config else None,
+            engines=_resolve_engines_list(config, engine_mode),
+            language=language,
+            glossary=custom_glossary,
+            output_format="srt",
+            enable_deterministic_correction=True,
+            # v2.0: LLM correction removed (owner decision #2)
+            # enable_llm_correction=False,
+            subtitle_offset_sec=subtitle_offset_sec,  # 主人前端滑块传过来
+        )
+        ctx = SubtitlePipeline(ctx).run()
 
-        segments = result.to_segments_list()
-
-        # Calculate actual duration for reference
-        import librosa
-        try:
-            total_duration = librosa.get_duration(path=audio_path)
-        except Exception:
-            total_duration = segments[-1]["end"] if segments else 0
+        if not ctx.engines_results:
+            raise HTTPException(
+                500, "No ASR engine available or all engines failed to transcribe"
+            )
 
         return {
             "filename": file.filename,
             "language": language,
-            "duration": total_duration,
-            "segments": segments,
-            "llm_status": _llm_status,
+            "duration": ctx.duration,
+            "segments": ctx.final_segments or [],
+            # v2.0: LLM 字段保留 (UI 仍读取, 永远 "skipped")
+            "llm_status": "skipped",
+            "llm_corrected": False,
         }
 
     except PermissionError as e:
@@ -567,6 +626,7 @@ async def transcribe_local(
     output_format: str = Form("srt"),
     glossary: str = Form("{}"),
     engine_mode: str = Form("local"),
+    subtitle_offset_sec: float = Form(0.0),
 ):
     """Transcribe a local file by path (for Tauri drag-drop, no upload needed).
 
@@ -574,7 +634,7 @@ async def transcribe_local(
         path: Absolute path to the audio/video file on disk
         language: Target language (auto/zh/en/ja/ko/yue)
         output_format: srt / lrc / ass
-        engine_mode: Engine identifier (local, cloud)
+        engine_mode: Engine identifier (local/zipformer_local/sensevoice_local/paraformer_local/cloud)
 
     Returns:
         JSON with subtitle content and segments for preview
@@ -597,44 +657,39 @@ async def transcribe_local(
                 content={"error": "invalid_glossary", "detail": str(exc)},
             )
 
-        # Resolve engine and transcribe
-        transcriber = get_engine(engine_mode)
-        audio_path = _extract_audio_for_transcribe(file_path, config.get("audio") if config else None)
-        result = transcriber.transcribe(audio_path, language=language, glossary=custom_glossary)
-
-        # VAD 智能断句：按语流停顿合并为句子级 segments
-        result.segments = _apply_vad_sentence_segmentation(audio_path, result.segments)
-
-        segments = result.to_segments_list()
-
-        # Calculate actual duration for reference
-        import librosa
-        try:
-            total_duration = librosa.get_duration(path=audio_path)
-        except Exception:
-            total_duration = segments[-1]["end"] if segments else 0
-
-        # Format output if requested
-        from app.core.subtitle_formatter import (
-            generate_srt, generate_lrc, generate_ass,
-            segments_from_transcription,
+        audio_path = _extract_audio_for_transcribe(
+            file_path, config.get("audio") if config else None,
         )
-        srt_segments = segments_from_transcription(segments)
 
-        if fmt == "srt":
-            content = generate_srt(srt_segments)
-        elif fmt == "lrc":
-            content = generate_lrc(srt_segments)
-        else:
-            content = generate_ass(srt_segments, title=file_path.name)
+        ctx = PipelineContext(
+            audio_path=audio_path,
+            audio_cfg=config.get("audio") if config else None,
+            engines=_resolve_engines_list(config, engine_mode),
+            language=language,
+            glossary=custom_glossary,
+            output_format=fmt,
+            title=file_path.name,
+            enable_deterministic_correction=True,
+            # v2.0: LLM correction removed (owner decision #2)
+            # enable_llm_correction=False,
+            subtitle_offset_sec=subtitle_offset_sec,  # 主人前端滑块传过来
+        )
+        ctx = SubtitlePipeline(ctx).run()
+
+        if not ctx.engines_results:
+            raise HTTPException(
+                500, "No ASR engine available or all engines failed to transcribe"
+            )
 
         return {
-            "content": content,
-            "segments": segments,
+            "content": ctx.output_content,
+            "segments": ctx.final_segments or [],
             "filename": file_path.name,
-            "duration": total_duration,
+            "duration": ctx.duration,
             "language": language,
-            "llm_status": _llm_status,
+            # v2.0: LLM 字段保留 (UI 仍读取, 永远 "skipped")
+            "llm_status": "skipped",
+            "llm_corrected": False,
         }
 
     except PermissionError as e:
@@ -729,13 +784,13 @@ async def set_llm_correction_settings(
 async def correct_transcription(body: dict):
     """Apply determinisic + optional LLM correction to transcription segments.
 
-    Accepts JSON: {"segments": [...], "engine_mode": "local"}
+    Accepts JSON: {"segments": [...], "engine_mode": "local", "subtitle_offset_sec": -2.0}
     Optionally accepts "audio_path" for VAD-based sentence segmentation.
 
-    Two-layer architecture:
+    Two-layer architecture (delegated to SubtitlePipeline):
       Layer 1: Deterministic correction (always runs, zero cost)
       Layer 2: Optional LLM enhancement (on top of Layer 1 result)
-      Phase 3: Optional VAD-based sentence segmentation (if audio_path provided)
+      Stage 2: Optional VAD-based sentence segmentation (if audio_path provided)
 
     Does NOT re-transcribe — only fixes text recognition errors.
 
@@ -746,90 +801,46 @@ async def correct_transcription(body: dict):
     """
     segments = body.get("segments", [])
     audio_path: Optional[str] = body.get("audio_path")
+    subtitle_offset_sec = float(body.get("subtitle_offset_sec", 0.0))
     if not segments:
         return {"segments": [], "llm_corrected": False}
 
-    # ── Phase 0: VAD-first sentence segmentation ──
-    # VAD runs FIRST to produce authoritative timestamps from audio.
-    # Uses VAD speech intervals (from detect_speech) rather than pause
-    # boundary midpoints — each speech interval between pauses >= 0.5s
-    # becomes one subtitle segment. This prevents text duplication that
-    # occurred with the old boundary-based approach.
-    if audio_path:
-        try:
-            from app.core.audio_processor import load_audio
-            from app.core.vad_detector import get_detector
-            from app.core.sentence_splitter import split_segments_at_vad_boundaries
-            waveform = load_audio(audio_path)
-            if len(waveform) >= 8000:
-                detector = get_detector()
-                speech_intervals = detector.detect_speech(
-                    waveform, sr=16000,
-                    min_speech_duration=0.1,
-                    min_silence_duration=0.5,
-                )
-                if speech_intervals and len(speech_intervals) >= 2:
-                    segments = split_segments_at_vad_boundaries(segments, speech_intervals)
-        except Exception as e:
-            logger.warning("[VAD] Failed to apply VAD segmentation: %s", e)
-
-    # ── Layer 1: Deterministic correction (always runs) ──
-    from app.core.asr_corrector import deterministic_correct
-    layer1 = deterministic_correct(segments)
-    layer1.sort(key=lambda s: s.get("start", 0))
-
-    # ── Helper: build final result (split long → return) ──
-    def _build_result(source: list, changed: bool, label: str):
-        from app.core.segment_merger import split_long_segments
-        final = split_long_segments(source)
-        if len(final) != len(source):
-            print(f"[Segment Splitter] Split {len(source)} → {len(final)} segments")
-        print(f"[{label}] Corrected {len(final)} segments")
-        return {"segments": final, "llm_corrected": changed}
-
-    # ── Layer 2: Optional LLM enhancement ──
-    from app.core.cloud_engine import load_llm_correction_config
-    cfg = load_llm_correction_config()
-
-    if not cfg.get("enabled"):
-        changed = any(s["text"] != o["text"] for s, o in zip(layer1, segments))
-        return _build_result(layer1, changed, "Deterministic LLM-disabled")
-
-    from app.core.llm_corrector import create_corrector, CorrectionConfig
-    corr_config = CorrectionConfig(
-        enabled=True,
-        provider=cfg.get("provider", "openai"),
-        api_url=cfg.get("api_url", ""),
-        api_key=cfg.get("api_key", ""),
-        model=cfg.get("model", ""),
+    ctx = PipelineContext(
+        skip_asr=True,
+        audio_path=audio_path or "",
+        # 深拷贝入参: pipeline 的 glossary/deterministic 会修改段文本,
+        # 若与 body 共享 dict 引用, 后续 changed 比较会因入参已被改而漏报
+        raw_segments=[dict(s) for s in segments],
+        engines_results={},  # /correct endpoint doesn't run ASR
+        enable_deterministic_correction=True,
+        enable_itn=True,
+        enable_punctuation=False,
+        output_format="srt",
+        subtitle_offset_sec=subtitle_offset_sec,
     )
-    corrector = create_corrector(corr_config)
-    if not corrector:
-        changed = any(s["text"] != o["text"] for s, o in zip(layer1, segments))
-        return _build_result(layer1, changed, "Deterministic LLM-config-missing")
 
-    print(f"[LLM Enhancement] Enhancing {len(layer1)} segments via {corr_config.provider}")
     try:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        llm_result = await loop.run_in_executor(None, corrector.correct, layer1)
+        ctx = SubtitlePipeline(ctx).run()
     except Exception as e:
-        print(f"[LLM Enhancement] Failed: {e}, falling back to deterministic result")
-        changed = any(s["text"] != o["text"] for s, o in zip(layer1, segments))
-        return _build_result(layer1, changed, "Deterministic LLM-fallback")
+        logger.warning("[Correct] Pipeline failed, fallback to original: %s", e)
+        return {"segments": segments, "llm_corrected": False}
 
-    llm_result.sort(key=lambda s: s.get("start", 0))
+    # v2.0: segment_merger + llm_guardrail removed
+    # 直接用 corrected_segments 当 final
+    final_source = ctx.final_segments or segments
+    final = final_source
 
-    llm_improved = any(
-        s["text"] != o["text"] for s, o in zip(llm_result, layer1)
+    # 计算是否实际发生了文本变化 (deterministic only — v2.0 无 LLM)
+    final_min_len = min(len(final), len(segments))
+    changed = any(
+        s.get("text") != o.get("text")
+        for s, o in zip(final[:final_min_len], segments[:final_min_len])
     )
-    if llm_improved:
-        print(f"[LLM Enhancement] Done — improvements applied")
-    else:
-        print(f"[LLM Enhancement] Done — no additional changes")
 
-    final_source = llm_result if llm_improved else layer1
-    return _build_result(final_source, llm_improved, "LLM")
+    logger.info("[Pipeline Correct] %d segments → %d corrected",
+                len(segments), len(final))
+
+    return {"segments": final, "llm_corrected": False, "llm_status": "skipped", "changed": changed}
 
 
 if __name__ == "__main__":

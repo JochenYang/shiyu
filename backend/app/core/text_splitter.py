@@ -237,7 +237,7 @@ def _assign_timestamps_with_overlap(
     parts: List[str],
     duration: float,
     result: List[Dict],
-    overlap_sec: float = OVERLAP_SECONDS,
+    overlap_sec: float = 0.0,  # v2.0: VAD 校准后边界已准, 不再需要 overlap 兜底
 ) -> None:
     """按字符数比例分配时间戳，相邻段间保留 ``overlap_sec`` 微重叠。
 
@@ -309,6 +309,16 @@ def _find_sentence_splits(text: str) -> List[int]:
                 continue
             if i + 1 >= len(text) or text[i + 1] == " ":
                 split_after.append(i + 1)
+        elif ch == "…":
+            # 中文省略号: 连续 2+ 个 (U+2026) 视为句界,
+            # 整体跳过并在最后一个省略号后记 split 点; 单个省略号不切分
+            j = i
+            while j < len(text) and text[j] == "…":
+                j += 1
+            if j - i >= 2:
+                split_after.append(j)
+            i = j
+            continue
         i += 1
     return split_after
 

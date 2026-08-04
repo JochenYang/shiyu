@@ -2,16 +2,22 @@
 ASR Deterministic Corrector — 自研高效算法，零 API 成本。
 
 双层架构的第一层（Layer 1），在 LLM 之前运行：
+0. 标点恢复 (Phase B, 参照剪映 PunctuationCtTransformer)
 1. 段碎片修复（跨段上下文推断）
 2. ASR 领域术语词典替换（智能验算：词边界+上下文置信度）
-3. 智能标点插入
-4. 重叠内容去重
+3. 重叠内容去重
+4. 智能标点插入 (弱化: Rule 3 跳过软语气词, 由 Phase 0 接管)
 
 智能验算引擎（自研）：
 - 每个替换自动做「前验+后验」双向验证
 - 词边界感知：不会把"bar"匹配到"barometer"
 - 上下文置信度：同源多目标时，用领域关联词打分排序
 - 替换后校验：验证替换结果不产生畸形拼接
+
+Phase B 标点恢复:
+- Rule 版 (兜底): 4 类启发式 (段尾语气词/连词/中段代词/段首语气词/英文段末)
+- NN 版 (stub): 预留 PunctuationCtTransformer ONNX 推理位, is_available=False
+- 工厂 get_punctuation_engine() 决定当前用哪个后端
 
 输出：在保留原始分段的前提下，产出可读的修正结果。
 LLM 层不可用时，Layer 1 确保用户永远不看到"无变化"的 ASR 原文。
@@ -22,6 +28,9 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+
+# Phase B: 标点恢复后端 (Rule / NN, 工厂选择)
+from app.core.punctuation import get_punctuation_engine
 
 logger = logging.getLogger(__name__)
 
@@ -377,8 +386,27 @@ class SmartDictionary:
 # ---------------------------------------------------------------------------
 # 配置常量
 # Phase 1: PUNCT_MIN_LEN 从 _apply_punct_rules line 793 硬编码字面量 10 提为模块常量
+# v2.2: Rule 3 (补句号) 移除; v2.2.1 以白名单版恢复, 该常量已不再使用
 # ---------------------------------------------------------------------------
-PUNCT_MIN_LEN: int = 10  # 段尾无标点时,触发补句号的最小字符阈值(原硬编码 10)
+PUNCT_MIN_LEN: int = 10  # 历史: 补句号最小字符阈值 (已不再使用)
+
+# v2.2.2: 段尾悬空字黑名单 — 命中且段长 > 4 时不补句号.
+# 通用原则: 中文句子可以以绝大多数字结尾 (名词/形容词/动词补语/
+# 语气词), 只有"悬空字"结尾时句子几乎必然未完 (单字及物动词后面
+# 还要接宾语, 介词/方位/时间词后面要接名词, 连词/助词用于衔接),
+# 因此用黑名单排除碎片段, 其余中文句尾一律补句号; 英文结尾无法
+# 判断碎片 (gine/ship/collision), 一律不补.
+_FRAGMENT_TAIL_CHARS: frozenset = frozenset(
+    # 高频单字及物动词 (结尾时通常还要接宾语, 句子未完)
+    "改 添 指 所 游 获 执 搜 调 取 转 变 移 删 打 放 拿 弄 想 需 要 "
+    "说 讲 写 做 用 找 看 听 读 学 教 让 使 问 求 算 计 测 试 验 修 建 造 "
+    # 被动/介词/方位/时间/量词 (悬空, 后面通常接名词)
+    "被 已 把 从 向 给 为 上 下 中 后 前 里 外 内 时 分 秒 年 月 日 天 次 个 条 张 帧 段 行 列 "
+    "组 队 台 部 间 侧 处 面 名 者 员 "
+    # 连词/副词/其他明显悬空
+    "死 度 载 除 是 点 节 这 那 与 及 或 但 而 且 并 才 就 都 也 又 还 "
+    "再 只 仅 曾 正 将 会 能 可 以 需"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -396,13 +424,14 @@ _DEFAULT_SMART_DICT = SmartDictionary([
               word_boundary=True, min_hits=1),
 
     # -- ASR 拼写错误 --
-    # "timescal" → "timescale"，非独立词 → 宽松边界
+    # "timescal" → "timescale"，启用词边界: 保护 "timescales"/"timescale"
+    # 等正确拼写不被前缀替换破坏 (word_boundary=False 时 "timescales" → "timescalees")
     DictEntry("timescal", "timescale",
-              word_boundary=False, min_hits=0),
+              word_boundary=True, min_hits=0),
     DictEntry("timest ep", "time step",
-              word_boundary=False, min_hits=0),
+              word_boundary=True, min_hits=0),
     DictEntry("timestep", "time step",
-              word_boundary=False, min_hits=0),
+              word_boundary=True, min_hits=0),
 
     # -- 中文同音字错误 --
     # "巴蒂" → "body"，默认带游戏开发上下文验算
@@ -423,20 +452,6 @@ _DEFAULT_SMART_DICT = SmartDictionary([
               context_hints=["回调", "碰撞", "节点", "物体", "函数",
                              "脚本", "修改"],
               word_boundary=True, min_hits=1),
-
-    # -- 常见 ASR 拼写修正（宽松，不带上下文，确保覆盖）--
-    DictEntry("collision", "collision", word_boundary=True, min_hits=0),
-    DictEntry("physics", "physics", word_boundary=True, min_hits=0),
-    DictEntry("velocity", "velocity", word_boundary=True, min_hits=0),
-    DictEntry("gravity", "gravity", word_boundary=True, min_hits=0),
-    DictEntry("texture", "texture", word_boundary=True, min_hits=0),
-    DictEntry("animation", "animation", word_boundary=True, min_hits=0),
-    DictEntry("controller", "controller", word_boundary=True, min_hits=0),
-    DictEntry("character", "character", word_boundary=True, min_hits=0),
-    DictEntry("component", "component", word_boundary=True, min_hits=0),
-    DictEntry("instance", "instance", word_boundary=True, min_hits=0),
-    DictEntry("interface", "interface", word_boundary=True, min_hits=0),
-    DictEntry("reference", "reference", word_boundary=True, min_hits=0),
 ])
 
 
@@ -564,6 +579,14 @@ class ASRDeterministicCorrector:
         # shallow copy: 不修改输入（不可变性规则）
         result = [dict(seg) for seg in segments]
 
+        # Phase 0: 标点恢复 (参照剪映 PunctuationCtTransformer)
+        # 标点恢复放在最前面,让后续步骤 (词典、碎片、dedup) 看到更完整的标点
+        try:
+            punc_engine = get_punctuation_engine()
+            result = punc_engine.punctuate_segments(result)
+        except Exception as e:
+            logger.debug("[Punctuation] Engine unavailable, skipping: %s", e)
+
         # Phase 1: 跨段碎片修复
         if self._enable_fragment:
             self._fix_fragments(result)
@@ -620,7 +643,10 @@ class ASRDeterministicCorrector:
         算法原理：
             对于相邻段 (prev, curr)，检测 prev 的最后一个英文词
             和 curr 的第一个英文词是否能拼接成一个有效英语词。
-            若是，则两边各自修正为完整词（不合并段）。
+            若是，完整词写回 prev 段末尾，curr 段只移除碎片词
+            （不合并段，避免同一词在相邻两段各显示一遍）。
+            curr 段仅剩碎片词时保持空字符串，由下游
+            segments_from_transcription 过滤空段。
 
         触发条件（严格，避免误判）：
             1. 拼接后的词在常用英语词表中
@@ -659,13 +685,14 @@ class ASRDeterministicCorrector:
             combined = last_lower + first_lower
 
             if combined in _COMMON_EN_WORDS:
-                # 碎片确认：两边各自修复为完整词
+                # 碎片确认：完整词写回 prev，curr 只移除碎片词
                 rest_prev = self._remove_last_word(prev_text, last_word)
                 rest_curr = self._remove_first_word(curr_text, first_word)
 
                 prev["text"] = (rest_prev + " " + combined).strip()
-                # curr 的首词也展开（每个段独立可读）
-                curr["text"] = (combined + " " + rest_curr).strip()
+                # curr 段只移除碎片词, 不再补完整词
+                # (否则完整词会在相邻两段各出现一次, 字幕显示重复)
+                curr["text"] = rest_curr
 
                 logger.debug(
                     "Fragment fixed: seg %d '%s...' + seg %d '...%s' → '%s'",
@@ -717,8 +744,14 @@ class ASRDeterministicCorrector:
 
     # 句子结尾语气词 → 触发问号或感叹号
     # 注意：优先级决定了冲突时的处理
-    _QUESTION_ENDS = {"吗", "呢", "吧", "呀", "么"}  # 明确问句
+    # Phase B: 移除"吧"/"呀"/"么"对齐新 RulePunctuation (把它们分别归为软语气/感叹/不触发)
+    _QUESTION_ENDS = {"吗", "呢"}  # 明确问句 (Phase B 收紧: 吧是软语气, 呀是感叹, 么不触发)
     _EXCLAMATION_ENDS = {"啊", "呀", "哇", "哦", "啦", "哈"}  # 感叹（含疑问式感叹）
+
+    # Phase B: 软语气词 (Rule 3 不补句号)
+    # 段尾是这些字符时, 默认句号规则跳过 (因为新 RulePunctuation 已经处理过)
+    # 例: "走走吧" 末字"吧"是软语气, 不强制加句号
+    _SOFT_PARTICLES = {"吧", "啊", "呢", "吗", "哦", "啦", "呀", "哇"}
 
     # 英文句首大写标记
     _EN_SENTENCE_STARTS = {"the", "this", "that", "it", "i", "we", "they",
@@ -792,14 +825,17 @@ class ASRDeterministicCorrector:
 
         trimmed = text.strip()
 
-        # ── Rule 3: 段尾无明显标点 → 补句号 ──
-        # 触发条件：
-        #   - 段尾没有标点
-        #   - 不是最后一段或者最后一段内容完整
-        #   - 段不太短（> PUNCT_MIN_LEN 字符，Phase 1 提为常量，原硬编码 10）
-        if trimmed and len(trimmed) > PUNCT_MIN_LEN:
+        # ── Rule 3: 段尾补句号 (v2.2.2 黑名单版) ──
+        # 中文句尾除"悬空字"(单字及物动词/介词/方位词等, 见
+        # _FRAGMENT_TAIL_CHARS) 外均可自然结束句子, 故黑名单排除碎片段,
+        # 其余段尾补句号. 段尾语气词已由 Rule 2 处理 (吗→？ 啊/呀→！).
+        if len(trimmed) > 4:
             last_ch = trimmed[-1]
-            if last_ch not in "。！？.!?":
+            if (
+                last_ch not in _FRAGMENT_TAIL_CHARS
+                and last_ch not in "。！？.!?，、；：,;:"
+                and not last_ch.isascii()
+            ):
                 text = text.rstrip() + "。"
 
         return text
