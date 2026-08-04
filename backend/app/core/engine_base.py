@@ -5,7 +5,7 @@ enabling drop-in replacement in main.py and the frontend.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 
 @dataclass

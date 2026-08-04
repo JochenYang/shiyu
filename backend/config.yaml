@@ -35,3 +35,24 @@ output:
   default_format: "srt"   # srt, lrc, ass
   max_line_length: 40     # chars per subtitle line
   max_line_count: 2       # max lines per subtitle event
+  # 字幕时间偏移 (秒) 由前端用户调, 走 API subtitle_offset_sec 参数
+  # 不用 config.yaml, 避免每次调都要重启后端
+
+# ASR engine registry (zipformer 主走)
+# - zipformer: 主走, sherpa-onnx Zipformer-CTC-zh int8 (350MB), CTC 字符级对齐
+# - paraformer: 备选, sherpa-onnx Paraformer-large int8 (232MB), CIF 显式 token 边界准
+# - sensevoice: 多语言备选 (zh/en/ja/ko/yue 5 语言)
+# - cloud: 云端 OpenAI 兼容 API (用户自己填 endpoint + key)
+engines:
+  paraformer:
+    enabled: true   # 备选 — CIF 显式 token 边界准
+    model_dir: "~/.shiyu/models/paraformer-large"
+    num_threads: 4
+  zipformer:
+    enabled: true   # 主走 — CTC int8 字符级对齐
+    model_dir: "~/.shiyu/models/zipformer-ctc-zh"
+    num_threads: 4
+  sensevoice:
+    enabled: true   # 多语言备选
+    model_dir: "~/.shiyu/models/sensevoice-small"
+    device: "cpu"

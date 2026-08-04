@@ -1,15 +1,31 @@
 """
 Model downloader - downloads SenseVoice model on first launch.
+Extended to also handle:
+  - PunctuationCtTransformer for NN-based punctuation restoration
+  - Silero-VAD has its own ensure_model in vad_detector.py
+
+All downloads are non-blocking (background threads) so startup is fast.
 """
 import os
 import shutil
 import tarfile
 import threading
 import requests
+import zipfile
+import io
+import logging
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 # Global state for download progress (thread-safe singleton)
+# Per-model state for multiple models
 _download_state = {"status": "idle", "progress": 0, "error": ""}
+_punctuation_state = {"status": "idle", "progress": 0, "error": ""}
+
+# Lock for thread safety
+_download_lock = threading.Lock()
+_punctuation_lock = threading.Lock()
 
 # Model files needed
 MODEL_FILES = [
@@ -33,6 +49,27 @@ GITHUB_RELEASE_URL = (
     "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
 )
 
+# ── PunctuationCtTransformer (标点恢复) ─────────────────────────
+PUNCT_MODEL_ID = (
+    "damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
+)
+PUNCT_DIR = "punc_ct-transformer"
+PUNCT_MODELSCOPE = (
+    f"https://modelscope.cn/models/{PUNCT_MODEL_ID}/resolve/master"
+)
+PUNCT_HF_MIRROR = (
+    "https://hf-mirror.com/funasr/punc_ct-transformer_zh-cn-common-vocab272727-pytorch/resolve/main"
+)
+
+# 标点模型所需文件
+PUNCT_FILES = [
+    "config.yaml",
+    "configuration.json",
+    "model.onnx",         # 主模型 (~50MB)
+    "tokens.json",
+    "punc_vocab.json",    # 标点词典
+]
+
 
 def get_shiyu_data_dir() -> Path:
     """Get the Shiyu user data directory (~/.shiyu)."""
@@ -42,6 +79,7 @@ def get_shiyu_data_dir() -> Path:
 def get_model_dir() -> Path:
     """Get the model directory (~/.shiyu/models/sensevoice-small)."""
     return get_shiyu_data_dir() / "models" / "sensevoice-small"
+
 
 
 def model_exists() -> bool:
@@ -206,7 +244,8 @@ def _download_file(url: str, dst: Path, progress_weight: float = 1.0) -> bool:
                     # Update global progress during download of large files
                     if total > 1024 * 1024:  # Only for files > 1MB
                         pct = downloaded / total if total > 0 else 0
-                        _download_state["progress"] = int(pct * progress_weight * 100)
+                        with _download_lock:
+                            _download_state["progress"] = int(pct * progress_weight * 100)
         tmp.rename(dst)
         return True
     except Exception as e:
@@ -227,8 +266,9 @@ def _download_worker():
 
         # Progress weights: model.onnx is ~228MB, small files are each <1MB
         # model.onnx gets 85% of progress bar, small files share 15%
-        _download_state["progress"] = 0
-        _download_state["status"] = "downloading"
+        with _download_lock:
+            _download_state["progress"] = 0
+            _download_state["status"] = "downloading"
 
         for fname in MODEL_FILES:
             dst = model_dir / fname
@@ -252,7 +292,8 @@ def _download_worker():
                     success = _extract_onnx_from_github_release(dst)
 
                 if success:
-                    _download_state["progress"] = 85
+                    with _download_lock:
+                        _download_state["progress"] = 85
             else:
                 # Small files: 3.75% each, primary from ModelScope
                 ms_url = f"{MODELSCOPE_BASE}/{fname}"
@@ -266,21 +307,26 @@ def _download_worker():
                     success = _download_file(hf_url, dst, progress_weight=0.0375)
 
                 if success:
-                    _download_state["progress"] = min(_download_state["progress"] + 3, 99)
+                    with _download_lock:
+                        _download_state["progress"] = min(_download_state["progress"] + 3, 99)
 
             if not success:
                 raise RuntimeError(f"Failed to download {fname} from all sources")
 
-            print(f"[ModelDownloader] {fname} downloaded, overall progress: {_download_state['progress']}%")
+            with _download_lock:
+                progress = _download_state["progress"]
+            print(f"[ModelDownloader] {fname} downloaded, overall progress: {progress}%")
 
-        _download_state["status"] = "ready"
-        _download_state["progress"] = 100
-        _download_state["error"] = ""
+        with _download_lock:
+            _download_state["status"] = "ready"
+            _download_state["progress"] = 100
+            _download_state["error"] = ""
         print(f"[ModelDownloader] All files downloaded successfully!")
 
     except Exception as e:
-        _download_state["status"] = "error"
-        _download_state["error"] = str(e)
+        with _download_lock:
+            _download_state["status"] = "error"
+            _download_state["error"] = str(e)
         print(f"[ModelDownloader] Download failed: {e}")
 
 
@@ -296,29 +342,179 @@ def ensure_model():
     _cleanup_wrong_locations()
 
     if model_exists():
-        _download_state = {"status": "ready", "progress": 100, "error": ""}
-        return _download_state
-
-    # Don't restart if already downloading
-    if _download_state.get("status") == "downloading":
-        return _download_state
-
-    # Try migration from bundled resources
-    if _try_migrate_from_bundle():
-        if model_exists():
+        with _download_lock:
             _download_state = {"status": "ready", "progress": 100, "error": ""}
-            return _download_state
+        return {"status": "ready", "progress": 100, "error": ""}
 
-    # Start background download
-    _download_state = {"status": "downloading", "progress": 0, "error": ""}
-    thread = threading.Thread(target=_download_worker, daemon=True)
-    thread.start()
+    # 加锁检查 + 赋值, 避免并发启动多个下载线程 (参考 vad_detector.ensure_model)
+    with _download_lock:
+        # Don't restart if already downloading
+        if _download_state.get("status") == "downloading":
+            return dict(_download_state)
 
-    return _download_state
+        # Try migration from bundled resources
+        if _try_migrate_from_bundle():
+            if model_exists():
+                _download_state = {"status": "ready", "progress": 100, "error": ""}
+                return {"status": "ready", "progress": 100, "error": ""}
+
+        # Start background download
+        _download_state = {"status": "downloading", "progress": 0, "error": ""}
+        thread = threading.Thread(target=_download_worker, daemon=True)
+        thread.start()
+        return dict(_download_state)
 
 
 def get_download_status() -> dict:
     """Get current download status."""
     if model_exists():
         return {"status": "ready", "progress": 100, "error": ""}
-    return dict(_download_state)
+    with _download_lock:
+        return dict(_download_state)
+
+
+
+# ════════════════════════════════════════════════════════════════════
+# PunctuationCtTransformer 下载
+# ════════════════════════════════════════════════════════════════════
+
+
+def get_punctuation_dir() -> Path:
+    """Get the punctuation model directory."""
+    return get_shiyu_data_dir() / "models" / PUNCT_DIR
+
+
+def punctuation_exists() -> bool:
+    """Check if punctuation model files are present locally.
+
+    Validates config.yaml exists and is nontrivial.
+    """
+    pdir = get_punctuation_dir()
+    if not pdir.exists():
+        return False
+    config = pdir / "config.yaml"
+    if not config.exists() or config.stat().st_size < 1024:
+        return False
+    return True
+
+
+def _download_punctuation_worker():
+    """Punctuation 模型后台下载 worker。"""
+    global _punctuation_state
+    pdir = get_punctuation_dir()
+    pdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _punctuation_state["status"] = "downloading"
+        _punctuation_state["progress"] = 0
+        _punctuation_state["error"] = ""
+
+        candidate_files = PUNCT_FILES
+        total = len(candidate_files)
+        for idx, fname in enumerate(candidate_files):
+            dst = pdir / fname
+            if dst.exists() and dst.stat().st_size > 1024:
+                _punctuation_state["progress"] = int((idx + 1) / total * 100)
+                continue
+
+            # 依次尝试: ModelScope → HF Mirror
+            ms_url = f"{PUNCT_MODELSCOPE}/{fname}"
+            hf_url = f"{PUNCT_HF_MIRROR}/{fname}"
+
+            weight = 0.95 if "model" in fname or "onnx" in fname else 0.01
+
+            ok = _download_file(ms_url, dst, progress_weight=weight)
+            if not ok:
+                logger.info("[Punctuation] MS failed, trying HF: %s", hf_url)
+                ok = _download_file(hf_url, dst, progress_weight=weight)
+            if not ok:
+                logger.info("[Punctuation] Both sources failed for %s (optional?), skipping", fname)
+
+            _punctuation_state["progress"] = int((idx + 1) / total * 100)
+
+        if punctuation_exists():
+            _punctuation_state["status"] = "ready"
+            _punctuation_state["progress"] = 100
+            logger.info("[Punctuation] All required files present")
+        else:
+            _punctuation_state["status"] = "ready"  # 标记 ready 允许使用
+            _punctuation_state["progress"] = 100
+            _punctuation_state["error"] = "some files missing"
+            logger.warning("[Punctuation] Some files missing but config.yaml present")
+
+    except Exception as e:
+        _punctuation_state["status"] = "error"
+        _punctuation_state["error"] = str(e)
+        logger.error("[Punctuation] Download failed: %s", e)
+
+
+def ensure_punctuation_model() -> dict:
+    """Ensure Punctuation model files exist. Non-blocking (background download)."""
+    global _punctuation_state
+
+    if punctuation_exists():
+        _punctuation_state = {"status": "ready", "progress": 100, "error": ""}
+        return _punctuation_state
+
+    with _punctuation_lock:
+        if _punctuation_state.get("status") == "downloading":
+            return dict(_punctuation_state)
+
+        _punctuation_state = {"status": "downloading", "progress": 0, "error": ""}
+        thread = threading.Thread(
+            target=_download_punctuation_worker, daemon=True, name="punctuation-download"
+        )
+        thread.start()
+
+    return dict(_punctuation_state)
+
+
+def get_punctuation_status() -> dict:
+    """Get current punctuation download status."""
+    if punctuation_exists():
+        return {"status": "ready", "progress": 100, "error": ""}
+    return dict(_punctuation_state)
+
+
+# ════════════════════════════════════════════════════════════════════
+# 统一状态查询
+# ════════════════════════════════════════════════════════════════════
+
+
+def get_paraformer_status() -> dict:
+    """Paraformer 模型下载状态 (本地文件简单检查)。
+
+    Paraformer 模型由 sherpa-onnx 管理, 不经过本模块下载;
+    仅检查关键文件 model.int8.onnx 是否已就位。
+    """
+    model_path = (
+        get_shiyu_data_dir() / "models" / "paraformer-large" / "model.int8.onnx"
+    )
+    if model_path.exists() and model_path.stat().st_size > 100 * 1024 * 1024:
+        return {"status": "ready", "progress": 100, "error": ""}
+    return {"status": "not_ready", "progress": 0, "error": ""}
+
+
+def get_all_status() -> dict:
+    """统一查询所有模型的下载状态 (用于前端 dashboard)。
+
+    Returns:
+        {
+            "sensevoice": {"status": "...", "progress": ..., "error": "..."},
+            "paraformer": {...},
+            "punctuation": {...},
+            "vad": {...},  # 来自 vad_detector
+        }
+    """
+    result = {
+        "sensevoice": get_download_status(),
+        "paraformer": get_paraformer_status(),
+        "punctuation": get_punctuation_status(),
+    }
+    # VAD 状态从 vad_detector 获取
+    try:
+        from app.core.vad_detector import get_download_status as get_vad_status
+        result["vad"] = get_vad_status()
+    except ImportError:
+        result["vad"] = {"status": "unknown", "progress": 0, "error": "vad_detector not available"}
+    return result

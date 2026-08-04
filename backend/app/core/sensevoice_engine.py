@@ -127,8 +127,12 @@ class SenseVoiceEngine:
         if self.sp_model is None:
             # Fall back to greedy decode
             return self._ctc_greedy_decode(logits, input_length)
-        
-        from app.core.ctc_aligner import ctc_viterbi_align
+
+        try:
+            from app.core.ctc_aligner import ctc_viterbi_align
+        except ModuleNotFoundError:
+            # ctc_aligner 已移除 (v2.2), 回退贪婪解码
+            return self._ctc_greedy_decode(logits, input_length)
         
         # Get reference text
         if external_text is None:
@@ -443,9 +447,9 @@ class SenseVoiceEngine:
         cmvn = load_cmvn(cmvn_file) if cmvn_file and os.path.exists(cmvn_file) else None
         
         # 使用模块级常量 + 合并自定义字典
+        # 仅应用内置词表 (SenseVoice 专属误识别); 用户自定义 glossary
+        # 由 pipeline 层统一应用, 避免引擎层与 pipeline 双重替换
         glossary = BASE_GLOSSARY.copy()
-        if custom_glossary:
-            glossary.update(custom_glossary)
         
         # 2. 将 VAD 区间转换为静音缝隙 (Silences)
         silences = []
@@ -527,7 +531,6 @@ class SenseVoiceEngine:
         
         if overlap_sec > 0 and len(windows) > 1:
             from .engine_base import Segment, TranscribeResult
-            from .chunk_merger import ChunkMerger
 
             chunk_results: List[TranscribeResult] = []
             for start_idx, end_idx in windows:
@@ -562,13 +565,23 @@ class SenseVoiceEngine:
 
                 chunk_results.append(TranscribeResult(segments=typed_segments))
 
-            # 用 ChunkMerger 做滑动窗口文本匹配合并
-            merger = ChunkMerger(min_matches=1, fuzzy_threshold=0.6)
-            merged = merger.merge(chunk_results, overlap_duration=overlap_sec)
-
+            # Simple concat (ChunkMerger removed in v2.0; it had BPE short-segment dedup bug)
+            # 重叠窗口会产生时间重复的段: 维护 covered_end, 跳过已被前面窗口覆盖的段
+            all_segs = []
+            covered_end = 0.0
+            for cr in chunk_results:
+                for seg in cr.segments:
+                    if seg.start >= covered_end:
+                        all_segs.append(seg)
+                        covered_end = max(covered_end, seg.end)
+                    elif seg.end > covered_end:
+                        # 跨边界段: 裁剪起点保留句尾, 避免重叠窗口丢弃句子尾部
+                        seg.start = round(covered_end, 3)
+                        all_segs.append(seg)
+                        covered_end = max(covered_end, seg.end)
             return [
                 {"start": s.start, "end": s.end, "text": s.text}
-                for s in merged.segments
+                for s in all_segs
             ]
         else:
             # 原有的非重叠处理逻辑
@@ -666,12 +679,15 @@ class SenseVoiceTranscriber(BaseTranscriber):
         self._engine = SenseVoiceEngine(model_path, tokens_path, device, model_dir)
         self._audio_cfg = audio_cfg or {}
         self._device = device
+        # 保存路径供 is_available 检查文件 (不实例化引擎, 避免读 tokens.json 抛错)
+        self._model_path = model_path
+        self._tokens_path = tokens_path
 
     @classmethod
     def from_config(cls, config: dict) -> "SenseVoiceTranscriber":
         """Factory: create from application config dict."""
         import os
-        from app.core.config_loader import get_model_dir
+        from app.core.model_downloader import get_model_dir
         model_dir = get_model_dir()
         model_path = os.path.join(model_dir, "model.onnx")
         tokens_path = os.path.join(model_dir, "tokens.json")
@@ -716,11 +732,18 @@ class SenseVoiceTranscriber(BaseTranscriber):
             typed_segments.append(Segment(start=s["start"], end=s["end"], text=text))
         return TranscribeResult(segments=typed_segments)
 
-    def is_available(self):
+    def is_available(self) -> Tuple[bool, str]:
+        """检查 onnxruntime + 模型文件是否齐备 (不实例化引擎, 避免读 tokens.json 抛错)."""
         try:
-            import onnxruntime
-            return True, ""
+            import onnxruntime  # noqa: F401
         except ImportError:
             return False, "onnxruntime not installed"
-        except Exception as e:
-            return False, str(e)
+
+        model_file = Path(self._model_path)
+        tokens_file = Path(self._tokens_path)
+        # 真实 model.onnx 约 230MB; < 10MB 视为不完整 (允许测试 stub 通过需另外 mock)
+        if not model_file.exists() or model_file.stat().st_size < 10_000_000:
+            return False, f"model.onnx missing or too small: {model_file}"
+        if not tokens_file.exists():
+            return False, f"tokens.json missing: {tokens_file}"
+        return True, ""

@@ -31,3 +31,6 @@ zhconv>=1.2.0
 
 # CTC forced alignment (loaded by sensevoice_engine, optional)
 sentencepiece>=0.2.0
+
+# Paraformer (阿里达摩院) ASR engine - ONNX only, no funasr/torch dependency
+# Uses onnxruntime directly (model_quant.onnx from ModelScope)

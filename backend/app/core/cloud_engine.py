@@ -518,9 +518,7 @@ def _transcribe_whisper(audio_path: str, language: str, api_url: str, api_key: s
                 text = _z(text, "zh-cn")
             except Exception:
                 pass
-            if glossary:
-                for bad, good in glossary.items():
-                    text = text.replace(bad, good)
+            # 自定义 glossary 由 pipeline 层统一应用 (避免引擎层双重替换)
             segments = _generate_timestamps_vad(audio_path, text)
         else:
             segments = []
@@ -686,7 +684,7 @@ def _refine_timestamps_with_ctc(audio_path: str, full_text: str,
 
         # 2. Compute fbank features
         from app.core.audio_processor import compute_fbank_kaldi, apply_lfr, apply_cmvn, load_cmvn
-        from app.core.config_loader import get_model_dir
+        from app.core.model_downloader import get_model_dir
 
         model_dir = get_model_dir()
         if not os.path.exists(os.path.join(model_dir, "model.onnx")):
@@ -741,7 +739,11 @@ def _refine_timestamps_with_ctc(audio_path: str, full_text: str,
         logits = outputs[0][0]  # [T, V]
 
         # 6. Run forced alignment
-        from app.core.ctc_aligner import align_text_to_timestamps
+        try:
+            from app.core.ctc_aligner import align_text_to_timestamps
+        except ModuleNotFoundError:
+            # ctc_aligner 已移除 (v2.2), 回退原始 segments
+            return None
         char_timestamps = align_text_to_timestamps(
             logits, full_text, sp_model,
             frame_to_sec=0.06, ctc_delay_sec=0.15
@@ -916,11 +918,7 @@ def _transcribe_dashscope(audio_path: str, language: str, api_url: str, api_key:
         if not text or not text.strip():
             continue
 
-        # Apply glossary on the fly
-        if glossary:
-            for bad, good in glossary.items():
-                text = text.replace(bad, good)
-
+        # 自定义 glossary 由 pipeline 层统一应用 (避免引擎层双重替换)
         accumulated_text.append(text)
 
         # Split text into subtitle-friendly segments within this time range
@@ -1056,15 +1054,13 @@ def _fmt_srt_time(seconds: float) -> str:
 # ── BaseTranscriber Adapter ────────────────────────────────────────
 
 from .engine_base import BaseTranscriber, TranscribeResult, Segment
-from .chunk_merger import ChunkMerger
 
 
 class CloudTranscriber(BaseTranscriber):
     """Adapter wrapping cloud engine as a BaseTranscriber.
 
-    Supports standard Whisper API and DashScope.
-    For DashScope with continuous audio, uses overlapping chunks + ChunkMerger
-    for more accurate timestamps.
+    Supports standard Whisper API (OpenAI-compatible) and DashScope chat_completions.
+    Cloud engines don't need local chunk merging - they return full transcripts.
     """
 
     name = "cloud"
@@ -1072,9 +1068,10 @@ class CloudTranscriber(BaseTranscriber):
     requires_network = True
     is_local = False
 
-    def __init__(self, use_chunk_merger: bool = True):
-        self._use_chunk_merger = use_chunk_merger
-        self._merger = ChunkMerger()
+    def __init__(self, **kwargs):
+        # Backward-compat: accept legacy use_chunk_merger kwarg, but ignore
+        # Cloud engines return full transcripts with timestamps built-in.
+        pass
 
     def transcribe(
         self,
@@ -1094,154 +1091,24 @@ class CloudTranscriber(BaseTranscriber):
         glossary = kwargs.get("glossary", {})
 
         if request_mode == "chat_completions":
-            # OpenAI-compatible chat completions + input_audio (DashScope / MiMo / etc.)
-            if self._use_chunk_merger:
-                return self._transcribe_dashscope_merged(
-                    audio_path, language, api_url, api_key, model, glossary
-                )
-            else:
-                _, segments = _transcribe_dashscope(
-                    audio_path, language, api_url, api_key, model, glossary
-                )
+            # OpenAI-compatible chat completions + input_audio (DashScope / MiMo / Volcengine proxy)
+            _, segments = _transcribe_dashscope(
+                audio_path, language, api_url, api_key, model, glossary
+            )
         elif request_mode == "whisper":
             _, segments = _transcribe_whisper(
                 audio_path, language, api_url, api_key, model, glossary
             )
+        else:
+            raise ValueError(f"Unknown request_mode: {request_mode!r}")
 
         typed = [Segment(start=s["start"], end=s["end"], text=s["text"])
                  for s in segments]
         return TranscribeResult(segments=typed)
 
-    def _transcribe_dashscope_merged(
-        self,
-        audio_path: str,
-        language: str,
-        api_url: str,
-        api_key: str,
-        model: str,
-        glossary: dict,
-    ) -> TranscribeResult:
-        """DashScope path with overlapping chunks + ChunkMerger for better timestamps."""
-        import librosa
-        import soundfile as sf
-
-        waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
-        audio_duration = len(waveform) / sr
-
-        # Use longer chunks with overlap
-        CHUNK_SEC = 20
-        OVERLAP_SEC = 10
-        chunk_samples = int(CHUNK_SEC * sr)
-        overlap_samples = int(OVERLAP_SEC * sr)
-        step_samples = chunk_samples - overlap_samples
-
-        if step_samples <= 0:
-            step_samples = chunk_samples // 2
-
-        # Build overlapping chunks
-        chunks = []
-        t = 0
-        while t < len(waveform):
-            end = min(t + chunk_samples, len(waveform))
-            chunks.append((t, end))
-            t += step_samples
-            if t + overlap_samples >= len(waveform):
-                break
-
-        if len(chunks) <= 1:
-            # Short audio: no need for merger
-            _, segments = _transcribe_dashscope(
-                audio_path, language, api_url, api_key, model, glossary
-            )
-            typed = [Segment(start=s["start"], end=s["end"], text=s["text"])
-                     for s in segments]
-            return TranscribeResult(segments=typed)
-
-        # Transcribe each overlapping chunk
-        chunk_results = []
-        for start_sample, end_sample in chunks:
-            seg_audio = waveform[start_sample:end_sample]
-            seg_duration = (end_sample - start_sample) / sr
-
-            if seg_duration < 1.0:
-                continue
-
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                temp_wav = f.name
-            try:
-                sf.write(temp_wav, seg_audio, sr)
-                compressed = _compress_audio_for_upload(temp_wav)
-                compressed_is_temp = (compressed != temp_wav)
-                try:
-                    text = _transcribe_dashscope_payload(compressed, api_url, api_key, model)
-                finally:
-                    if compressed_is_temp:
-                        try:
-                            os.unlink(compressed)
-                        except OSError:
-                            pass
-            finally:
-                try:
-                    os.unlink(temp_wav)
-                except OSError:
-                    pass
-
-            if not text or not text.strip():
-                chunk_results.append(TranscribeResult())
-                continue
-
-            # Apply glossary
-            if glossary:
-                for bad, good in glossary.items():
-                    text = text.replace(bad, good)
-
-            # Create a single segment per chunk for merger
-            seg_start = start_sample / sr
-            seg_end = end_sample / sr
-            seg = Segment(start=seg_start, end=seg_end, text=text)
-            chunk_results.append(TranscribeResult(segments=[seg]))
-
-        if not chunk_results:
-            raise RuntimeError("Cloud API returned empty transcription (no speech detected).")
-
-        # Merge overlapping transcriptions
-        merged = self._merger.merge(chunk_results, overlap_duration=OVERLAP_SEC)
-
-        # Build subtitle segments from merged result
-        if not merged.segments:
-            return merged
-
-        all_segments = []
-        for seg in merged.segments:
-            is_cjk = text_splitter.is_mostly_cjk(seg.text)
-            max_len = text_splitter.DEFAULT_MAX_CHARS if is_cjk else text_splitter.DEFAULT_MAX_CHARS_EN  # Phase 1: 引用 text_splitter 共享常量
-            sub_texts = text_splitter.split_text_for_subtitles(seg.text, max_len, is_cjk)
-
-            if len(sub_texts) <= 1:
-                all_segments.append(Segment(start=seg.start, end=seg.end, text=seg.text))
-            else:
-                total_chars = sum(len(t) for t in sub_texts) or 1
-                duration = seg.end - seg.start
-                offset = 0.0
-                for sub in sub_texts:
-                    ratio = len(sub) / total_chars
-                    sub_start = seg.start + offset
-                    sub_end = seg.start + offset + ratio * duration
-                    offset += ratio * duration
-                    all_segments.append(Segment(start=sub_start, end=sub_end, text=sub))
-
-        # Clean up boundaries
-        for i in range(len(all_segments) - 1):
-            if all_segments[i].end > all_segments[i + 1].start:
-                all_segments[i].end = all_segments[i + 1].start
-
-        if all_segments:
-            all_segments[-1].end = min(all_segments[-1].end, audio_duration)
-
-        return TranscribeResult(segments=all_segments)
-
-    def is_available(self):
+    def is_available(self) -> Tuple[bool, str]:
+        """Check if cloud API is configured."""
         config = load_engine_config()
         if config.get("enabled") and config.get("api_url") and config.get("api_key"):
             return True, ""
-        return False, "Cloud API not configured"
+        return False, "Cloud API not configured (api_url + api_key required)"
