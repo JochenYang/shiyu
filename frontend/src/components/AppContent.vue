@@ -66,11 +66,30 @@
           </span>
         </div>
 
-        <!-- LLM 修正按钮 -->
-        <div class="llm-correct-row" v-if="parsedSegments.length > 0 && appSettings.llmApiUrl">
-          <button class="secondary-btn llm-correct-btn" @click="onCorrectWithLLM" :disabled="isCorrecting">
-            <BrainCircuit :size="16" /> {{ isCorrecting ? '修正中...' : 'LLM 修正' }}
-          </button>
+        <!-- 字幕时间偏移 (主人手动微调, 不依赖后端重启) -->
+        <div class="offset-control">
+          <label class="engine-label">
+            字幕时间偏移
+            <span class="offset-value">{{ subtitleOffset.toFixed(1) }}s</span>
+            <span class="offset-hint">{{ subtitleOffset > 0 ? '(字幕提前)' : subtitleOffset < 0 ? '(字幕推后)' : '' }}</span>
+          </label>
+          <div class="offset-row">
+            <button class="offset-btn" @click="adjustOffset(-0.5)" :disabled="isProcessing">-0.5s</button>
+            <input
+              type="range"
+              min="-5"
+              max="5"
+              step="0.1"
+              v-model.number="subtitleOffset"
+              class="offset-slider"
+              :disabled="isProcessing"
+            />
+            <button class="offset-btn" @click="adjustOffset(0.5)" :disabled="isProcessing">+0.5s</button>
+            <button class="offset-btn offset-reset" @click="subtitleOffset = 0" :disabled="isProcessing">重置</button>
+          </div>
+          <div class="offset-hint-row">
+            字幕晚 2 秒 → 滑到 -2.0 (或点 -0.5s 四次)
+          </div>
         </div>
 
         <!-- 列表头部 -->
@@ -429,58 +448,6 @@
               </div>
             </template>
 
-            <!-- LLM 修正 -->
-            <template v-if="currentSettingsTab === 'llm'">
-              <div class="setting-item">
-                <div class="setting-label">启用 LLM 修正</div>
-                <n-switch v-model:value="appSettings.llmEnabled" @update:value="onToggleLlmEnabled" />
-              </div>
-              <div class="setting-item" v-if="appSettings.llmEnabled">
-                <div class="setting-label">状态</div>
-                <span class="llm-status" v-if="appSettings.llmApiUrl && appSettings.llmModel">
-                  <span class="model-status-dot active"></span>
-                  已配置 {{ appSettings.llmProvider === 'ollama' ? 'Ollama 本地' : '云端' }} ({{ appSettings.llmModel }})
-                </span>
-                <span class="llm-status" v-else>
-                  <span class="model-status-dot inactive"></span>
-                  配置不完整（需填写 API 地址和模型名）
-                </span>
-              </div>
-  <div class="setting-item col">
-    <div class="setting-label">提供商</div>
-    <select class="log-level-select" v-model="appSettings.llmProvider">
-      <option value="openai">OpenAI 兼容</option>
-      <option value="ollama">Ollama </option>
-    </select>
-  </div>
-  <div class="setting-item col">
-    <div class="setting-label">API 地址</div>
-    <n-input v-model:value="appSettings.llmApiUrl"
-      placeholder="例: https://api.openai.com/v1 / https://ark.cn-beijing.volces.com/api/v3 / http://localhost:11434/v1" />
-  </div>
-  <div class="setting-item col">
-    <div class="setting-label">API Key</div>
-    <n-input v-model:value="appSettings.llmApiKey"
-      :type="showLlmApiKey ? 'text' : 'password'" placeholder="Ollama 可留空，其余必填">
-      <template #suffix>
-        <button class="icon-btn" @click="showLlmApiKey = !showLlmApiKey" tabindex="-1">
-          <Eye v-if="!showLlmApiKey" :size="16" />
-          <EyeOff v-else :size="16" />
-        </button>
-      </template>
-    </n-input>
-  </div>
-  <div class="setting-item col">
-    <div class="setting-label">模型名</div>
-    <n-input v-model:value="appSettings.llmModel"
-      placeholder="例: gpt-4o / deepseek-v4-flash / qwen-plus" />
-  </div>
-              <div class="setting-item">
-                <button class="secondary-btn" @click="onSaveLlmCorrectionSettings">保存 LLM 配置</button>
-                <span v-if="llmSettingsStatus" class="setting-status">{{ llmSettingsStatus }}</span>
-              </div>
-            </template>
-
             <!-- 日志 -->
             <template v-if="currentSettingsTab === 'log'">
               <div class="setting-item">
@@ -617,6 +584,12 @@ const backendOnline = ref(false);
 const engines = ref([]);
 const selectedEngine = ref("sensevoice_local");
 
+// 字幕时间偏移 (主人手动微调, 不依赖后端重启, 范围 -5s ~ +5s, 精度 0.1s)
+const subtitleOffset = ref(0.0);
+function adjustOffset(delta) {
+  subtitleOffset.value = Math.max(-5, Math.min(5, subtitleOffset.value + delta));
+}
+
 // Model download state
 const modelStatus = ref("idle"); // idle, downloading, loading, ready, error
 const modelProgress = ref(0);
@@ -663,7 +636,6 @@ const settingsTabs = [
   { key: "general", icon: Settings, label: "通用" },
   { key: "model", icon: Mic, label: "模型" },
   { key: "cloud", icon: Cloud, label: "云端" },
-  { key: "llm", icon: BrainCircuit, label: "LLM" },
   { key: "log", icon: FileText, label: "日志" },
 ];
 const appSettings = ref({
@@ -941,9 +913,9 @@ async function onCorrectWithLLM() {
     if (data.segments) {
       resultSegments.value = data.segments;
       if (data.llm_corrected) {
-        message.success(`LLM 已修正 ${data.segments.length} 条字幕`);
+        message.success(`已修正 ${data.segments.length} 条字幕`);
       } else {
-        message.info("LLM 修正无变化");
+        message.info("修正无变化");
       }
     }
   } catch (e) {
@@ -981,6 +953,7 @@ async function startTranscribe() {
         output_format: format.value,
         glossary: glossaryStr,
         engine: currentEngine,
+        subtitleOffset: subtitleOffset.value,
       });
       if (result.segments) {
         resultSegments.value = result.segments;
@@ -992,6 +965,7 @@ async function startTranscribe() {
         language.value,
         glossaryStr,
         currentEngine,
+        subtitleOffset.value,
       );
       if (json?.segments) {
         resultSegments.value = json.segments;
@@ -1496,6 +1470,90 @@ function fmtTimeSrt(sec) {
   font-size: 0.7rem;
   color: #e8a838;
   margin-top: 2px;
+}
+
+/* 字幕时间偏移滑块 */
+.offset-control {
+  margin-top: 12px;
+}
+.offset-control .engine-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.offset-value {
+  font-weight: 600;
+  color: #1fbc5b;
+  font-variant-numeric: tabular-nums;
+}
+.offset-hint {
+  font-size: 0.7rem;
+  color: #888;
+  font-weight: 400;
+}
+.offset-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.offset-btn {
+  background: #333;
+  color: #fff;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.offset-btn:hover:not(:disabled) {
+  background: #444;
+}
+.offset-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.offset-reset {
+  margin-left: auto;
+  color: #888;
+}
+.offset-slider {
+  flex: 1;
+  height: 4px;
+  background: #333;
+  border-radius: 2px;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+.offset-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  background: #1fbc5b;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.offset-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  background: #1fbc5b;
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+}
+.offset-slider:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.offset-hint-row {
+  font-size: 0.7rem;
+  color: #666;
+  margin-top: 4px;
+  font-style: italic;
 }
 
 .upload-container :deep(.n-upload-dragger) {

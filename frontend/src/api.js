@@ -52,12 +52,13 @@ export async function transcribeFile(file, options = {}) {
  * @param {string} language - Target language
  * @returns {Promise<Object>} { filename, language, duration, segments }
  */
-export async function transcribeJson(file, language = "auto", glossary = "{}", engine = "local") {
+export async function transcribeJson(file, language = "auto", glossary = "{}", engine = "local", subtitleOffset = 0) {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("language", language);
   formData.append("glossary", glossary);
   formData.append("engine_mode", engine);
+  formData.append("subtitle_offset_sec", String(subtitleOffset));
 
   const res = await fetch(`${API_BASE}/transcribe/json`, {
     method: "POST",
@@ -85,6 +86,7 @@ export async function transcribeLocal(filePath, options = {}) {
   formData.append("output_format", options.output_format || "srt");
   formData.append("glossary", options.glossary || "{}");
   formData.append("engine_mode", options.engine || "local");
+  formData.append("subtitle_offset_sec", String(options.subtitleOffset || 0));
 
   const res = await fetch(`${API_BASE}/transcribe/local`, {
     method: "POST",
