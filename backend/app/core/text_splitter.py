@@ -31,6 +31,13 @@ DEFAULT_MAX_DURATION = 7.0     # 切分后最大时长（秒）
 # 行业惯例（YouTube auto-caption 近似值）；overlap_sec=0 可禁用
 OVERLAP_SECONDS = 0.05
 
+# 停顿切分阈值（秒）: 逐字符时间戳中相邻字符间隔超过该值视为句间停顿,
+# 作为优先切分点 (zipformer 无标点输出场景, 比 25 字符硬切更贴近真实句边界)
+PAUSE_THRESHOLD = 0.4
+
+# 停顿切分的独立片段下限: 低于该字数的停顿段并入相邻段
+MIN_PAUSE_FRAGMENT = 7
+
 
 # ── CJK 检测 ──────────────────────────────────────────────────────────────
 
@@ -200,6 +207,14 @@ def split_text_at_boundaries(
             result.append(dict(seg))
             continue
 
+        # 停顿切分优先 (zipformer 无标点场景, char_times 存在时):
+        # 真实句边界 ≈ 字符间停顿, 比 25 字符硬切更贴近语音
+        if seg.get("char_times"):
+            pause_parts = _split_by_pauses(seg, max_chars)
+            if pause_parts:
+                _assign_timestamps(seg, pause_parts, duration, result)
+                continue
+
         # Find valid sentence-end split points
         split_after = _find_sentence_splits(text)
 
@@ -241,6 +256,10 @@ def _assign_timestamps_with_overlap(
 ) -> None:
     """按字符数比例分配时间戳，相邻段间保留 ``overlap_sec`` 微重叠。
 
+    若 seg 携带 ``char_times`` (逐字符真实开始时间, len == len(text)),
+    则改为按字符在 text 中的偏移查真实时间戳, 消除长段比例插值的
+    累积误差 (zipformer 整段输出场景, 实测可差 1.4s+); 缺省时回退比例分配.
+
     Phase 1 新增：替代纯比例分配，用微小重叠掩盖时间戳抖动。
     默认 ``overlap_sec = OVERLAP_SECONDS (0.05s)``，传 0 即可禁用回到旧行为。
 
@@ -254,24 +273,55 @@ def _assign_timestamps_with_overlap(
         result.append(dict(seg))
         return
 
+    char_times = seg.get("char_times")
+    text = seg.get("text") or ""
+    if not (isinstance(char_times, (list, tuple)) and len(char_times) == len(text)):
+        char_times = None
+
     cursor = seg["start"]
     n = len(parts)
+    consumed = 0  # 已消耗字符数 (真实时间戳定位用, 与 sensevoice 同款 find)
+    remaining = text
     for idx, part_text in enumerate(parts):
         is_last = idx == n - 1
-        part_ratio = len(part_text) / total_chars
-        if is_last:
-            # 最后一段固定为 seg.end，避免累加误差
-            part_end = seg["end"]
+        if char_times is not None:
+            # 精确分配: 定位 part 在 text 中的字符区间, 首/末字符取真实时间
+            pos = remaining.find(part_text)
+            if pos == -1:
+                start_char, end_char = consumed, consumed + len(part_text) - 1
+            else:
+                start_char = consumed + pos
+                end_char = start_char + len(part_text) - 1
+            start_char = min(max(start_char, 0), len(text) - 1)
+            end_char = min(max(end_char, start_char), len(text) - 1)
+            # 起点钳制: 分块 DEDUP 裁剪过 seg.start 时, 段起点不得早于裁剪点
+            part_start = max(float(char_times[start_char]), seg["start"])
+            part_end = float(char_times[end_char])
+            consumed = end_char + 1
+            remaining = text[consumed:]
+            if is_last:
+                part_end = seg["end"]
+            else:
+                part_end = max(part_end, part_start)  # 防回退
         else:
-            part_end = cursor + duration * part_ratio
+            # 比例分配 (旧行为)
+            part_ratio = len(part_text) / total_chars
+            part_start = cursor
+            if is_last:
+                part_end = seg["end"]
+            else:
+                part_end = cursor + duration * part_ratio
         result.append({
-            "start": round(cursor, 3),
+            "start": round(part_start, 3),
             "end": round(part_end, 3),
             "text": part_text,
         })
-        # 非最后段：下一段 start = 当前 end - overlap_sec（用 max 防止倒退到 seg.start 之前）
         if not is_last:
-            cursor = max(seg["start"], part_end - overlap_sec)
+            # 非最后段: 下一段起点 (真实时间戳时取本段 end, 避免回退; 比例时 - overlap)
+            if char_times is not None:
+                cursor = max(seg["start"], part_end)
+            else:
+                cursor = max(seg["start"], part_end - overlap_sec)
 
 
 def _assign_timestamps(
@@ -289,6 +339,74 @@ def _assign_timestamps(
 
 
 # ── 内部辅助 ──────────────────────────────────────────────────────────
+
+
+def _split_by_pauses(seg: Dict, max_chars: int, min_chars: int = MIN_PAUSE_FRAGMENT) -> List[str]:
+    """停顿切分: 用逐字符时间戳中的停顿点切分, 返回 parts 或 None(回退).
+
+    适用场景: 无标点引擎 (zipformer-ctc) 的整段输出, ``char_times`` 为逐字符
+    真实开始时间, 相邻字符间隔 > ``PAUSE_THRESHOLD`` 处视为真实句边界,
+    比 25 字符硬切更贴近语音; 无停顿点、切分结果无效时返回 None 回退硬切.
+
+    注意: 停顿段的自然长度通常 6-14 字符 (口语短句), 过短段合并阈值用
+    ``MIN_PAUSE_FRAGMENT`` (7) 而非标点切分的 ``DEFAULT_MIN_CHARS`` (15),
+    否则停顿段全被并入巨型段, 又退回 25 字符硬切 (实测复现).
+
+    Args:
+        seg: Segment dict, 需携带 ``char_times`` (len == len(text)).
+        max_chars: 切分后片段字符上限, 内部无停顿的超长段仍硬切至此.
+        min_chars: 低于此字数的停顿段并入相邻段 (默认 ``MIN_PAUSE_FRAGMENT``).
+
+    Returns:
+        List[str] 切分文本, 或 None (无需切分 / 数据无效 / 全部并回一段).
+    """
+    text = seg.get("text") or ""
+    char_times = seg.get("char_times")
+    if not (isinstance(char_times, (list, tuple)) and len(char_times) == len(text)):
+        return None
+    n = len(text)
+    if n <= max_chars:
+        return None  # 不需要切
+
+    pauses = [i + 1 for i in range(n - 1) if char_times[i + 1] - char_times[i] > PAUSE_THRESHOLD]
+    if not pauses:
+        return None
+
+    # 粗切: 每个停顿点处断开
+    parts, prev = [], 0
+    for sp in pauses:
+        part = text[prev:sp].strip()
+        if part:
+            parts.append(part)
+        prev = sp
+    tail = text[prev:].strip()
+    if tail:
+        parts.append(tail)
+    if len(parts) <= 1:
+        return None
+
+    # 过短段并入前段, 避免碎字幕
+    merged, buf = [], ""
+    for part in parts:
+        if buf and len(part) < min_chars:
+            buf += part
+        else:
+            if buf:
+                merged.append(buf)
+            buf = part
+    if buf:
+        merged.append(buf)
+    if len(merged) <= 1:
+        return None  # 全合并回去, 回退硬切
+
+    # 内部已无停顿的超长段硬切 (停顿切分不保证 <= max_chars)
+    final = []
+    for part in merged:
+        if len(part) <= max_chars:
+            final.append(part)
+        else:
+            final.extend(part[i:i + max_chars] for i in range(0, len(part), max_chars))
+    return final
 
 
 def _find_sentence_splits(text: str) -> List[int]:

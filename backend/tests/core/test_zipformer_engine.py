@@ -161,6 +161,32 @@ class TestFromConfig:
         engine = ZipformerEngine.from_config({"num_threads": 8})
         assert engine._num_threads == 8
 
+    def test_from_config_ctc_delay_sec(self):
+        """ctc_delay_sec 自定义; 缺省时用默认 0.15."""
+        from app.core.zipformer_engine import ZipformerEngine
+        engine = ZipformerEngine.from_config({"ctc_delay_sec": 0.2})
+        assert engine._ctc_delay_sec == 0.2
+        engine_default = ZipformerEngine.from_config({})
+        assert engine_default._ctc_delay_sec == 0.15
+
+    def test_init_kwargs_from_config_ctc_delay_sec(self):
+        """生产注册路径 (init_kwargs_from_config) 透传 ctc_delay_sec.
+
+        回归: reviewer P1-2 — main.py 用 init_kwargs_from_config 注册,
+        缺失时 config.yaml engines.zipformer.ctc_delay_sec 不生效.
+        """
+        from app.core.zipformer_engine import ZipformerEngine
+        kwargs = ZipformerEngine.init_kwargs_from_config({"ctc_delay_sec": 0.0})
+        assert kwargs["ctc_delay_sec"] == 0.0
+        kwargs_default = ZipformerEngine.init_kwargs_from_config({})
+        assert kwargs_default["ctc_delay_sec"] == 0.15
+
+    def test_transcriber_from_config_ctc_delay_sec(self):
+        """ZipformerTranscriber.from_config (注册即用) 透传 ctc_delay_sec."""
+        from app.core.zipformer_engine import ZipformerTranscriber
+        t = ZipformerTranscriber.from_config({"ctc_delay_sec": 0.2})
+        assert t._engine._ctc_delay_sec == 0.2
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 5. _result_to_segments() 边界
@@ -195,7 +221,7 @@ class TestResultToSegments:
         assert segments[0].end == 0.0
 
     def test_whole_utterance_uses_first_last_timestamp(self, tmp_path):
-        """无 VAD 切分 → 1 段, [timestamps[0], timestamps[-1]]."""
+        """无 VAD 切分 → 1 段, [timestamps[0], timestamps[-1]], 减去 CTC 滞后 0.15s."""
         engine = self._make_engine(tmp_path)
         result = MagicMock(
             text="今天天气不错",
@@ -206,9 +232,39 @@ class TestResultToSegments:
         )
         segments = engine._result_to_segments(result)
         assert len(segments) == 1
+        assert segments[0].start == 0.01
+        assert segments[0].end == 1.61
+        assert segments[0].text == "今天天气不错"
+
+    def test_ctc_delay_disabled_keeps_raw_timestamps(self, tmp_path):
+        """ctc_delay_sec=0 → 不补偿, 保留 sherpa-onnx 原始时间戳."""
+        from app.core.zipformer_engine import ZipformerEngine
+        engine = ZipformerEngine(model_dir=str(tmp_path), num_threads=1, ctc_delay_sec=0.0)
+        result = MagicMock(
+            text="今天天气不错",
+            timestamps=[0.16, 0.48, 0.80, 1.12, 1.44, 1.76],
+            segment_texts=[],
+            segment_timestamps=[],
+            segment_durations=[],
+        )
+        segments = engine._result_to_segments(result)
         assert segments[0].start == 0.16
         assert segments[0].end == 1.76
-        assert segments[0].text == "今天天气不错"
+
+    def test_ctc_delay_custom_value(self, tmp_path):
+        """自定义补偿值生效 (0.2s)."""
+        from app.core.zipformer_engine import ZipformerEngine
+        engine = ZipformerEngine(model_dir=str(tmp_path), num_threads=1, ctc_delay_sec=0.2)
+        result = MagicMock(
+            text="今天天气不错",
+            timestamps=[0.16, 0.48, 0.80, 1.12, 1.44, 1.76],
+            segment_texts=[],
+            segment_timestamps=[],
+            segment_durations=[],
+        )
+        segments = engine._result_to_segments(result)
+        assert segments[0].start == 0.0  # 0.16 - 0.2 → clamp 0
+        assert segments[0].end == 1.56
 
     def test_vad_segmented_result_uses_segment_texts(self, tmp_path):
         """VAD 切分结果 → 多段, 时间戳来自 segment_timestamps."""
@@ -223,11 +279,11 @@ class TestResultToSegments:
         segments = engine._result_to_segments(result)
         assert len(segments) == 2
         assert segments[0].text == "第一段"
-        assert segments[0].start == 0.0
+        assert segments[0].start == 0.0    # 0 - 0.15 → clamp 0
         assert segments[0].end == 1.5
         assert segments[1].text == "第二段"
-        assert segments[1].start == 2.0
-        assert segments[1].end == 3.8
+        assert segments[1].start == 1.85   # 2.0 - 0.15
+        assert segments[1].end == 3.65     # 1.85 + 1.8
 
     def test_vad_segmented_skips_empty_segments(self, tmp_path):
         """VAD 切分中有空白段 → 跳过."""
@@ -376,9 +432,10 @@ class TestChunkOverlapDedup:
         wav = tmp_path / "long.wav"
         sf.write(str(wav), np.zeros(65 * sr, dtype=np.float32), sr)
 
-        # 块 1 [0s, 30s): 末段 CTC 尾巴溢出到 30.5s (覆盖了块 2 起点)
-        # 块 2 输入回退到 [28s, 60s): 重叠区 [28s, 30s) 的转录绝对时间
-        #   落在 [28s, 30s), 与 covered_end=30.5 重叠 → 应被丢弃
+        # 块 1 [0s, 30s) 内容区 [0, 28): 末段 CTC 尾巴溢出到 30.5s,
+        #   但只保留到内容区末尾 28s (块尾 2s 重叠区交给块 2 完整解码)
+        # 块 2 输入回退到 [28s, 60s) 内容区 [30, 58): 重叠区 [28, 30) 的
+        #   "重叠内容" 绝对时间落在内容区外 → 整段丢弃 (无 char_times 路径)
         chunk_specs = [
             (["说话内容", "更多内容"], [0.0, 25.0], [5.0, 5.5]),
             (["重叠内容", "继续说话"], [0.0, 4.0], [2.0, 6.0]),
@@ -393,13 +450,14 @@ class TestChunkOverlapDedup:
             mock_vad.return_value.detect_speech.return_value = []
             result = engine.transcribe(str(wav))
 
-        # 修正偏移后: 块 2 音频起点 28s, 重叠重复段 (28, 30) 被丢弃,
-        # 新内容 (32, 38); 块 3 音频起点 58s, 内容 (58, 62)
+        # v2.3 语义: 每块只输出内容区 [chunk_start, 块尾-2s) 的句子,
+        #   起点钳制到内容区起点; 所有时间戳减 0.15s CTC 滞后补偿
+        #   (起点 < 0 时 clamp 到 0)
         assert [(s.text, round(s.start, 3), round(s.end, 3)) for s in result.segments] == [
             ("说话内容", 0.0, 5.0),
-            ("更多内容", 25.0, 30.5),
-            ("继续说话", 32.0, 38.0),   # 块 2 的重叠重复段 (28, 30) 被丢弃
-            ("收尾内容", 58.0, 62.0),
+            ("更多内容", 24.85, 28.0),     # 块尾 2s 重叠区截断, 交给块 2 重新解码
+            ("继续说话", 31.85, 37.85),   # 块 2 的重叠重复段 (27.85, 29.85) 整段丢弃
+            ("收尾内容", 60.0, 61.85),    # 块 3 内容区 [60, 65): 起点钳制到 60
         ]
         # 块输入回退: 块 1 [0, 30s), 块 2 [28s, 60s), 块 3 [58s, 65s)
         assert len(recognizer.captured[0]) == 30 * sr
@@ -459,3 +517,226 @@ class TestZipformerE2E:
         assert seg.end <= audio_duration + 2.0, (
             f"end={seg.end} > duration={audio_duration}"
         )
+
+    def test_e2e_long_audio_chunked_path(self, tmp_path):
+        """>30s 音频走分块路径 (reviewer P2-2): 无异常、时间戳不超界、无相邻重复.
+
+        用 0.wav 拼接 6 段 + 段间静音 → 33.7s, 触发 30s 分块 + 2s 重叠.
+        """
+        import numpy as np
+        import soundfile as sf
+        from app.core.zipformer_engine import ZipformerEngine
+
+        engine = ZipformerEngine.from_config({"model_dir": ZIPFORMER_MODEL_DIR})
+        src = Path(ZIPFORMER_MODEL_DIR) / "test_wavs" / "0.wav"
+        audio, sr = sf.read(str(src), dtype="float32")
+        silence = np.zeros(int(0.4 * sr), dtype="float32")
+        long_audio = np.concatenate([audio, silence] * 6)
+        long_wav = tmp_path / "long.wav"
+        sf.write(str(long_wav), long_audio, sr)
+        duration = len(long_audio) / sr
+        assert duration > 30.0  # 必须触发分块
+
+        result = engine.transcribe(str(long_wav))
+        assert len(result.segments) >= 1
+        for i, seg in enumerate(result.segments):
+            assert seg.start >= 0
+            assert seg.end >= seg.start
+            assert seg.end <= duration + 2.0, f"seg {i} end={seg.end} > duration={duration}"
+            assert len(seg.text) > 0
+        # 无相邻重复段 (块边界去重回归)
+        for i in range(1, len(result.segments)):
+            assert result.segments[i].text != result.segments[i - 1].text, (
+                f"相邻重复段: {result.segments[i].text!r}"
+            )
+
+# ─────────────────────────────────────────────────────────────────────
+# 9. v2.3 块边界处理: _trim_segment / _dedup_overlap / _build_char_times
+# ─────────────────────────────────────────────────────────────────────
+
+class TestTrimSegment:
+    """_trim_segment: 块内容区裁剪 + 停顿点对齐 (整句保留, 残句丢弃)."""
+
+    def _mk(self, text, times, start=0.0, end=None):
+        from app.core.engine_base import Segment
+        if end is None:
+            end = times[-1] + 1.0
+        return Segment(start=start, end=end, text=text, char_times=times)
+
+    def test_no_char_times_clamps_bounds(self):
+        """无 char_times (VAD 切分路径): 直接钳制 start/end."""
+        from app.core.engine_base import Segment
+        from app.core.zipformer_engine import ZipformerEngine
+        seg = Segment(start=1.0, end=9.0, text="测试文本")
+        out = ZipformerEngine._trim_segment(seg, 2.0, 8.0)
+        assert out.start == 2.0
+        assert out.end == 8.0
+        assert out.text == "测试文本"
+
+    def test_empty_interval_returns_none(self):
+        """内容区内没有内容 (整段落在已覆盖区) → None."""
+        from app.core.engine_base import Segment
+        from app.core.zipformer_engine import ZipformerEngine
+        seg = Segment(start=3.0, end=4.0, text="重叠", char_times=[3.0, 3.5])
+        assert ZipformerEngine._trim_segment(seg, 5.0, 8.0) is None
+
+    def test_segment_after_hi_returns_none(self):
+        """整段在 hi 之后 (块尾解码内容) → None (由下一块负责)."""
+        from app.core.zipformer_engine import ZipformerEngine
+        seg = self._mk("下一块内容", [9.0, 9.1, 9.2, 9.3, 9.4], start=9.0)
+        assert ZipformerEngine._trim_segment(seg, 5.0, 8.0) is None
+
+    def test_trim_keeps_complete_sentence_across_hi(self):
+        """句尾跨 hi 时整句保留 (end 扩展到句尾真实时间, 而不是截断)."""
+        from app.core.zipformer_engine import ZipformerEngine
+        # 第一句 [0.0, 0.3], 第二句 [1.4, 1.7], 句间停顿 1.1s
+        # 内容区 [1.0, 1.5): 落在第二句中间. 句首回退 → "五" (1.4),
+        # 句尾扩展 → "八" (1.7), 整句跨 hi 仍完整保留, end = 句尾真实时间
+        text = "一二三四" + "五六七八"
+        times = [0.0, 0.1, 0.2, 0.3, 1.4, 1.5, 1.6, 1.7]
+        seg = self._mk(text, times)
+        out = ZipformerEngine._trim_segment(seg, 1.0, 1.5)
+        assert out.text == "五六七八"
+        assert out.char_times == [1.4, 1.5, 1.6, 1.7]
+        # end 覆盖到句尾真实时间 (1.7), 不截断到 hi (1.5)
+        assert out.end == 1.7
+        # 句首 1.4 > lo=1.0, start 钳到 lo (内容区起点)
+        assert out.start == 1.0
+
+    def test_trim_with_pause_alignment(self):
+        """裁剪点对齐停顿点: 起点回退到句首, 终点扩展到句尾."""
+        from app.core.zipformer_engine import ZipformerEngine
+        # 4 字一句, 句间停顿 1s. 内容区 [1.0, 3.2) 落在第二句内
+        text = "一二三四" + "五六七八" + "九十甲乙"
+        times = [0.0, 0.1, 0.2, 0.3, 1.4, 1.5, 1.6, 1.7, 2.8, 2.9, 3.0, 3.1]
+        seg = self._mk(text, times)
+        out = ZipformerEngine._trim_segment(seg, 1.0, 3.2)
+        # i0: 第一个 t>=1.0 = "五"(1.4) → 回退到句首 "五" (1.4 前 0.3 停顿 1.1s)
+        # i1: 最后一个 t<3.2 = "甲"(2.8)... 扩展链到句尾 "乙"(3.1)
+        # 文本 = "五六七八九十甲乙"
+        assert out.text == "五六七八九十甲乙"
+        assert out.char_times == [1.4, 1.5, 1.6, 1.7, 2.8, 2.9, 3.0, 3.1]
+        assert out.start == 1.0  # 句首 1.4 > lo=1.0, 钳到内容区起点
+        assert out.end == 3.2    # 钳制到 hi
+
+    def test_start_clamped_to_lo_when_sentence_starts_inside(self):
+        """句首在内容区内时, start 钳到 lo."""
+        from app.core.zipformer_engine import ZipformerEngine
+        text = "一二三四" + "五六七八"
+        times = [0.0, 0.1, 0.2, 0.3, 1.6, 1.7, 1.8, 1.9]
+        seg = self._mk(text, times)
+        out = ZipformerEngine._trim_segment(seg, 1.0, 2.0)
+        # i0 = "五"(1.6) >= 1.0, 回退: 前有停顿 (0.3→1.6 = 1.3s) → 停在 "五"
+        # start = max(seg.start=0, min(lo=1.0, ct[i0]=1.6)) = 1.0
+        assert out.text == "五六七八"
+        assert out.start == 1.0
+
+
+class TestDedupOverlap:
+    """_dedup_overlap: 相邻段时间重叠 + 文本包含 → 去重."""
+
+    def _mk(self, text, start, end):
+        from app.core.engine_base import Segment
+        return Segment(start=start, end=end, text=text)
+
+    def test_drop_tail_duplicate(self):
+        """后段是前段子串且时间重叠 → 丢弃后段."""
+        from app.core.zipformer_engine import ZipformerEngine
+        segs = [
+            self._mk("然后当我们的计时器超时时", 27.5, 30.0),
+            self._mk("当我们的计时器超时时", 28.0, 30.1),
+        ]
+        out = ZipformerEngine._dedup_overlap(segs)
+        assert [(s.text, s.start) for s in out] == [("然后当我们的计时器超时时", 27.5)]
+
+    def test_replace_prev_with_full_sentence(self):
+        """前段是后段子串 (后段更完整) → 用后段替换前段."""
+        from app.core.zipformer_engine import ZipformerEngine
+        segs = [
+            self._mk("如果我们移除玩家的", 58.0, 59.4),
+            self._mk("如果我们移除玩家的碰撞体", 58.3, 62.0),
+        ]
+        out = ZipformerEngine._dedup_overlap(segs)
+        assert [(s.text) for s in out] == ["如果我们移除玩家的碰撞体"]
+
+    def test_identical_text_drops_second(self):
+        """完全相同文本 + 时间重叠 → 保留前段."""
+        from app.core.zipformer_engine import ZipformerEngine
+        segs = [
+            self._mk("重复的内容", 10.0, 12.0),
+            self._mk("重复的内容", 10.2, 12.1),
+        ]
+        out = ZipformerEngine._dedup_overlap(segs)
+        assert len(out) == 1
+        assert out[0].start == 10.0
+
+    def test_no_overlap_kept(self):
+        """时间不重叠 → 即使子串也保留 (不同时段内容是独立的)."""
+        from app.core.zipformer_engine import ZipformerEngine
+        segs = [
+            self._mk("第一句内容", 0.0, 2.0),
+            self._mk("第一句", 5.0, 6.0),
+        ]
+        out = ZipformerEngine._dedup_overlap(segs)
+        assert len(out) == 2
+
+    def test_adjacent_zero_gap_duplicate_dropped(self):
+        """块尾整句越界时, 前后段 end/start 完全邻接 (0 间隔) → 仍去重."""
+        from app.core.zipformer_engine import ZipformerEngine
+        segs = [
+            self._mk("然后当我们的计时器超时时", 27.5, 29.45),
+            self._mk("当我们的计时器超时时", 29.45, 30.1),
+        ]
+        out = ZipformerEngine._dedup_overlap(segs)
+        assert len(out) == 1
+        assert out[0].text == "然后当我们的计时器超时时"
+
+    def test_chained_replace_then_dedup(self):
+        """替换后与下一段继续链式去重 (后段替换前段后, 再与再后段比较)."""
+        from app.core.zipformer_engine import ZipformerEngine
+        segs = [
+            self._mk("如果我们移除玩家的", 58.0, 59.4),
+            self._mk("如果我们移除玩家的碰撞体", 58.3, 62.0),
+            self._mk("如果我们移除玩家的碰撞体让它直接从地图上掉落", 58.5, 64.0),
+        ]
+        out = ZipformerEngine._dedup_overlap(segs)
+        assert [(s.text) for s in out] == [
+            "如果我们移除玩家的碰撞体让它直接从地图上掉落"
+        ]
+
+
+class TestBuildCharTimes:
+    """_build_char_times: token/timestamps → 逐字符时间, 失败回退 None."""
+
+    def test_valid_mapping(self):
+        """合法 token 流 → char_times (与文本等长, 时间取起始字节所属 token)."""
+        from app.core.bbpe_map import BYTE_TO_BCHAR
+        from app.core.zipformer_engine import ZipformerEngine
+        raw = "你好".encode("utf-8")
+        tokens = [BYTE_TO_BCHAR[b] for b in raw]
+        timestamps = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+        ct = ZipformerEngine._build_char_times("你好", tokens, timestamps)
+        assert ct == [1.0, 1.3]
+
+    def test_decoded_text_mismatch_returns_none(self):
+        """解码文本与传入 text 不一致 → None (时间戳不可信)."""
+        from app.core.bbpe_map import BYTE_TO_BCHAR
+        from app.core.zipformer_engine import ZipformerEngine
+        raw = "你好".encode("utf-8")
+        tokens = [BYTE_TO_BCHAR[b] for b in raw]
+        ct = ZipformerEngine._build_char_times("你好吗", tokens, [1.0] * 6)
+        assert ct is None
+
+    def test_none_or_mismatched_inputs_return_none(self):
+        """tokens/timestamps 缺失或长度不一致 → None."""
+        from app.core.zipformer_engine import ZipformerEngine
+        assert ZipformerEngine._build_char_times("abc", None, None) is None
+        assert ZipformerEngine._build_char_times("abc", ["a", "b"], [1.0]) is None
+        assert ZipformerEngine._build_char_times("", [], []) is None
+
+    def test_magicmock_defaults_to_none(self):
+        """MagicMock 段 (旧测试兼容) 的 tokens/timestamps 属性 → None, 不抛异常."""
+        from app.core.zipformer_engine import ZipformerEngine
+        from unittest.mock import MagicMock
+        r = MagicMock()
+        assert ZipformerEngine._build_char_times("abc", r.tokens, r.timestamps) is None

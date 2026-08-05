@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from .engine_base import BaseTranscriber, Segment, TranscribeResult
+from .text_splitter import PAUSE_THRESHOLD
 
 if TYPE_CHECKING:
     import sherpa_onnx  # noqa: F401  (for type hints only)
@@ -32,9 +33,20 @@ class ZipformerEngine(BaseTranscriber):
     requires_network = False
     is_local = True
 
-    def __init__(self, model_dir: str, num_threads: int = 4):
+    # CTC 峰值滞后补偿 (秒): CTC 在看到后续上下文后才发射 token,
+    # 时间戳整体滞后约 100-200ms. 与 sensevoice_engine.CTC_DELAY_SEC 对齐,
+    # 可在 config.yaml engines.zipformer.ctc_delay_sec 调整, 0 关闭.
+    CTC_DELAY_SEC = 0.15
+
+    def __init__(
+        self,
+        model_dir: str,
+        num_threads: int = 4,
+        ctc_delay_sec: float = CTC_DELAY_SEC,
+    ):
         self._model_dir = model_dir
         self._num_threads = num_threads
+        self._ctc_delay_sec = max(0.0, float(ctc_delay_sec))
         # sherpa_onnx.OfflineRecognizer 实例 (lazy 加载, 用 object 避开 TYPE_CHECKING 时的 import)
         self._recognizer: Optional["sherpa_onnx.OfflineRecognizer"] = None
 
@@ -50,7 +62,8 @@ class ZipformerEngine(BaseTranscriber):
         model_dir = config.get("model_dir") or "~/.shiyu/models/zipformer-ctc-zh"
         model_dir = str(Path(os.path.expanduser(model_dir)).resolve())
         num_threads = int(config.get("num_threads", 4))
-        return cls(model_dir=model_dir, num_threads=num_threads)
+        ctc_delay_sec = float(config.get("ctc_delay_sec", cls.CTC_DELAY_SEC))
+        return cls(model_dir=model_dir, num_threads=num_threads, ctc_delay_sec=ctc_delay_sec)
 
     def _ensure_loaded(self):
         """Lazily create sherpa-onnx OfflineRecognizer."""
@@ -114,7 +127,6 @@ class ZipformerEngine(BaseTranscriber):
         # 拼接时维护 covered_end, 丢弃与已覆盖区间重叠的重复识别段
         CHUNK_SIZE = 30 * 16000  # 480k samples = 30s
         OVERLAP_SECONDS = 2.0
-        DEDUP_TOLERANCE = 0.05  # 秒, 与已覆盖区间重叠超过该值即丢弃
         total_samples = len(audio)
 
         # 单段足够短 → 走原路径
@@ -126,6 +138,7 @@ class ZipformerEngine(BaseTranscriber):
             segments = self._result_to_segments(result)
             # v2.0 顺序: 先 ITN+清<unk>+细切, 再 VAD 校准子段
             segments = self._post_process(segments)
+            segments = self._dedup_overlap(segments)
             segments = self._align_with_vad(audio, sample_rate, segments)
             return TranscribeResult(
                 segments=segments,
@@ -148,21 +161,29 @@ class ZipformerEngine(BaseTranscriber):
             # 注意: chunk 实际从 start_idx 开始 (第二块起回退 2s 上下文),
             # 偏移必须以 start_idx 为基准; 若按 chunk_start 算会整体 +2s 错位
             time_offset = start_idx / sample_rate
+            # 块内容区 [lo, hi): lo 至少是块内容区起点 (chunk_start),
+            # 不能是 time_offset (重叠上下文起点)——否则重叠区残句会被
+            # i0 回退链纳入 (实测 chunk 3 输出 "我们的" 残句);
+            # hi 末尾 2s 重叠区交给下一块完整解码 (块 1 hi=28s),
+            # 最后一块保留到音频末尾; lo 同时受 covered_end 钳制
+            lo = max(chunk_start / sample_rate, covered_end)
+            if chunk_end >= total_samples:
+                hi = chunk_end / sample_rate
+            else:
+                hi = chunk_start / sample_rate + CHUNK_SIZE / sample_rate - OVERLAP_SECONDS
             chunk_segments = self._result_to_segments(result, time_offset=time_offset)
             for seg in chunk_segments:
-                if seg.start >= covered_end - DEDUP_TOLERANCE:
-                    all_segments.append(seg)
-                    covered_end = max(covered_end, seg.end)
-                elif seg.end > covered_end:
-                    # 跨边界段: 裁剪起点到 covered_end, 保留句尾内容, 避免丢字
-                    seg.start = covered_end
-                    all_segments.append(seg)
-                    covered_end = max(covered_end, seg.end)
+                trimmed = self._trim_segment(seg, lo, hi)
+                if trimmed is None:
+                    continue
+                all_segments.append(trimmed)
+                covered_end = max(covered_end, trimmed.end)
 
             # 立即释放 stream
             del stream
 
         all_segments = self._post_process(all_segments)
+        all_segments = self._dedup_overlap(all_segments)
         all_segments = self._align_with_vad(audio, sample_rate, all_segments)
         return TranscribeResult(
             segments=all_segments,
@@ -281,7 +302,7 @@ class ZipformerEngine(BaseTranscriber):
             text = re.sub(r"\s+", " ", text).strip()
             if not text:
                 continue
-            cleaned.append(Segment(start=s.start, end=s.end, text=text))
+            cleaned.append(Segment(start=s.start, end=s.end, text=text, char_times=s.char_times))
 
         if not cleaned:
             return []
@@ -290,7 +311,16 @@ class ZipformerEngine(BaseTranscriber):
         try:
             from .text_splitter import split_text_at_boundaries
             seg_dicts = [
-                {"start": s.start, "end": s.end, "text": s.text}
+                {
+                    "start": s.start,
+                    "end": s.end,
+                    "text": s.text,
+                    # 整段输出场景带逐字符真实时间戳, 细切时精确分配,
+                    # 避免长段比例插值累积滞后; 长度失配 (ITN 改动文本) 时回退比例
+                    "char_times": (
+                        s.char_times if s.char_times and len(s.char_times) == len(s.text) else None
+                    ),
+                }
                 for s in cleaned
             ]
             split_dicts = split_text_at_boundaries(seg_dicts)
@@ -310,6 +340,52 @@ class ZipformerEngine(BaseTranscriber):
             )
             return cleaned
 
+    @staticmethod
+    def _build_char_times(
+        text: str, tokens, timestamps
+    ) -> Optional[List[float]]:
+        """从 sherpa-onnx 逐 token 时间戳重建逐字符开始时间 (字节级精确映射).
+
+        sherpa-onnx 的 ``tokens`` 是 byte-level BPE 符号 (如 ``▁ƍĩĴ``),
+        通过 bbpe_map 复刻 C++ ``SymbolTable::DecodeByteBpe`` 逐字节解码:
+        字节流 → 每个字符的起始字节 → 所属 token → 时间戳. 这样每个字符
+        都拿到真实语音时间 (token 级精度, ~0.08s 帧步长), 消除长段
+        比例插值的累积误差 (实测 30s 段可差 1.4s+).
+
+        token 符号解码出的文本与 ``text`` 不一致 (含 <unk> 或编码异常)
+        时返回 None, 调用方回退比例分配.
+
+        Args:
+            text: 与 tokens 同源的解码文本 (已清 <unk>).
+            tokens: sherpa-onnx result.tokens (逐 token 符号).
+            timestamps: result.timestamps (逐 token 开始时间, 秒).
+        """
+        if not text or not tokens or not timestamps:
+            return None
+        if not isinstance(tokens, (list, tuple)) or not isinstance(
+            timestamps, (list, tuple)
+        ):
+            return None
+        if len(tokens) != len(timestamps):
+            return None
+        try:
+            from .bbpe_map import tokens_to_char_times
+        except ImportError:
+            return None
+        try:
+            result = tokens_to_char_times(list(tokens), list(timestamps))
+        except Exception:
+            return None
+        if result is None:
+            return None
+        char_times, decoded = result
+        # 解码文本必须与传入 text 一致 (忽略空格差异), 否则时间戳不可信
+        if decoded.replace(" ", "") != text.replace(" ", ""):
+            return None
+        if len(char_times) != len(text):
+            return None
+        return char_times
+
     def _result_to_segments(self, result, time_offset: float = 0.0) -> List[Segment]:
         """把 sherpa-onnx OfflineRecognitionResult 转成 List[Segment].
 
@@ -319,6 +395,10 @@ class ZipformerEngine(BaseTranscriber):
         时间戳来源:
           - VAD 切分时: segment_timestamps[i] + segment_durations[i]
           - 整段时: timestamps[0] ~ timestamps[-1] 覆盖整个解码区间
+
+        所有时间戳统一减去 CTC 峰值滞后补偿 (self._ctc_delay_sec):
+        CTC 发射 token 晚于实际发音, 字幕时间戳整体滞后; 补偿后与
+        sensevoice 的 -150ms 行为一致, VAD 校准再就近吸附修正.
         """
         # 情况 1: sherpa-onnx 已 VAD 切分 (短静音会自动分段)
         # 用 isinstance 兜底 MagicMock 测试和异常返回值
@@ -336,7 +416,7 @@ class ZipformerEngine(BaseTranscriber):
                 t = (t or "").strip()
                 if not t:
                     continue
-                start = float(seg_ts[i]) + time_offset
+                start = max(0.0, float(seg_ts[i]) + time_offset - self._ctc_delay_sec)
                 dur = float(seg_dur[i]) if isinstance(seg_dur, list) and i < len(seg_dur) else 0.0
                 segments.append(Segment(start=round(start, 3), end=round(start + dur, 3), text=t))
             if segments:
@@ -349,9 +429,132 @@ class ZipformerEngine(BaseTranscriber):
         timestamps = getattr(result, "timestamps", None) or []
         if not isinstance(timestamps, list) or not timestamps:
             return [Segment(start=time_offset, end=time_offset, text=text)]
-        start_sec = float(timestamps[0]) + time_offset
-        end_sec = float(timestamps[-1]) + time_offset
-        return [Segment(start=round(start_sec, 3), end=round(end_sec, 3), text=text)]
+        start_sec = max(0.0, float(timestamps[0]) + time_offset - self._ctc_delay_sec)
+        end_sec = max(0.0, float(timestamps[-1]) + time_offset - self._ctc_delay_sec)
+        # 先清 <unk> (与 _post_process 同款), 保证 char_times 与 text 长度一致
+        import re
+        cleaned_text = re.sub(r"<unk>\s*", "", text).strip()
+        char_times = None
+        if cleaned_text:
+            char_times = self._build_char_times(
+                cleaned_text,
+                getattr(result, "tokens", None),
+                timestamps,
+            )
+            if char_times:
+                # CTC 时间戳整体滞后, 逐字符时间与 start/end 同基准减补偿
+                char_times = [max(0.0, t - self._ctc_delay_sec) for t in char_times]
+                if time_offset:
+                    # 分块路径: timestamps 是块内相对时间, 逐字符时间也要加偏移,
+                    # 否则 _post_process 细切时把相对时间当绝对时间, 整段错位
+                    char_times = [t + time_offset for t in char_times]
+        return [Segment(
+            start=round(start_sec, 3),
+            end=round(end_sec, 3),
+            text=cleaned_text,
+            char_times=char_times,
+        )]
+
+    @classmethod
+    def _trim_segment(
+        cls, seg: Segment, lo: float, hi: float
+    ) -> Optional[Segment]:
+        """把段裁剪到块内容区 [lo, hi), 同步裁剪文本与逐字符时间戳.
+
+        分块转写时, 每块只贡献其内容区内的句子: 块末尾 2s 重叠区是给
+        下一块的解码上下文 (本块解码到重叠区字符不可靠, 实测块尾丢字),
+        块开头是上一块的重复上下文 (避免重复输出).
+
+        带 char_times 时, 裁剪点对齐停顿点: 起点回退到句首、终点扩展
+        到句尾 (跨 [lo, hi) 边界的句子保留整句), 保证字幕不出现半句;
+        不带 char_times (VAD 切分路径) 退化为直接钳制 start/end.
+
+        Args:
+            seg: _result_to_segments 的输出 (整段或 VAD 子段).
+            lo: 内容区起点 (秒), 通常 max(块覆盖起点, covered_end).
+            hi: 内容区末尾 (秒), 最后一块为音频末尾, 否则块尾 - 重叠区.
+
+        Returns:
+            裁剪后的 seg (原地修改), 区间内无内容时返回 None.
+        """
+        ct = seg.char_times
+        if not (isinstance(ct, (list, tuple)) and len(ct) == len(seg.text)):
+            # 无逐字符时间戳: 直接钳制, 不尝试停顿点对齐
+            seg.start = max(seg.start, lo)
+            seg.end = min(seg.end, hi)
+            if seg.end <= seg.start + 0.05:
+                return None
+            return seg
+
+        # 找区间 [lo, hi) 内的字符跨度
+        i0 = None
+        for i, t in enumerate(ct):
+            if t >= lo:
+                i0 = i
+                break
+        i1 = len(ct) - 1
+        for i in range(len(ct) - 1, -1, -1):
+            if ct[i] < hi:
+                i1 = i
+                break
+        if i0 is None or i1 < i0 or ct[i0] >= hi:
+            return None  # 内容区内没有字符 (整段在重叠区/已覆盖区)
+
+        # 对齐停顿点: 起点回退到句首, 终点扩展到句尾
+        while i0 > 0 and ct[i0] - ct[i0 - 1] <= PAUSE_THRESHOLD:
+            i0 -= 1
+        while i1 + 1 < len(ct) and ct[i1 + 1] - ct[i1] <= PAUSE_THRESHOLD:
+            i1 += 1
+
+        if i0 >= len(seg.text) or not seg.text[i0:i1 + 1].strip():
+            return None
+        seg.text = seg.text[i0:i1 + 1]
+        seg.char_times = ct[i0:i1 + 1]
+        # 起点钳制: 常规情况不早于 lo; 但 i0 回退到句首可能越过 lo
+        # (句首在块内容区起点之前, 属重叠区重复句), 此时保留句首真实
+        # 时间, 让 _dedup_overlap 按"时间重叠 + 文本子串"删除重复段
+        # (实测: 钳到 lo 会掩盖重叠, 导致 28.0 处重复字幕)
+        seg.start = max(seg.start, min(lo, float(seg.char_times[0])))
+        # end 至少覆盖到句尾: 跨 hi 的整句 (块末尾重叠区) 允许越过 hi,
+        # 下一块用 covered_end 钳制其起点 + _dedup_overlap 去重, 避免
+        # 时间钳制造成 "半句截断 + 邻接重复" (实测 28.0 处重复字幕)
+        seg.end = max(min(seg.end, hi), float(seg.char_times[-1]))
+        seg.end = max(seg.end, seg.start)
+        return seg
+
+    @staticmethod
+    def _dedup_overlap(segments: List[Segment]) -> List[Segment]:
+        """相邻段时间重叠 + 文本包含 → 去重 (块边界重叠解码产物).
+
+        分块解码时, 同一句可能被相邻两块都识别出来 (文本相同或一个
+        包含另一个, 时间戳重叠). 只处理相邻段, 防止误伤真正并列的
+        短重复句 (如口头重复 "好的好的"), 也避免长距离误删.
+
+        Args:
+            segments: _post_process 之后的段列表 (时间戳已精确分配).
+
+        Returns:
+            去重后的新列表, 输入不被修改.
+        """
+        if not segments:
+            return segments
+        result: List[Segment] = [segments[0]]
+        for s in segments[1:]:
+            prev = result[-1]
+            # +0.05 容忍: 块尾整句越界时前块 end 与后块裁剪后 start 完全邻接
+            # (0 间隔), 减号判断会漏掉这种"邻接重复"
+            if s.start < prev.end + 0.05 and prev.start < s.end - 0.05:
+                a, b = prev.text, s.text
+                if a and b:
+                    if b == a:
+                        continue  # 完全相同文本, 保留前段
+                    if b in a and len(b) < len(a):
+                        continue  # 后段是前段子串, 丢弃
+                    if a in b and len(a) < len(b):
+                        result[-1] = s  # 前段是后段子串, 用后段替换
+                        continue
+            result.append(s)
+        return result
 
     def is_available(self) -> Tuple[bool, str]:
         """检查 sherpa-onnx + 模型文件是否齐备."""
@@ -384,8 +587,13 @@ class ZipformerTranscriber(BaseTranscriber):
     requires_network = False
     is_local = True
 
-    def __init__(self, model_dir: str, num_threads: int = 4):
-        self._engine = ZipformerEngine(model_dir, num_threads)
+    def __init__(
+        self,
+        model_dir: str,
+        num_threads: int = 4,
+        ctc_delay_sec: float = ZipformerEngine.CTC_DELAY_SEC,
+    ):
+        self._engine = ZipformerEngine(model_dir, num_threads, ctc_delay_sec)
 
     @classmethod
     def from_config(cls, config: dict) -> "ZipformerTranscriber":
@@ -407,7 +615,15 @@ def init_kwargs_from_config(cls, config: dict) -> dict:
     model_dir = config.get("model_dir") or "~/.shiyu/models/zipformer-ctc-zh"
     model_dir = str(Path(os.path.expanduser(model_dir)).resolve())
     num_threads = config.get("num_threads", 4)
-    return {"model_dir": model_dir, "num_threads": num_threads}
+    # ctc_delay_sec 必须透传: 生产注册路径 (ZipformerTranscriber.from_config)
+    # 走这里, 缺失时 config.yaml engines.zipformer.ctc_delay_sec 不生效
+    # (reviewer P1-2: 用户调 0 关闭补偿的预期会落空)
+    ctc_delay_sec = config.get("ctc_delay_sec", cls.CTC_DELAY_SEC)
+    return {
+        "model_dir": model_dir,
+        "num_threads": num_threads,
+        "ctc_delay_sec": ctc_delay_sec,
+    }
 
 
 ZipformerEngine.init_kwargs_from_config = init_kwargs_from_config

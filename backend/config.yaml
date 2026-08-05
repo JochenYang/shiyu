@@ -52,6 +52,9 @@ engines:
     enabled: true   # 主走 — CTC int8 字符级对齐
     model_dir: "~/.shiyu/models/zipformer-ctc-zh"
     num_threads: 4
+    # CTC 峰值滞后补偿 (秒): CTC 发射 token 晚于实际发音约 100-200ms,
+    # 字幕时间戳整体滞后. 0 = 关闭; 若发现字幕提前可调小 (如 0.10).
+    ctc_delay_sec: 0.15
   sensevoice:
     enabled: true   # 多语言备选
     model_dir: "~/.shiyu/models/sensevoice-small"
