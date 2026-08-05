@@ -582,7 +582,7 @@ const backendOnline = ref(false);
 
 // Engine selector state
 const engines = ref([]);
-const selectedEngine = ref("sensevoice_local");
+const selectedEngine = ref("zipformer_local");
 
 // 字幕时间偏移 (主人手动微调, 不依赖后端重启, 范围 -5s ~ +5s, 精度 0.1s)
 const subtitleOffset = ref(0.0);
@@ -944,7 +944,7 @@ async function startTranscribe() {
       }
     }
     const glossaryStr = JSON.stringify(glossaryDict);
-    const currentEngine = selectedEngine.value || (appSettings.value.engineEnabled ? "cloud" : "local");
+    const currentEngine = selectedEngine.value || (appSettings.value.engineEnabled ? "cloud" : "zipformer_local");
     let llmApplied = false;
 
     if (localFilePath.value) {
