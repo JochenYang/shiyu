@@ -208,8 +208,24 @@ class DoubaoCloudEngine(BaseTranscriber):
             offset = start_sample / RATE
             duration = len(chunk) / RATE
             value = self._transcribe_chunk(chunk, duration)
+            # 诊断: 记录豆包原始返回的时间范围。真实素材出现时间戳越界时,
+            # 光看异常消息无法判断是基准差异还是单个词异常。
+            try:
+                _utts = (value or {}).get("result", {}).get("utterances") or []
+                _ends = [w.get("end_time", 0) for u in _utts
+                         for w in (u.get("words") or [])]
+                _starts = [w.get("start_time", 0) for u in _utts
+                           for w in (u.get("words") or [])]
+                logger.info(
+                    "[Doubao] 块 offset=%.2fs 时长=%.2fs: %d 句 %d 词, "
+                    "start 范围 [%s, %s]ms, end 范围 [%s, %s]ms",
+                    offset, duration, len(_utts), len(_ends),
+                    min(_starts) if _starts else "-", max(_starts) if _starts else "-",
+                    min(_ends) if _ends else "-", max(_ends) if _ends else "-",
+                )
+            except Exception:
+                pass
             segments.extend(self._parse_result(value, duration, offset))
-
         # 豆包已给出真实词尾时间, 不需要 sherpa 的 _finish (那是 CTC 后处理);
         # 段已按块顺序生成, 时间天然递增。
         return TranscribeResult(segments=segments, language=language)
@@ -273,43 +289,76 @@ class DoubaoCloudEngine(BaseTranscriber):
             if not words:
                 raise DoubaoCloudError("豆包未返回逐词时间戳，无法生成准确的字幕时间。")
 
-            word_rows: List[Tuple[str, float, float]] = []
-            previous = -1.0
+            # 收集词。豆包对空格/标点这类不发声的词返回 start=-1 end=-1,
+            # 这是"无时间"的合法信号而不是异常 —— 直接报错会让英文素材
+            # 整体失败 (英文词间都是空格)。这里先记 None, 后面回填。
+            word_rows: List[Tuple[str, Optional[float], Optional[float]]] = []
+            previous: Optional[float] = None
             for word in words:
                 w_text = (word or {}).get("text")
                 w_start, w_end = (word or {}).get("start_time"), (word or {}).get("end_time")
                 if not isinstance(w_text, str):
                     raise DoubaoCloudError("豆包词语数据不完整。")
+                if w_start == -1 or w_end == -1:
+                    word_rows.append((w_text, None, None))
+                    continue
                 if (
                     not isinstance(w_start, (int, float))
                     or not isinstance(w_end, (int, float))
                     or not (math.isfinite(w_start) and math.isfinite(w_end))
                     or not 0 <= w_start <= w_end <= duration * 1000 + 50
-                    or w_start < previous
+                    or (previous is not None and w_start < previous)
                 ):
-                    raise DoubaoCloudError("豆包返回的时间戳异常，已停止生成字幕。")
+                    # 报出具体数值, 否则无法定位是哪一条越界
+                    raise DoubaoCloudError(
+                        f"豆包返回的时间戳异常（词={w_text!r} "
+                        f"start={w_start} end={w_end}ms，"
+                        f"本块时长={duration:.2f}s 上限={duration * 1000 + 50:.0f}ms，"
+                        f"上一词 start={previous}ms）"
+                    )
                 previous = w_start
-                word_rows.append(
-                    (w_text.strip(), offset + min(w_start / 1000, duration),
-                     offset + min(w_end / 1000, duration))
-                )
+                word_rows.append((w_text, w_start, w_end))
 
-            # 逐词时间 → Segment + char_times (字符继承所属词 start,
-            # 与 forced_aligner.char_times_for 同一契约); 行末取末词 end,
-            # 豆包给了真实词尾 —— 比本地 CTC 只有起点更好。
-            full_text = "".join(w[0] for w in word_rows)
-            if not full_text.strip():
+            if not word_rows:
                 continue
-            char_times: List[float] = []
-            last_end = offset + duration
+            # 无时间的词继承前一个有时间词; 开头的则用第一个有时间词
+            first_start = next((s for _, s, _ in word_rows if s is not None), None)
+            if first_start is None:
+                continue  # 整句都没有时间, 无法定位
+
+            prev_time = first_start
+            last_end_ms = first_start
+            chars: List[str] = []
+            times: List[float] = []
             for w_text, w_start, w_end in word_rows:
-                for _ch in w_text:
-                    char_times.append(w_start)
-                last_end = w_end
+                if w_start is None:
+                    t = prev_time
+                else:
+                    t = w_start
+                    prev_time = w_start
+                    last_end_ms = w_end
+                for ch in w_text:
+                    chars.append(ch)
+                    times.append(t)
+
+            # 去掉首尾空白, 时间同步裁剪 (英文素材首尾常带空格);
+            # 保留中间的空白字符 —— 否则英文词会粘连成一片。
+            lo_i, hi_i = 0, len(chars)
+            while lo_i < hi_i and chars[lo_i].isspace():
+                lo_i += 1
+            while hi_i > lo_i and chars[hi_i - 1].isspace():
+                hi_i -= 1
+            if lo_i >= hi_i:
+                continue
+
+            full_text = "".join(chars[lo_i:hi_i])
+            char_times = [
+                round(offset + min(t / 1000, duration), 3) for t in times[lo_i:hi_i]
+            ]
             segments.append(
                 Segment(
-                    start=round(char_times[0], 3),
-                    end=round(last_end, 3),
+                    start=char_times[0],
+                    end=round(offset + min(last_end_ms / 1000, duration), 3),
                     text=full_text,
                     char_times=char_times,
                 )
