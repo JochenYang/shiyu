@@ -524,12 +524,15 @@
                 <!-- 有预置清单时给候选, 但仍可手填任意模型名
                      (新模型上线、微调版、provider 新增型号) -->
                 <n-input v-model:value="editingEngine.model"
-                  :placeholder="editingModels[0] || 'whisper-1'" />
+                  :placeholder="editingModels[0]?.value || 'whisper-1'" />
                 <div v-if="editingModels.length" class="setting-row model-presets">
-                  <button v-for="m in editingModels" :key="m"
+                  <button v-for="m in editingModels" :key="m.value"
                     class="secondary-btn small-btn"
-                    :class="{ 'preset-active': editingEngine.model === m }"
-                    @click="editingEngine.model = m">{{ m }}</button>
+                    :class="{ 'preset-active': editingEngine.model === m.value }"
+                    :title="m.note || m.value"
+                    @click="editingEngine.model = m.value">
+                    {{ m.label }}
+                  </button>
                 </div>
               </div>
               <div class="setting-item col">
@@ -920,11 +923,17 @@ const editingEngine = computed(() => {
                     request_mode: "whisper", display_name: "" };
 });
 
-// 当前编辑配置对应 provider 的预置模型清单 (空 = 自定义, 手填)
+// 当前编辑配置对应 provider 的预置模型候选。
+// provider 清单里 models 有两种形态: 纯字符串 (模型名即值) 与对象
+// (剪映式 {id, name, resource_id}), 统一下成 {value, label}。
 const editingModels = computed(() => {
   const pid = editingEngine.value.provider || "custom";
   const p = providers.value.find(x => x.id === pid);
-  return p ? p.models || [] : [];
+  return (p?.models || []).map(m =>
+    typeof m === "string"
+      ? { value: m, label: m, note: "" }
+      : { value: m.id, label: m.name || m.id, note: m.note || "" }
+  );
 });
 
 // 切换 provider: 预填 base_url / 请求模式 / 默认模型 / 认证头,
@@ -937,8 +946,16 @@ function onProviderChange(pid) {
   cur.provider = p.id;
   cur.api_url = p.api_url || "";
   cur.request_mode = p.request_mode || "whisper";
-  if (p.models && p.models.length) {
-    cur.model = p.models[0];
+  // 默认模型: provider 声明的 default_model_id 优先, 否则第一个
+  const models = p.models || [];
+  if (models.length) {
+    const preferred = models.find(
+      (m) => typeof m === "object" && m.id === p.default_model_id
+    );
+    const first = preferred || models[0];
+    cur.model = typeof first === "string" ? first : first.id;
+  } else {
+    cur.model = "";
   }
   cur.auth_header = p.auth_header ? JSON.parse(JSON.stringify(p.auth_header)) : null;
   if (!cur.api_key && p.id !== "custom") {

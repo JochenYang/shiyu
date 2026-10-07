@@ -83,12 +83,24 @@ BUILTIN_PROVIDERS = [
     },
     {
         "id": "doubao",
-        "name": "豆包录音文件识别 2.0 (火山引擎)",
+        "name": "豆包录音文件识别（火山引擎）",
         "api_url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel",
+        # 豆包不用 model 字段区分版本: 模型版本由请求头 X-Api-Resource-Id
+        # 表达 (官方文档: 1.0=volc.bigasr.auc, 2.0=volc.seedasr.auc);
+        # 请求体的 model_name 固定为协议常量 bigmodel。
+        # 这里把两个版本列为可选"模型", 后端把它映射成 resource_id。
         "request_mode": "doubao",
-        "models": ["bigmodel"],
+        "models": [
+            {"id": "doubao-asr-2.0", "name": "录音文件识别 2.0",
+             "resource_id": "volc.seedasr.auc",
+             "note": "准确率更高, 推荐"},
+            {"id": "doubao-asr-1.0", "name": "录音文件识别 1.0",
+             "resource_id": "volc.bigasr.auc",
+             "note": "兼容旧开通服务"},
+        ],
+        "default_model_id": "doubao-asr-2.0",
         "auth_header": None,
-        "note": "逐词毫秒时间戳, 精度最高; 60s 块提交即计费, 只需语音服务 KEY",
+        "note": "逐词毫秒时间戳; 60s 块提交即计费, 只需语音服务 KEY",
     },
     {
         "id": "custom",

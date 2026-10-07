@@ -29,13 +29,20 @@ logger = logging.getLogger(__name__)
 HOST = "openspeech.bytedance.com"
 SUBMIT_PATH = "/api/v3/auc/bigmodel/submit"
 QUERY_PATH = "/api/v3/auc/bigmodel/query"
-RESOURCE_ID = "volc.seedasr.auc"
+# 豆包用请求头 X-Api-Resource-Id 选模型版本 (官方文档):
+#   1.0 = volc.bigasr.auc, 2.0 = volc.seedasr.auc
+# 请求体的 model_name 固定为协议常量 bigmodel, 不随版本变。
+DEFAULT_RESOURCE_ID = "volc.seedasr.auc"
+RESOURCE_IDS = {
+    "doubao-asr-2.0": "volc.seedasr.auc",
+    "doubao-asr-1.0": "volc.bigasr.auc",
+}
+MODEL_NAME = "bigmodel"  # 协议常量
 RATE = 16000
 # 60s 单声道 16bit wav ≈ 1.9MB, base64 后 ≈ 2.6MB —— 官方单请求上限内
 CHUNK_SECONDS = 60
 QUERY_INTERVAL = 3.0
 QUERY_TIMEOUT = 1800.0
-
 # X-Api-Status-Code: 20000000 成功; 20000001 排队; 20000002 处理中;
 # 20000003 空音频; 45xxxxxx 鉴权/参数错; 55xxxxxx 服务/限流
 _STATUS_OK = "20000000"
@@ -86,31 +93,44 @@ class DoubaoCloudEngine(BaseTranscriber):
     """豆包录音文件识别 2.0 (云端, 按量计费)。"""
 
     name = "doubao_cloud"
-    display_name = "豆包录音文件识别 2.0"
+    display_name = "豆包录音文件识别"
     requires_network = True
     is_local = False
 
-    def __init__(self, api_key: str = "", **kwargs) -> None:
+    def __init__(self, api_key: str = "", resource_id: str = "", **kwargs) -> None:
         self._api_key = (api_key or "").strip()
+        # resource_id 表达模型版本 (1.0/2.0); 未指定时用 2.0
+        self._resource_id = resource_id or DEFAULT_RESOURCE_ID
 
     # ── 配置 ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _api_key_from_config() -> str:
-        """从云端引擎激活配置里读 doubao provider 的 KEY。"""
+    def _config_from_provider() -> Dict[str, Any]:
+        """从云端配置里读豆包需要的字段 (KEY + 模型版本)。
+
+        模型版本存在 provider 的 models 清单里 (id → resource_id),
+        用户选的 model 字段就是那个 id。
+        """
         from .cloud_engine import load_engine_config
 
         cfg = load_engine_config()
-        if cfg.get("provider") == "doubao" or "doubao" in (cfg.get("model") or ""):
-            return (cfg.get("api_key") or "").strip()
-        return ""
+        if cfg.get("provider") != "doubao" and "doubao" not in (cfg.get("model") or ""):
+            return {}
+        model_id = cfg.get("model") or "doubao-asr-2.0"
+        return {
+            "api_key": (cfg.get("api_key") or "").strip(),
+            "resource_id": RESOURCE_IDS.get(model_id, DEFAULT_RESOURCE_ID),
+        }
 
     def is_available(self) -> Tuple[bool, str]:
-        key = self._api_key or self._api_key_from_config()
+        cfg = self._config_from_provider()
+        key = self._api_key or cfg.get("api_key", "")
+        if not self._resource_id:
+            self._resource_id = cfg.get("resource_id", DEFAULT_RESOURCE_ID)
         if not key:
             return False, (
                 "豆包云端识别未配置 API Key：请在「设置 → 云端」选择"
-                "「豆包录音文件识别 2.0」并填入语音服务 API Key"
+                "「豆包录音文件识别」并填入语音服务 API Key"
             )
         return True, ""
 
@@ -122,7 +142,7 @@ class DoubaoCloudEngine(BaseTranscriber):
         headers = {
             "Content-Type": "application/json",
             "X-Api-Key": self._api_key,
-            "X-Api-Resource-Id": RESOURCE_ID,
+            "X-Api-Resource-Id": self._resource_id,
             "X-Api-Request-Id": request_id,
         }
         if endpoint == SUBMIT_PATH:
@@ -161,7 +181,7 @@ class DoubaoCloudEngine(BaseTranscriber):
         ok, reason = self.is_available()
         if not ok:
             raise DoubaoCloudError(reason)
-        self._api_key = self._api_key or self._api_key_from_config()
+        # is_available() 已把 KEY 与版本补齐, 这里不再重复读配置
 
         from .audio_processor import extract_audio_for_transcribe
         import soundfile as sf
@@ -200,7 +220,7 @@ class DoubaoCloudEngine(BaseTranscriber):
                 "channel": 1,
             },
             "request": {
-                "model_name": "bigmodel",
+                "model_name": MODEL_NAME,  # 协议常量, 版本由 resource_id 头决定
                 "show_utterances": True,   # 逐词时间戳必需
                 "enable_itn": True,        # 数字归一, 与本地 ITN 一致
                 "enable_punc": True,

@@ -96,10 +96,26 @@ def _register_default_engines():
             display = item.get("display_name") or item.get("model") or "云模型"
             # 豆包走专用引擎 (两段式 HTTP + 逐词时间戳), 其余走 OpenAI 兼容适配器
             if item.get("provider") == "doubao" or item.get("request_mode") == "doubao":
-                from app.core.doubao_cloud import DoubaoCloudEngine
+                from app.core.cloud_engine import BUILTIN_PROVIDERS
+                from app.core.doubao_cloud import DEFAULT_RESOURCE_ID, RESOURCE_IDS, DoubaoCloudEngine
 
+                # 模型版本: 配置里的 model 是 provider 清单里的 id
+                # (doubao-asr-2.0 / doubao-asr-1.0), 映射成 resource_id 请求头
+                model_id = item.get("model") or "doubao-asr-2.0"
+                resource_id = RESOURCE_IDS.get(model_id, DEFAULT_RESOURCE_ID)
                 cls = DoubaoCloudEngine
-                kwargs = {"api_key": item.get("api_key", "")}
+                kwargs = {
+                    "api_key": item.get("api_key", ""),
+                    "resource_id": resource_id,
+                }
+                # 下拉里显示具体版本, 而不是笼统的「豆包」
+                for p in BUILTIN_PROVIDERS:
+                    if p.get("id") == "doubao":
+                        for m in p.get("models", []):
+                            if isinstance(m, dict) and m.get("id") == model_id:
+                                display = m.get("name", display)
+                                break
+                        break
             else:
                 cls = CloudTranscriber
                 kwargs = {"engine_id": eid}
