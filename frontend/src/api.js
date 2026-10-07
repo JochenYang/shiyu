@@ -242,6 +242,27 @@ export async function getProviders() {
 }
 
 /**
+ * 把字幕行渲染成指定格式 (srt/ass/lrc/fcpxml/jianying/edl)。
+ *
+ * 剪辑工程格式 (fcpxml/jianying/edl) 的帧与微秒换算在服务端做,
+ * 前端只负责保存。
+ *
+ * @param {Array} segments - [{start, end, text}, ...]
+ * @param {string} format
+ * @returns {Promise<string>} 渲染后的文本内容
+ */
+export async function renderSubtitle(segments, format) {
+  const res = await fetch(`${API_BASE}/subtitle/render`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ segments, format }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.content || "";
+}
+
+/**
  * Apply LLM correction to transcription segments.
  * @param {string} engineMode - "local" or "cloud"
  * @returns {Promise<{segments: Array, llm_corrected: boolean}>}

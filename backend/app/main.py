@@ -94,11 +94,20 @@ def _register_default_engines():
                 continue
             engine_name = "cloud" if eid == active_id else f"cloud:{eid}"
             display = item.get("display_name") or item.get("model") or "云模型"
+            # 豆包走专用引擎 (两段式 HTTP + 逐词时间戳), 其余走 OpenAI 兼容适配器
+            if item.get("provider") == "doubao" or item.get("request_mode") == "doubao":
+                from app.core.doubao_cloud import DoubaoCloudEngine
+
+                cls = DoubaoCloudEngine
+                kwargs = {"api_key": item.get("api_key", "")}
+            else:
+                cls = CloudTranscriber
+                kwargs = {"engine_id": eid}
             try:
-                instance = CloudTranscriber(engine_id=eid)
+                instance = cls(**kwargs)
                 _transcriber_registry[engine_name] = {
-                    "cls": CloudTranscriber,
-                    "kwargs": {"engine_id": eid},
+                    "cls": cls,
+                    "kwargs": kwargs,
                     "instance": instance,
                 }
                 # 实例级 display_name: 下拉里同时显示多个云配置时能区分
@@ -442,7 +451,7 @@ async def transcribe_file(
         Plain text subtitle content
     """
     fmt = output_format.lower()
-    if fmt not in ("srt", "lrc", "ass"):
+    if fmt not in ("srt", "lrc", "ass", "fcpxml", "jianying", "edl"):
         raise HTTPException(400, f"Unsupported format: {output_format}")
 
     suffix = Path(file.filename).suffix or ".tmp"
@@ -597,7 +606,7 @@ async def transcribe_local(
         raise HTTPException(400, f"File not found: {path}")
 
     fmt = output_format.lower()
-    if fmt not in ("srt", "lrc", "ass"):
+    if fmt not in ("srt", "lrc", "ass", "fcpxml", "jianying", "edl"):
         raise HTTPException(400, f"Unsupported format: {output_format}")
 
     try:
@@ -727,7 +736,6 @@ def _masked_engine(item: Dict[str, Any]) -> Dict[str, Any]:
     out["has_key"] = bool(item.get("api_key"))
     return out
 
-
 @app.get("/settings/providers")
 async def list_providers():
     """内置云端 provider 清单 (前端据此预填 base_url/模型/认证头)。"""
@@ -735,6 +743,73 @@ async def list_providers():
 
     return {"providers": BUILTIN_PROVIDERS}
 
+
+@app.post("/subtitle/render")
+async def render_subtitle(body: dict):
+    """把字幕行渲染成指定格式, 不跑 ASR。
+
+    供前端「导出」使用: 已有的字幕行 (可能经用户校对) 直接转成
+    SRT/ASS/LRC 或剪辑工程文件 (FCPXML/剪映/EDL)。
+
+    Body::
+        {"segments": [{start, end, text}, ...], "format": "fcpxml"}
+    """
+    from app.core.subtitle_formatter import (
+        SubtitleSegment,
+        generate_ass,
+        generate_lrc,
+        generate_srt,
+    )
+
+    segments_in = body.get("segments")
+    fmt = str(body.get("format", "srt")).lower()
+    if not isinstance(segments_in, list) or not segments_in:
+        raise HTTPException(422, "segments 必须是非空列表")
+    if fmt not in ("srt", "lrc", "ass", "fcpxml", "jianying", "edl"):
+        raise HTTPException(400, f"Unsupported format: {fmt}")
+
+    rows: List[Dict[str, Any]] = []
+    for seg in segments_in:
+        if not isinstance(seg, dict):
+            continue
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        try:
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        rows.append({"start": start, "end": end, "text": text})
+    if not rows:
+        raise HTTPException(422, "没有可渲染的字幕内容")
+
+    try:
+        if fmt in ("fcpxml", "jianying", "edl"):
+            from app.core.editor_export import (
+                generate_edl,
+                generate_fcpxml,
+                generate_jianying_draft,
+            )
+
+            if fmt == "fcpxml":
+                content = generate_fcpxml(rows)
+            elif fmt == "jianying":
+                content = generate_jianying_draft(rows)
+            else:
+                content = generate_edl(rows)
+        else:
+            typed = [SubtitleSegment(start=r["start"], end=r["end"], text=r["text"])
+                     for r in rows]
+            if fmt == "srt":
+                content = generate_srt(typed)
+            elif fmt == "lrc":
+                content = generate_lrc(typed)
+            else:
+                content = generate_ass(typed)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"format": fmt, "content": content}
 
 @app.get("/settings/engines")
 async def list_engine_settings():

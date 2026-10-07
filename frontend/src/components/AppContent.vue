@@ -252,10 +252,12 @@
                 class="format-select"
                 :disabled="parsedSegments.length === 0"
               >
-                <option value="srt">SRT</option>
-                <option value="lrc">LRC</option>
-                <option value="ass">ASS</option>
-                <option value="txt">TXT</option>
+                <option value="srt">SRT 字幕</option>
+                <option value="ass">ASS 样式字幕</option>
+                <option value="lrc">LRC 歌词</option>
+                <option value="fcpxml">FCPXML（Final Cut Pro）</option>
+                <option value="jianying">剪映草稿（draft_content.json）</option>
+                <option value="edl">EDL（Premiere / DaVinci）</option>
               </select>
               <button
                 class="secondary-btn"
@@ -672,6 +674,7 @@ import {
   getLlmCorrectionSettings,
   saveLlmCorrectionSettings,
   correctTranscription,
+  renderSubtitle,
 } from "../api.js";
 
 const message = useMessage();
@@ -1488,30 +1491,54 @@ function saveCurrentSegment() {
   }
 }
 
+// 导出格式元信息: 扩展名 / 文件类型标签 / 适用软件
+const EXPORT_FORMATS = {
+  srt:      { ext: "srt",     label: "Subtitle",  hint: "通用字幕" },
+  ass:      { ext: "ass",     label: "Subtitle",  hint: "带样式字幕" },
+  lrc:      { ext: "lrc",     label: "Lyrics",    hint: "歌词时间轴" },
+  fcpxml:   { ext: "fcpxml",  label: "FCPXML",    hint: "Final Cut Pro 逐句 Title" },
+  jianying: { ext: "json",    label: "JSON",      hint: "剪映草稿 (draft_content.json)" },
+  edl:      { ext: "edl",     label: "EDL",       hint: "Premiere / DaVinci 通用" },
+};
+
 async function downloadResult() {
   if (parsedSegments.value.length === 0) return;
-  // Format segments to SRT
-  let srtContent = "";
-  parsedSegments.value.forEach((seg, i) => {
-    srtContent += `${i + 1}\n`;
-    srtContent += `${fmtTimeSrt(seg.start)} --> ${fmtTimeSrt(seg.end)}\n`;
-    srtContent += `${seg.text}\n\n`;
-  });
-
+  const meta = EXPORT_FORMATS[format.value] || EXPORT_FORMATS.srt;
   const defaultName =
     selectedFile.value?.name.replace(/\.[^.]+$/, "") || "subtitle";
+
+  // 非 SRT 的格式 (特别是剪辑工程文件) 交给后端生成:
+  // 时间单位换算 (剪辑用帧/微秒) 与工程结构都在那边。
+  let content = "";
+  try {
+    if (format.value === "srt") {
+      parsedSegments.value.forEach((seg, i) => {
+        content += `${i + 1}\n`;
+        content += `${fmtTimeSrt(seg.start)} --> ${fmtTimeSrt(seg.end)}\n`;
+        content += `${seg.text}\n\n`;
+      });
+    } else {
+      content = await renderSubtitle(parsedSegments.value, format.value);
+    }
+  } catch (err) {
+    message.error(`生成 ${format.value.toUpperCase()} 失败: ` + (err.message || err));
+    return;
+  }
+  if (!content) {
+    message.error("没有可导出的字幕内容");
+    return;
+  }
 
   try {
     const filePath = await save({
       defaultPath: appSettings.value.defaultSavePath
-        ? `${appSettings.value.defaultSavePath}\\${defaultName}.srt`
-        : `${defaultName}.srt`,
-      filters: [{ name: "Subtitle", extensions: ["srt"] }],
+        ? `${appSettings.value.defaultSavePath}\\${defaultName}.${meta.ext}`
+        : `${defaultName}.${meta.ext}`,
+      filters: [{ name: meta.label, extensions: [meta.ext] }],
     });
-
     if (filePath) {
-      await writeTextFile(filePath, srtContent);
-      message.success("导出成功！");
+      await writeTextFile(filePath, content);
+      message.success(`导出成功 (${meta.hint})`);
     }
   } catch (err) {
     // Fallback to browser download if not running in Tauri
@@ -1519,7 +1546,7 @@ async function downloadResult() {
       err.toString().includes("__TAURI_IPC__") ||
       err.toString().includes("window.__TAURI__")
     ) {
-      downloadText(srtContent, `${defaultName}.srt`);
+      downloadText(content, `${defaultName}.${meta.ext}`);
     } else {
       message.error("导出失败: " + err.toString());
     }

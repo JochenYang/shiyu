@@ -476,13 +476,29 @@ class SubtitlePipeline:
         )
         srt_segments = segments_from_transcription(self.ctx.final_segments or [])
         fmt = (self.ctx.output_format or "srt").lower()
-
         if fmt == "srt":
             self.ctx.output_content = generate_srt(srt_segments)
         elif fmt == "lrc":
             self.ctx.output_content = generate_lrc(srt_segments)
         elif fmt == "ass":
             self.ctx.output_content = generate_ass(srt_segments, title=self.ctx.title)
+        elif fmt in ("fcpxml", "jianying", "edl"):
+            # 剪辑软件工程导出: 每句独立轨道片段, 用户可逐句做包装与效果
+            from app.core.editor_export import (
+                generate_edl,
+                generate_fcpxml,
+                generate_jianying_draft,
+            )
+
+            plain = [self._seg_to_dict(s) for s in srt_segments]
+            if fmt == "fcpxml":
+                self.ctx.output_content = generate_fcpxml(plain)
+            elif fmt == "jianying":
+                self.ctx.output_content = generate_jianying_draft(
+                    plain, duration_sec=self.ctx.duration
+                )
+            else:
+                self.ctx.output_content = generate_edl(plain)
         else:
             raise ValueError(f"Unsupported output format: {fmt}")
 

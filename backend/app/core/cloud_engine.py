@@ -82,6 +82,15 @@ BUILTIN_PROVIDERS = [
         "note": "认证头特殊 (api-key), 已自动配置",
     },
     {
+        "id": "doubao",
+        "name": "豆包录音文件识别 2.0 (火山引擎)",
+        "api_url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel",
+        "request_mode": "doubao",
+        "models": ["bigmodel"],
+        "auth_header": None,
+        "note": "逐词毫秒时间戳, 精度最高; 60s 块提交即计费, 只需语音服务 KEY",
+    },
+    {
         "id": "custom",
         "name": "自定义",
         "api_url": "",

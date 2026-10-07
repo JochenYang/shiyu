@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 # 长音频分块: 30s 一块, 相邻块 2s 重叠上下文, 避免句子在块边界被截断
 CHUNK_SECONDS = 30
 OVERLAP_SECONDS = 2.0
+# 切点搜索: 在块尾这段时间内找能量最低点作为切点, 避免在人声中间截断
+BOUNDARY_SEARCH_SECONDS = 5.0
+BOUNDARY_PROBE_SECONDS = 0.1
 
 # CTC 峰值滞后补偿 (秒): CTC 在看到后续上下文后才发射 token, 时间戳整体滞后
 # 约 100-200ms。可在 config.yaml engines.<name>.ctc_delay_sec 调整, 0 关闭。
@@ -38,6 +41,39 @@ CTC_DELAY_SEC = 0.15
 
 # SenseVoice 的语言取值 (sherpa-onnx --sense-voice-language)
 _SENSE_VOICE_LANGUAGES = {"auto", "zh", "en", "ko", "ja", "yue"}
+
+def _chunk_bounds(audio: np.ndarray, sample_rate: int) -> List[Tuple[int, int]]:
+    """把长音频切成无缝相接的块, 切点落在块尾的低能量处。
+
+    返回 [(start, stop), ...] 的**采样点**区间, 相邻区间首尾相接
+    (前一块的 stop 就是后一块的 start), 因此内容不会丢失。
+
+    切点搜索参照 SubPop 的实测做法: 在块尾 5s 内以 100ms 为窗找能量最低
+    处收尾, 避免在人声中间拦腰截断; 找不到合适位置就按固定长度切。
+    """
+    chunk = CHUNK_SECONDS * sample_rate
+    search = int(BOUNDARY_SEARCH_SECONDS * sample_rate)
+    probe = max(1, int(BOUNDARY_PROBE_SECONDS * sample_rate))
+    bounds: List[Tuple[int, int]] = []
+    cursor = 0
+    total = len(audio)
+    while cursor < total:
+        stop = min(cursor + chunk, total)
+        if stop < total:
+            # 至少保留 1s 内容, 且不越过块尾
+            lo = max(cursor + sample_rate, stop - search)
+            hi = stop
+            if hi - lo >= probe:
+                # 按 probe 窗口算能量, 取最低处作为切点
+                starts = range(lo, hi - probe + 1, probe)
+                energies = [float(np.mean(np.square(audio[i:i + probe]))) for i in starts]
+                best = next(iter(starts)) + int(np.argmin(energies)) * probe
+                stop = min(stop, best + probe // 2)
+        if stop <= cursor:
+            stop = min(cursor + chunk, total)
+        bounds.append((cursor, stop))
+        cursor = stop
+    return bounds
 
 
 def _clean_tokens(tokens: List[str]) -> List[str]:
@@ -306,20 +342,18 @@ class SherpaOfflineEngine(BaseTranscriber):
 
         all_segments: List[Segment] = []
         covered_end = 0.0
-        for chunk_start in range(0, len(audio), chunk_size):
+        for chunk_start, chunk_stop in _chunk_bounds(audio, sample_rate):
             # 第二块起向左回退重叠区, 让块边界的句子有完整解码上下文
             start_idx = max(0, chunk_start - int(OVERLAP_SECONDS * sample_rate))
-            chunk_end = min(chunk_start + chunk_size, len(audio))
+            chunk_end = chunk_stop
             chunk = audio[start_idx:chunk_end]
             time_offset = start_idx / sample_rate
 
-            # 内容区 [lo, hi): 重叠区交给相邻块, 避免重复与残句
+            # 内容区 [lo, hi) 必须与相邻块**接续无缝**: 重叠区只是解码上下文,
+            # 不能从内容区里扣 (否则重叠那段两边都不认, 内容丢失: 实测 30s
+            # 块边界丢 2.1s)。
             lo = max(chunk_start / sample_rate, covered_end)
-            hi = (
-                chunk_end / sample_rate
-                if chunk_end >= len(audio)
-                else chunk_start / sample_rate + CHUNK_SECONDS - OVERLAP_SECONDS
-            )
+            hi = chunk_stop / sample_rate
             for seg in self._decode(chunk, sample_rate, time_offset, language):
                 # 无逐字符时间的段 (Qwen3-ASR 等) start=end=块起点, 裁剪只会
                 # 把它们全部丢掉。先尝试用本地强制对齐器补时间, 补上后再裁剪;
