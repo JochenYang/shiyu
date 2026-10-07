@@ -21,6 +21,8 @@ def main():
         "--name=shiyu-backend",
         "--onefile",                     # Single executable output
         "--add-data=config.yaml:.",       # Embed config.yaml in the exe
+        "--add-data=config/models.json:config",  # 模型清单 (固定 revision + SHA-256)
+        "--collect-data=jieba",            # jieba 词典 (断句依赖, 跨平台由 PyInstaller 定位)
         "--clean",
         "--noconfirm",
     ]
@@ -33,13 +35,18 @@ def main():
     hidden = [
         # App modules (uvicorn.run("app.main:app") is string-based, not auto-detected)
         "app.main",
+        "app.core.model_catalog",
+        "app.core.model_download",
+        "app.core.sherpa_engine",
+        "app.core.caption_builder",
+        "app.core.semantic_breaks",
+        "app.core.text_units",
         "app.core.audio_processor",
         "app.core.subtitle_formatter",
-        "app.core.model_downloader",
         "app.core.config_loader",
-        "app.core.sensevoice_engine",
-        # Audio processing
-        "kaldi_native_fbank",       # C++ extension, loaded via import
+        # 断句依赖 jieba (纯 Python, 字典是数据文件)
+        "jieba",
+        # Audio processing (fbank/LFR/CMVN 由 sherpa-onnx 内部完成, 不再需要 kaldi-native-fbank)
         "soundfile",                # C extension, needs libsndfile
         # Web framework
         "uvicorn.logging",

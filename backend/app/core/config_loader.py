@@ -1,21 +1,45 @@
 """
 Configuration loader for subtitle assistant.
+
+模型路径不再写死在 config.yaml 里 —— 由 ``backend/config/models.json`` 清单
+管理, 运行时经 ``app.core.model_catalog`` 解析。这里只负责:
+  * 展开 ``model.dir`` 的 ``~`` 并转成绝对路径
+  * 在缺少可选段时补上默认值, 让调用方不必到处 ``.get`` 判空
 """
 import os
-import yaml
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
+
+import yaml
+
+DEFAULTS: Dict[str, Any] = {
+    "model": {"dir": "~/.shiyu/models"},
+    "audio": {"sample_rate": 16000, "max_duration": 300},
+    "inference": {"language": "auto", "use_itn": True, "device": "cpu"},
+    "output": {"default_format": "srt"},
+    "engines": {},
+}
+
+
+def _merge_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
+    """把缺失的段补上默认值 (只补顶层段, 不覆盖用户写的值)。"""
+    for section, values in DEFAULTS.items():
+        if section not in config or config[section] is None:
+            config[section] = dict(values) if isinstance(values, dict) else values
+        elif isinstance(values, dict):
+            for key, value in values.items():
+                config[section].setdefault(key, value)
+    return config
 
 
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
-    """Load YAML config, resolve model paths relative to model.dir.
+    """Load YAML config and resolve ``model.dir`` to an absolute path.
 
     Args:
-        config_path: Path to config.yaml
+        config_path: Path to config.yaml (relative paths resolve against backend/).
 
     Returns:
-        config dict with absolute paths stored under legacy keys
-        (onnx_path, tokens_path, config_path) for backward compat
+        config dict with ``model.dir`` expanded to an absolute path.
     """
     config_file = Path(config_path)
     if not config_file.is_absolute():
@@ -23,29 +47,11 @@ def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
         config_file = backend_dir / config_path
 
     with open(config_file, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
 
-    # Resolve model.dir: expand ~ and convert to absolute
+    config = _merge_defaults(config)
+
     model_dir_raw = config["model"].get("dir", "~/.shiyu/models")
-    model_dir = Path(os.path.expanduser(model_dir_raw)).resolve()
-    config["model"]["dir"] = str(model_dir)
-
-    # Resolve model paths relative to model.dir, stored under legacy keys
-    path_keys = {
-        "onnx": "onnx_path",
-        "tokens": "tokens_path",
-        "model_config": "config_path",
-    }
-    for yaml_key, config_key in path_keys.items():
-        rel_path = config["model"].get(yaml_key)
-        if rel_path:
-            absolute = (model_dir / rel_path).resolve()
-            config["model"][config_key] = str(absolute)
-
-    # Resolve audio cmvn_file: extract basename and locate in model.dir
-    cmvn_path = config.get("audio", {}).get("cmvn_file")
-    if cmvn_path and not Path(cmvn_path).is_absolute():
-        resolved = (model_dir / "sensevoice-small" / Path(cmvn_path).name).resolve()
-        config["audio"]["cmvn_file"] = str(resolved)
+    config["model"]["dir"] = str(Path(os.path.expanduser(model_dir_raw)).resolve())
 
     return config

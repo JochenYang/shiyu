@@ -46,28 +46,53 @@ class TestSplitLongLines:
         assert " ".join(lines) == text
 
 
-class TestSegmentsFromTranscriptionMerge:
-    """segments_from_transcription 段合并的空格行为."""
+class TestSegmentsFromTranscription:
+    """segments_from_transcription 不再合并相邻段。
 
-    def test_merge_cjk_segments_joins_without_space(self):
-        """中文段合并直接拼接, 不插入空格."""
+    字幕行已由引擎在测量词边界上断好; 格式化层再按间隔合并会把断句结果
+    重新打回一整行 (回归: 3 行曾被拼成 4.65s 一条)。
+    """
+
+    def test_adjacent_cjk_segments_are_not_merged(self):
         segments_raw = [
             {"start": 0.0, "end": 0.8, "text": "第一段"},
             {"start": 0.9, "end": 2.0, "text": "第二段"},
         ]
-        result = segments_from_transcription(segments_raw, merge_gap=0.5)
-        assert len(result) == 1
-        assert result[0].text == "第一段第二段"
+        result = segments_from_transcription(segments_raw)
+        assert len(result) == 2
+        assert [s.text for s in result] == ["第一段", "第二段"]
 
-    def test_merge_english_segments_keeps_space(self):
-        """英文段合并保留空格分隔."""
+    def test_adjacent_english_segments_are_not_merged(self):
         segments_raw = [
             {"start": 0.0, "end": 0.8, "text": "First part"},
             {"start": 0.9, "end": 2.0, "text": "second part"},
         ]
-        result = segments_from_transcription(segments_raw, merge_gap=0.5)
-        assert len(result) == 1
-        assert result[0].text == "First part second part"
+        result = segments_from_transcription(segments_raw)
+        assert len(result) == 2
+        assert [s.text for s in result] == ["First part", "second part"]
+
+    def test_short_segments_are_not_merged(self):
+        """极短段也保留 —— 不再因「读不完」而被吞进邻段。"""
+        segments_raw = [
+            {"start": 0.0, "end": 0.5, "text": "嗯"},
+            {"start": 0.5, "end": 2.0, "text": "我想说的是"},
+        ]
+        result = segments_from_transcription(segments_raw)
+        assert len(result) == 2
+
+    def test_times_are_preserved_exactly(self):
+        segments_raw = [{"start": 0.01, "end": 1.11, "text": "对我做了介绍"}]
+        result = segments_from_transcription(segments_raw)
+        assert result[0].start == 0.01
+        assert result[0].end == 1.11
+
+    def test_empty_text_is_dropped(self):
+        segments_raw = [
+            {"start": 0.0, "end": 1.0, "text": "  "},
+            {"start": 1.0, "end": 2.0, "text": "有内容"},
+        ]
+        result = segments_from_transcription(segments_raw)
+        assert [s.text for s in result] == ["有内容"]
 
 
 class TestGenerateSrt:

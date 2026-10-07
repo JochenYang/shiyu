@@ -29,9 +29,11 @@
               <Film v-if="isVideo" class="file-icon" :size="20" />
               <Music v-else class="file-icon" :size="20" />
               <div class="file-details">
-                <span class="file-name" :title="selectedFile.name">{{
-                  selectedFile.name
-                }}</span>
+                <VTooltip :content="selectedFile.name">
+                  <span class="file-name">{{
+                    selectedFile.name
+                  }}</span>
+                </VTooltip>
                 <span class="file-meta">{{
                   isVideo ? "视频文件" : "音频文件"
                 }}</span>
@@ -64,6 +66,10 @@
           <span v-if="selectedEngine && !getEngineInfo(selectedEngine)?.available" class="engine-warning">
             该引擎当前网络不可达，尝试连接可能失败
           </span>
+          <button v-if="canRegenerate" class="secondary-btn small-btn regenerate-btn"
+            :disabled="isProcessing" @click="onRegenerate">
+            ↻ 用 {{ getEngineInfo(selectedEngine)?.display_name || '新引擎' }} 重新生成
+          </button>
         </div>
 
         <!-- 字幕时间偏移 (主人手动微调, 不依赖后端重启) -->
@@ -75,14 +81,14 @@
           </label>
           <div class="offset-row">
             <button class="offset-btn" @click="adjustOffset(-0.5)" :disabled="isProcessing">-0.5s</button>
-            <input
-              type="range"
-              min="-5"
-              max="5"
-              step="0.1"
-              v-model.number="subtitleOffset"
-              class="offset-slider"
+            <SmartSlider
+              v-model="subtitleOffset"
+              :min="-5"
+              :max="5"
+              :step="0.1"
               :disabled="isProcessing"
+              :format="(v) => v.toFixed(1) + 's'"
+              aria-label="字幕时间偏移"
             />
             <button class="offset-btn" @click="adjustOffset(0.5)" :disabled="isProcessing">+0.5s</button>
             <button class="offset-btn offset-reset" @click="subtitleOffset = 0" :disabled="isProcessing">重置</button>
@@ -109,9 +115,11 @@
           >
             <span class="item-time">{{ fmtTimeFull(seg.start) }}</span>
             <span class="item-text">{{ seg.text }}</span>
-            <button class="item-delete" @click.stop="removeSegment(idx)" title="删除此字幕">
-              <Trash2 :size="14" />
-            </button>
+            <VTooltip content="删除此字幕">
+              <button class="item-delete" @click.stop="removeSegment(idx)">
+                <Trash2 :size="14" />
+              </button>
+            </VTooltip>
           </div>
           <div class="list-empty" v-if="parsedSegments.length === 0">
             暂无字幕
@@ -318,9 +326,11 @@
           :format-tooltip="formatVolumeTooltip"
         />
         <div class="divider"></div>
-        <button class="icon-btn" @click="showSettings = true" title="设置">
-          <Settings :size="18" />
-        </button>
+        <VTooltip content="设置">
+          <button class="icon-btn" @click="showSettings = true">
+            <Settings :size="18" />
+          </button>
+        </VTooltip>
       </div>
     </footer>
 
@@ -339,9 +349,12 @@
         </div>
         <div class="custom-modal-body nav-layout">
           <div class="settings-sidebar">
+            <!-- 滑动高亮块: transform 平滑跟随激活项 (借鉴 beUI morphing-tabs) -->
+            <div class="settings-nav-glider" :style="navGliderStyle" aria-hidden="true"></div>
             <div
               v-for="tab in settingsTabs"
               :key="tab.key"
+              :data-tab="tab.key"
               class="settings-nav-item"
               :class="{ active: currentSettingsTab === tab.key }"
               @click="currentSettingsTab = tab.key"
@@ -397,34 +410,91 @@
             <template v-if="currentSettingsTab === 'model'">
               <div class="setting-item col">
                 <div class="setting-label">语音模型</div>
-                <div class="model-status-row">
-                  <span class="model-status-dot" :class="modelInfoClass"></span>
-                  <span class="model-status-text">{{ modelInfoText }}</span>
+                <div class="model-status-text model-hint">
+                  下载后离线运行，识别时不上传音频。已安装的模型可在「识别引擎」中选用。
                 </div>
-                <div class="path-picker" v-if="modelPath">
-                  <n-input
-                    v-model:value="modelPath"
-                    placeholder="模型路径"
-                    readonly
-                  />
-                  <button class="secondary-btn small-btn" @click="openModelDir">
-                    打开文件夹
-                  </button>
+              </div>
+
+              <div v-for="m in models" :key="m.id" class="model-row">
+                <div class="model-row-main">
+                  <div class="model-row-title">
+                    <span class="model-status-dot" :class="m.installed ? 'dot-green' : 'dot-gray'"></span>
+                    <span class="model-name">{{ m.name }}</span>
+                    <span v-if="m.id === defaultModelID" class="model-tag">默认</span>
+                  </div>
+                  <div class="model-row-desc">{{ m.description }}</div>
+                  <div class="model-row-meta">
+                    <span>{{ formatSize(m.sizeBytes) }}</span>
+                    <span v-if="m.languages && m.languages.length"> · {{ m.languages.join(" / ") }}</span>
+                    <span v-if="!m.installed && m.reason"> · {{ m.reason }}</span>
+                  </div>
+
+                  <!-- 该模型的下载进度 -->
+                  <div v-if="jobFor(m.id)" class="model-progress">
+                    <div class="model-progress-bar">
+                      <div class="model-progress-fill"
+                        :style="{ width: Math.round((jobFor(m.id).progress || 0) * 100) + '%' }"></div>
+                    </div>
+                    <div class="model-progress-text">
+                      {{ jobStageText(jobFor(m.id)) }}
+                    </div>
+                  </div>
                 </div>
+
+                <div class="model-row-actions">
+                  <button v-if="m.installed && m.id !== defaultModelID && m.engine !== 'forced_aligner'"
+                    class="secondary-btn small-btn"
+                    :disabled="isProcessing"
+                    @click="onSetDefaultModel(m)">设为默认</button>
+                  <button v-if="!m.installed && !jobFor(m.id)"
+                    class="secondary-btn small-btn"
+                    :disabled="isProcessing"
+                    @click="onInstallModel(m.id)">下载</button>
+                  <button v-else-if="jobFor(m.id) && jobFor(m.id).status === 'running'"
+                    class="secondary-btn small-btn"
+                    @click="onCancelModelJob(jobFor(m.id).jobID)">取消</button>
+                  <button v-else-if="m.installed"
+                    class="secondary-btn small-btn danger-btn"
+                    :disabled="isProcessing"
+                    @click="onRemoveModel(m)">移除</button>
+                </div>
+              </div>
+
+              <div class="setting-item">
+                <button class="secondary-btn small-btn" @click="openModelDir">
+                  打开模型文件夹
+                </button>
               </div>
             </template>
 
             <!-- 云端 -->
+            <!-- 云端: 多配置并存 (v2.4) -->
             <template v-if="currentSettingsTab === 'cloud'">
               <div class="setting-item col">
+                <div class="setting-label">云端配置（可添加多个，同时显示在引擎下拉）</div>
+                <select class="log-level-select" v-model="editingEngineId">
+                  <option v-for="e in engineConfigs" :key="e.id" :value="e.id">
+                    {{ (e.display_name || e.model || '(未命名)') }}{{ activeEngineId === e.id ? ' ✓当前' : '' }}
+                  </option>
+                </select>
+                <div class="setting-row">
+                  <button class="secondary-btn small-btn" @click="onAddEngineConfig">+ 新增配置</button>
+                  <button v-if="engineConfigs.length > 1" class="secondary-btn small-btn danger-btn"
+                    @click="onDeleteEngineConfig">删除当前</button>
+                  <button v-if="activeEngineId !== editingEngineId" class="secondary-btn small-btn"
+                    @click="onActivateEngine">设为当前使用</button>
+                </div>
+              </div>
+              <div class="setting-item col">
                 <div class="setting-label">API 地址</div>
-                <n-input v-model:value="appSettings.engineApiUrl"
+                <n-input v-model:value="editingEngine.api_url"
                   placeholder="https://api.openai.com/v1" />
               </div>
               <div class="setting-item col">
                 <div class="setting-label">API Key</div>
-                <n-input v-model:value="appSettings.engineApiKey"
-                  :type="showEngineApiKey ? 'text' : 'password'" placeholder="sk-...">
+                <n-input v-model:value="editingEngine.api_key"
+                  :type="showEngineApiKey ? 'text' : 'password'"
+                  :placeholder="editingEngine.has_key ? '已保存（留空则不修改）' : 'sk-...'">
                   <template #suffix>
                     <button class="icon-btn" @click="showEngineApiKey = !showEngineApiKey" tabindex="-1">
                       <Eye v-if="!showEngineApiKey" :size="16" />
@@ -435,15 +505,28 @@
               </div>
               <div class="setting-item col">
                 <div class="setting-label">模型名</div>
-                <n-input v-model:value="appSettings.engineModel"
-                  placeholder="whisper-1" />
+                <n-input v-model:value="editingEngine.model" placeholder="whisper-1" />
+              </div>
+              <div class="setting-item col">
+                <div class="setting-label">请求模式</div>
+                <select class="log-level-select" v-model="editingEngine.request_mode">
+                  <option value="whisper">whisper — /audio/transcriptions</option>
+                  <option value="chat_completions">chat_completions — /chat/completions</option>
+                </select>
+                <div class="model-row-desc">
+                  OpenAI、Groq 等选 whisper；DashScope Qwen3-ASR 等只提供 chat 接口的选 chat_completions。
+                </div>
+              </div>
+              <div class="setting-item col">
+                <div class="setting-label">显示名称（可选，用于区分多个云模型）</div>
+                <n-input v-model:value="editingEngine.display_name" placeholder="DashScope" />
               </div>
               <div class="setting-item">
-                <div class="setting-label">启用云端引擎</div>
-                <n-switch v-model:value="appSettings.engineEnabled" />
+                <div class="setting-label">启用该配置</div>
+                <n-switch v-model:value="editingEngine.enabled" />
               </div>
               <div class="setting-item">
-                <button class="secondary-btn" @click="onSaveEngineSettings">保存云端配置</button>
+                <button class="secondary-btn" @click="onSaveEngineSettings">保存全部配置</button>
                 <span v-if="engineSettingsStatus" class="setting-status">{{ engineSettingsStatus }}</span>
               </div>
             </template>
@@ -467,8 +550,34 @@
               </div>
             </template>
 
+            <!-- 关于: 项目地址与版本 -->
+            <template v-if="currentSettingsTab === 'about'">
+              <div class="setting-item col">
+                <div class="setting-label">项目仓库</div>
+                <a class="about-link" :href="PROJECT_INFO.repo" target="_blank" rel="noopener">
+                  <Github :size="15" class="about-link-icon" />
+                  {{ PROJECT_INFO.repo }}
+                </a>
+                <div class="model-row-desc">GitHub 仓库地址 —— 问题反馈、文档与源码</div>
+              </div>
+              <div class="setting-item col">
+                <div class="setting-label">问题反馈</div>
+                <a class="about-link" :href="PROJECT_INFO.issues" target="_blank" rel="noopener">
+                  {{ PROJECT_INFO.issues }}
+                </a>
+                <div class="model-row-desc">提交 Issue 时请附上排错日志（日志页可打开日志文件夹）</div>
+              </div>
+              <div class="setting-item">
+                <div class="setting-label">版本</div>
+                <span class="setting-status">{{ PROJECT_INFO.version }}</span>
+              </div>
+              <div class="setting-item">
+                <div class="setting-label">开源许可</div>
+                <span class="setting-status">MIT</span>
+              </div>
+            </template>
             <div class="copyright-info">
-              © 2026 时语 Shiyu Subtitle v1.1.0. All rights reserved.
+              © 2026 时语 Shiyu Subtitle {{ PROJECT_INFO.version }} · 开源 (MIT)
             </div>
           </div>
         </div>
@@ -476,42 +585,15 @@
     </div>
   </div>
 
-  <!-- 模型下载遮罩层 -->
-  <div class="download-overlay" v-if="modelStatus !== 'ready'">
-    <div class="download-card">
-      <div class="download-title">时语 Shiyu</div>
-      <div class="download-subtitle">本地 AI 字幕助手</div>
-
-      <div class="download-progress-area" v-if="modelStatus === 'downloading'">
-        <div class="download-progress-ring">
-          <svg width="80" height="80" viewBox="0 0 80 80">
-            <circle cx="40" cy="40" r="36" fill="none" stroke="#2a2a2a" stroke-width="6" />
-            <circle cx="40" cy="40" r="36" fill="none" stroke="#1fbc5b" stroke-width="6"
-              stroke-dasharray="226.2" :stroke-dashoffset="226.2 - 226.2 * modelProgress / 100"
-              stroke-linecap="round" transform="rotate(-90 40 40)" style="transition: stroke-dashoffset 0.3s" />
-          </svg>
-          <span class="download-progress-text">{{ modelProgress }}%</span>
-        </div>
-        <div class="download-info">正在下载语音模型 ({{ modelSizeStr }})</div>
-        <div class="download-subinfo">首次启动需要下载约 230MB，请耐心等待</div>
-      </div>
-
-      <div class="download-progress-area" v-else-if="modelStatus === 'loading'">
-        <div class="spinner"></div>
-        <div class="download-info">正在加载模型中...</div>
-      </div>
-
-      <div class="download-progress-area" v-else-if="modelStatus === 'error'">
-        <div class="download-error-icon">⚠️</div>
-        <div class="download-info">模型下载失败</div>
-        <div class="download-error-msg">{{ modelError }}</div>
-        <button class="primary-btn retry-btn" @click="retryDownload">重新下载</button>
-      </div>
-
-      <div class="download-progress-area" v-else-if="modelStatus === 'idle'">
-        <div class="spinner"></div>
-        <div class="download-info">正在检查模型...</div>
-      </div>
+  <!-- 模型下载进度悬浮条 (不再遮挡整个界面: 未下载模型时由识别报错引导) -->
+  <div class="download-toast" v-if="activeJob">
+    <div class="download-toast-title">{{ activeJob.modelName }} 下载中</div>
+    <div class="model-progress-bar">
+      <div class="model-progress-fill"
+        :style="{ width: Math.round((activeJob.progress || 0) * 100) + '%' }"></div>
+    </div>
+    <div class="download-toast-text">
+      {{ jobStageText(activeJob) }} · {{ formatSize(activeJob.completedBytes || 0) }} / {{ formatSize(activeJob.totalBytes || 0) }}
     </div>
   </div>
 </template>
@@ -542,6 +624,8 @@ import {
   Cloud,
   BrainCircuit,
   FileText,
+  Info,
+  Github,
   Pause,
   Eye,
   EyeOff,
@@ -550,6 +634,8 @@ import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { save, open } from "@tauri-apps/api/dialog";
 import { writeTextFile } from "@tauri-apps/api/fs";
+import VTooltip from "./VTooltip.vue";
+import SmartSlider from "./SmartSlider.vue";
 import {
   healthCheck,
   transcribeFile,
@@ -557,12 +643,15 @@ import {
   transcribeLocal,
   downloadText,
   openLogFolder,
-  getModelStatus,
-  restartModelDownload,
+  getModels,
+  installModel,
+  removeModel,
+  cancelModelJob,
+  setDefaultModel,
   openModelFolder,
   setLogLevel,
-  getEngineSettings,
-  saveEngineSettings,
+  getEngineConfigs,
+  saveEngineConfigsApi,
   getEngines,
   getLlmCorrectionSettings,
   saveLlmCorrectionSettings,
@@ -583,46 +672,64 @@ const backendOnline = ref(false);
 // Engine selector state
 const engines = ref([]);
 const selectedEngine = ref("zipformer_local");
-
-// 字幕时间偏移 (主人手动微调, 不依赖后端重启, 范围 -5s ~ +5s, 精度 0.1s)
 const subtitleOffset = ref(0.0);
 function adjustOffset(delta) {
   subtitleOffset.value = Math.max(-5, Math.min(5, subtitleOffset.value + delta));
 }
 
-// Model download state
-const modelStatus = ref("idle"); // idle, downloading, loading, ready, error
-const modelProgress = ref(0);
-const modelError = ref("");
-const modelSizeStr = ref("230 MB");
+// 模型清单状态 (清单式管理: 每个模型独立下载/移除)
+const models = ref([]);
+const defaultModelID = ref("");
+const activeJob = ref(null);
 const modelPath = ref("");
 let modelPollTimer = null;
 
-// Computed model info for settings panel
-const modelInfoClass = computed(() => {
-  switch (modelStatus.value) {
-    case "ready": return "dot-green";
-    case "downloading":
-    case "loading": return "dot-yellow";
-    case "error": return "dot-red";
-    default: return "dot-gray";
-  }
-});
-const modelInfoText = computed(() => {
-  switch (modelStatus.value) {
-    case "ready": return "模型就绪";
-    case "downloading": return `下载中 ${modelProgress.value}%`;
-    case "loading": return "加载中...";
-    case "error": return `下载失败: ${modelError.value || "未知错误"}`;
-    case "idle": return "正在检查...";
-    default: return "未知";
-  }
-});
+/** 取某模型当前运行中的下载任务 (无则 null)。 */
+function jobFor(modelId) {
+  const job = activeJob.value;
+  return job && job.modelID === modelId && job.status === "running" ? job : null;
+}
+
+/** 把任务阶段翻成中文进度描述。 */
+function jobStageText(job) {
+  if (!job) return "";
+  if (job.status === "failed") return job.error || "下载失败";
+  if (job.status === "cancelled") return job.error || "已取消";
+  const percent = Math.round((job.progress || 0) * 100);
+  const stage = {
+    connecting: "连接中",
+    "switching-source": `切换镜像 (${job.source || ""})`,
+    downloading: "下载中",
+    resuming: "继续下载",
+    checking: "校验中",
+    cancelling: "正在取消",
+    ready: "完成",
+  }[job.stage] || "处理中";
+  return `${stage} ${percent}%`;
+}
+
+/** 字节数 → 人类可读大小。 */
+function formatSize(bytes) {
+  const value = Number(bytes) || 0;
+  if (value >= 1024 ** 3) return (value / 1024 ** 3).toFixed(2) + " GB";
+  if (value >= 1024 ** 2) return (value / 1024 ** 2).toFixed(0) + " MB";
+  if (value >= 1024) return (value / 1024).toFixed(0) + " KB";
+  return value + " B";
+}
+
 
 const format = ref("srt");
 const language = ref("zh");
 
 const resultSegments = ref([]);
+// 生成字幕时实际用的引擎; 切换后不同则提示可重新生成 (问题 2)
+const lastGeneratedEngine = ref("");
+const canRegenerate = computed(() =>
+  !!lastGeneratedEngine.value &&
+  !!selectedEngine.value &&
+  lastGeneratedEngine.value !== selectedEngine.value &&
+  resultSegments.value.length > 0
+);
 const uploadKey = ref(0);
 const currentSegIndex = ref(-1);
 const currentSegmentText = ref("");
@@ -637,23 +744,75 @@ const settingsTabs = [
   { key: "model", icon: Mic, label: "模型" },
   { key: "cloud", icon: Cloud, label: "云端" },
   { key: "log", icon: FileText, label: "日志" },
+  { key: "about", icon: Info, label: "关于" },
 ];
+
+// ── 设置侧边栏滑动高亮块 (morphing) ──
+const navGlider = ref({ top: 0, height: 0, ready: false });
+const navGliderStyle = computed(() => ({
+  transform: `translateY(${navGlider.value.top}px)`,
+  height: `${navGlider.value.height}px`,
+  opacity: navGlider.value.ready ? 1 : 0,
+}));
+
+function updateNavGlider() {
+  // 不用 v-for ref 数组 (组件更新时 ref 回调先置 null 会错位),
+  // 直接从 DOM 按 data-tab 查, 并要求布局已稳定 (有非零高度)
+  const items = document.querySelectorAll(".settings-nav-item[data-tab]");
+  const el = [...items].find(
+    (n) => n.dataset.tab === currentSettingsTab.value
+  );
+  if (!el || el.offsetHeight < 8) return;
+  navGlider.value = {
+    top: el.offsetTop,
+    height: el.offsetHeight,
+    ready: true,
+  };
+}
+
+watch(currentSettingsTab, () => nextTick(updateNavGlider));
+watch(showSettings, (open) => {
+  if (!open) return;
+  // 弹窗有缩放动画, 动画进行中 offsetTop/Height 不稳定;
+  // 首次测量 + 动画结束后再校正一次, 两值一致才用
+  nextTick(updateNavGlider);
+  setTimeout(updateNavGlider, 420);
+});
+let navResizeObserver = null;
+onMounted(() => {
+  // 字体加载可能改变行高; resize 与侧边栏尺寸变化都要重算
+  nextTick(updateNavGlider);
+  window.addEventListener("resize", updateNavGlider);
+  const sidebar = document.querySelector(".settings-sidebar");
+  if (sidebar && "ResizeObserver" in window) {
+    navResizeObserver = new ResizeObserver(() => updateNavGlider());
+    navResizeObserver.observe(sidebar);
+  }
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", updateNavGlider);
+  navResizeObserver?.disconnect();
+});
+
+// 项目信息 (关于页展示; 发布包里也应可追溯)
+const PROJECT_INFO = {
+  repo: "https://github.com/JochenYang/shiyu",
+  issues: "https://github.com/JochenYang/shiyu/issues",
+  version: "v2.4",
+};
 const appSettings = ref({
   autostart: false,
   startMinimized: false,
   defaultSavePath: "",
   logLevel: "info",
-  engineEnabled: false,
-  engineApiUrl: "",
-  engineApiKey: "",
-  engineModel: "whisper-1",
+  // 云端多配置状态在 engineConfigs/activeEngineId/editingEngineId (v2.4),
+  // 旧单配置字段已移除 — 保留这里会让人误以为还有第二个数据源。
   llmEnabled: false,
   llmProvider: "openai",
   llmApiUrl: "",
   llmApiKey: "",
   llmModel: "",
 });
-
 // Player State
 const mediaPlayer = ref(null);
 const isPlaying = ref(false);
@@ -722,17 +881,85 @@ watch(currentSegIndex, (idx) => {
 
 const engineSettingsStatus = ref("");
 
+// ── 云端多配置 (v2.4) ──────────────────────────────────────────
+const engineConfigs = ref([]);          // 后端全部配置 (脱敏)
+const activeEngineId = ref("");          // 当前激活配置 id
+const editingEngineId = ref("");
+
+// 正在编辑的配置对象 (直接绑定表单; has_key 由后端回传, 不回传)
+const editingEngine = computed(() => {
+  const found = engineConfigs.value.find(e => e.id === editingEngineId.value);
+  return found || { api_url: "", api_key: "", model: "", enabled: false,
+                    request_mode: "whisper", display_name: "" };
+});
+
+function _blankEngine() {
+  return { id: "", api_url: "", api_key: "", model: "", enabled: true,
+           request_mode: "whisper", display_name: "", has_key: false };
+}
+
+async function fetchEngineConfigs() {
+  try {
+    const data = await getEngineConfigs();
+    engineConfigs.value = data.engines || [];
+    activeEngineId.value = data.active || "";
+    if (!engineConfigs.value.length) {
+      engineConfigs.value = [_blankEngine()];
+      editingEngineId.value = engineConfigs.value[0].id;
+    } else if (!engineConfigs.value.some(e => e.id === editingEngineId.value)) {
+      editingEngineId.value = activeEngineId.value || engineConfigs.value[0].id;
+    }
+  } catch {
+    // 后端未就绪 (开发模式) — 留空白供手填
+    if (!engineConfigs.value.length) {
+      engineConfigs.value = [_blankEngine()];
+      editingEngineId.value = engineConfigs.value[0].id;
+    }
+  }
+}
+
+function onAddEngineConfig() {
+  const fresh = _blankEngine();
+  fresh.id = `new-${Date.now()}`;   // 临时 id, 后端保存时重新分配
+  engineConfigs.value.push(fresh);
+  editingEngineId.value = fresh.id;
+}
+
+function onDeleteEngineConfig() {
+  if (engineConfigs.value.length <= 1) return;
+  const idx = engineConfigs.value.findIndex(e => e.id === editingEngineId.value);
+  if (idx < 0) return;
+  const removed = engineConfigs.value.splice(idx, 1)[0];
+  if (activeEngineId.value === removed.id) {
+    activeEngineId.value = engineConfigs.value[0]?.id || "";
+  }
+  editingEngineId.value = activeEngineId.value || engineConfigs.value[0]?.id || "";
+}
+
+async function onActivateEngine() {
+  // 立即保存并把当前编辑项设为激活
+  await onSaveEngineSettings();
+}
+
 async function onSaveEngineSettings() {
   try {
     engineSettingsStatus.value = "保存中...";
-    await saveEngineSettings({
-      api_url: appSettings.value.engineApiUrl,
-      api_key: appSettings.value.engineApiKey,
-      model: appSettings.value.engineModel,
-      enabled: appSettings.value.engineEnabled,
+    await saveEngineConfigsApi({
+      engines: engineConfigs.value.map(e => ({
+        id: e.id && !String(e.id).startsWith("new-") ? e.id : undefined,
+        api_url: e.api_url || "",
+        api_key: e.api_key || "",          // 空值后端保留旧密钥
+        model: e.model || "",
+        enabled: !!e.enabled,
+        request_mode: e.request_mode || "whisper",
+        display_name: e.display_name || "",
+      })),
+      active: activeEngineId.value || undefined,
     });
     engineSettingsStatus.value = "✓ 已保存";
     setTimeout(() => { engineSettingsStatus.value = ""; }, 3000);
+    await fetchEngineConfigs();          // 回读真实 id 与激活态
+    await fetchEngines();                 // 云端引擎下拉同步
   } catch (err) {
     engineSettingsStatus.value = "保存失败: " + (err.message || err);
   }
@@ -792,12 +1019,9 @@ onMounted(async () => {
     }
   }
 
-  // Sync cloud engine settings from backend
+  // Sync cloud engine configs (multi, v2.4) from backend
   try {
-    const cfg = await getEngineSettings();
-    appSettings.value.engineApiUrl = cfg.api_url || "";
-    appSettings.value.engineModel = cfg.model || "whisper-1";
-    appSettings.value.engineEnabled = cfg.enabled || false;
+    await fetchEngineConfigs();
   } catch {
     // Backend may not have engine endpoint yet during dev
   }
@@ -805,8 +1029,9 @@ onMounted(async () => {
   // Sync LLM correction settings from backend
   syncLlmCorrectionSettings();
 
-  // Fetch available engines
+  // Fetch available engines + model list
   await fetchEngines();
+  await refreshModels();
 
   pollTimer = setInterval(async () => {
     try {
@@ -816,9 +1041,9 @@ onMounted(async () => {
         // Fetch engines once backend comes online
         fetchEngines();
       }
-      // Once backend is online, start checking model status
-      if (modelStatus.value !== "ready") {
-        checkModelStatus();
+      // 有下载任务在跑时刷新清单, 以便看到进度
+      if (activeJob.value) {
+        refreshModels();
       }
     } catch {
       backendOnline.value = false;
@@ -924,12 +1149,24 @@ async function onCorrectWithLLM() {
     isCorrecting.value = false;
   }
 }
+// 切换引擎后重新生成 (问题 2): 复用当前文件与设置, 走同一条转录链路
+async function onRegenerate() {
+  if (isProcessing.value) return;
+  if (!localFilePath.value && !selectedFile.value) {
+    message.warning("没有可重新生成的文件");
+    return;
+  }
+  message.info("正在用新引擎重新生成字幕…");
+  await startTranscribe();
+}
+
 async function startTranscribe() {
   if (!selectedFile.value) return;
   isProcessing.value = true;
   resultSegments.value = [];
   currentSegIndex.value = -1;
-
+  // 记住本次生成用的引擎, 供「切换引擎后重新生成」提示判断
+  lastGeneratedEngine.value = selectedEngine.value;
   try {
     let glossaryDict = {};
     if (appSettings.value.customGlossaryText) {
@@ -944,7 +1181,8 @@ async function startTranscribe() {
       }
     }
     const glossaryStr = JSON.stringify(glossaryDict);
-    const currentEngine = selectedEngine.value || (appSettings.value.engineEnabled ? "cloud" : "zipformer_local");
+    // 云端选中态: 引擎下拉里激活云配置叫 "cloud" (后端保证), 兼容旧回退
+    const currentEngine = selectedEngine.value || (activeEngineId.value ? "cloud" : "zipformer_local");
     let llmApplied = false;
 
     if (localFilePath.value) {
@@ -975,8 +1213,18 @@ async function startTranscribe() {
     if (resultSegments.value.length > 0) {
       currentSegIndex.value = 0;
     }
-    message.success(llmApplied ? "✓ 已修正" : "字幕生成完成");
-  } catch (err) {
+    if (resultSegments.value.length > 0) {
+      currentSegIndex.value = 0;
+      message.success(llmApplied ? "✓ 已修正" : "字幕生成完成");
+    } else {
+      // 0 段不能只说「完成」: 主人会以为成功了却找不到字幕。
+      // 常见原因按可能性排序给提示 (静音/无语音/引擎输出为空)。
+      message.warning(
+        "未识别到语音内容：请确认视频包含清晰的说话声，\n" +
+        "或换一个识别引擎（如 SenseVoice Small）重试",
+        { duration: 6000 }
+      );
+    }
     message.error(err.message || "处理失败，请检查后端服务");
   } finally {
     isProcessing.value = false;
@@ -1279,40 +1527,70 @@ async function fetchEngines() {
   }
 }
 
-async function checkModelStatus() {
+/** 拉取模型清单与当前下载任务 (只读, 不触发任何下载)。 */
+async function refreshModels() {
   try {
-    const status = await getModelStatus();
-    modelStatus.value = status.status;
-    modelProgress.value = status.progress || 0;
-    modelError.value = status.error || "";
-    if (status.model_size_mb) {
-      modelSizeStr.value = `${status.model_size_mb} MB`;
-    }
-    if (status.model_path) {
-      modelPath.value = status.model_path.replace(/\\/g, '/').replace(/\/model\.onnx$/, '');
-    }
+    const data = await getModels();
+    models.value = data.models || [];
+    defaultModelID.value = data.defaultModelID || "";
+    activeJob.value = data.job || null;
+    // 引擎列表随安装状态变化, 同步刷新引擎选择器
+    await fetchEngines();
   } catch {
     // Backend not ready yet, will retry
   }
 }
 
-async function retryDownload() {
-  modelStatus.value = "idle";
-  modelProgress.value = 0;
-  modelError.value = "";
+/** 下载模型。 */
+async function onInstallModel(modelId) {
   try {
-    await restartModelDownload();
-    // Status polling will pick up the new download state
+    activeJob.value = await installModel(modelId);
+    await refreshModels();
   } catch (err) {
-    // Backend might not be ready yet; polling loop will retry
+    message.error("无法开始下载: " + (err.message || err));
   }
 }
+
+/** 取消运行中的下载任务 (已下载部分保留, 重试可续传)。 */
+async function onCancelModelJob(jobId) {
+  try {
+    await cancelModelJob(jobId);
+    await refreshModels();
+  } catch (err) {
+    message.error("取消失败: " + (err.message || err));
+  }
+}
+
+/** 移除模型。删除是不可逆操作, 先确认。 */
+async function onRemoveModel(model) {
+  const confirmed = window.confirm(
+    `确定移除「${model.name}」？\n\n` +
+    `将删除 ${formatSize(model.sizeBytes)} 的模型文件，下次使用需重新下载。`
+  );
+  if (!confirmed) return;
+  try {
+    await removeModel(model.id);
+    message.success(`已移除 ${model.name}`);
+    await refreshModels();
+  } catch (err) {
+    message.error("移除失败: " + (err.message || err));
+  }
+}
+async function onSetDefaultModel(model) {
+  try {
+    await setDefaultModel(model.id);
+    defaultModelID.value = model.id;
+    message.success(`已将 ${model.name} 设为默认模型`);
+  } catch (err) {
+    message.error("设置失败: " + (err.message || err));
+  }
+}
+
 
 async function openModelDir() {
   try {
     const res = await openModelFolder();
     if (res.status !== "ok") {
-      message.error(res.msg || "无法打开模型文件夹");
     }
   } catch (err) {
     message.error("调用后端失败: " + err);
@@ -1472,6 +1750,10 @@ function fmtTimeSrt(sec) {
   margin-top: 2px;
 }
 
+.regenerate-btn {
+  margin-top: 8px;
+  align-self: flex-start;
+}
 /* 字幕时间偏移滑块 */
 .offset-control {
   margin-top: 12px;
@@ -1939,6 +2221,24 @@ function fmtTimeSrt(sec) {
   margin-left: 8px;
 }
 
+.about-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #7ab8ff;
+  text-decoration: none;
+  font-size: 13px;
+  word-break: break-all;
+}
+.about-link:hover {
+  text-decoration: underline;
+}
+
+.setting-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
 .primary-btn,
 .secondary-btn {
   padding: 8px 16px;
@@ -2172,7 +2472,29 @@ function fmtTimeSrt(sec) {
   flex-direction: column;
   gap: 2px;
 }
+.settings-sidebar {
+  position: relative;
+}
+/* 滑动高亮块: 弹性跟随激活项 (借鉴 beUI morphing-tabs 的共享布局动效) */
+.settings-nav-glider {
+  position: absolute;
+  top: 0; /* 必须显式归零: 不设时元素停在静态位置 (padding-top 之后),
+             再叠加 translateY(offsetTop) 会双重偏移一个 padding-top */
+  left: 0;
+  width: 100%;
+  background: rgba(31, 188, 91, 0.08);
+  border-right: 2px solid #1fbc5b;
+  border-radius: 0 8px 8px 0;
+  pointer-events: none;
+  transition:
+    transform 0.32s cubic-bezier(0.34, 1.4, 0.64, 1),
+    height 0.32s cubic-bezier(0.34, 1.4, 0.64, 1),
+    opacity 0.18s ease;
+  z-index: 0;
+}
 .settings-nav-item {
+  position: relative;
+  z-index: 1; /* 文字浮在 glider 上 */
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2189,9 +2511,9 @@ function fmtTimeSrt(sec) {
 }
 .settings-nav-item.active {
   color: #1fbc5b;
-  background: rgba(31, 188, 91, 0.08);
-  border-right: 2px solid #1fbc5b;
+  /* 背景与右缘条由 settings-nav-glider 弹性滑动呈现 */
 }
+
 .nav-icon {
   display: flex;
   align-items: center;
@@ -2309,86 +2631,118 @@ function fmtTimeSrt(sec) {
   gap: 6px;
 }
 
-/* ─── Model Download Overlay ─── */
-.download-overlay {
-  position: fixed;
-  inset: 0;
-  background: #111111;
+/* ─── Model Manager ─── */
+.model-hint {
+  font-size: 0.8rem;
+  color: #777;
+  line-height: 1.5;
+}
+
+.model-row {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 9999;
-}
-
-.download-card {
-  text-align: center;
-  padding: 48px;
-}
-
-.download-title {
-  font-size: 2rem;
-  font-weight: 700;
-  color: #e0e0e0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
   margin-bottom: 8px;
-  letter-spacing: 1px;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  background: #1a1a1a;
 }
 
-.download-subtitle {
-  font-size: 1rem;
-  color: #666;
-  margin-bottom: 48px;
+.model-row-main {
+  flex: 1;
+  min-width: 0;
 }
 
-.download-progress-area {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 16px;
-}
-
-.download-progress-ring {
-  position: relative;
-  width: 80px;
-  height: 80px;
+.model-row-title {
   display: flex;
   align-items: center;
-  justify-content: center;
+  gap: 8px;
 }
 
-.download-progress-text {
-  position: absolute;
-  font-size: 1.1rem;
-  font-weight: 600;
+.model-name {
+  font-size: 0.9rem;
   color: #e0e0e0;
 }
 
-.download-info {
-  font-size: 1rem;
-  color: #ccc;
+.model-tag {
+  font-size: 0.7rem;
+  color: #1fbc5b;
+  border: 1px solid rgba(31, 188, 91, 0.4);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.model-row-desc {
+  font-size: 0.8rem;
+  color: #999;
+  margin-top: 4px;
+}
+
+.model-row-meta {
+  font-size: 0.75rem;
+  color: #666;
+  margin-top: 4px;
+}
+
+.model-row-actions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.danger-btn:hover {
+  color: #e74c3c;
+  border-color: #e74c3c;
+}
+
+.model-progress {
   margin-top: 8px;
 }
 
-.download-subinfo {
-  font-size: 0.85rem;
-  color: #666;
+.model-progress-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: #2a2a2a;
+  overflow: hidden;
 }
 
-.download-error-icon {
-  font-size: 2.5rem;
+.model-progress-fill {
+  height: 100%;
+  background: #1fbc5b;
+  transition: width 0.3s;
+}
+
+.model-progress-text {
+  font-size: 0.75rem;
+  color: #999;
+  margin-top: 4px;
+}
+
+/* 下载进度悬浮条: 不遮挡界面 */
+.download-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  width: 280px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid #2a2a2a;
+  background: rgba(26, 26, 26, 0.96);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  z-index: 9999;
+}
+
+.download-toast-title {
+  font-size: 0.85rem;
+  color: #e0e0e0;
   margin-bottom: 8px;
 }
 
-.download-error-msg {
-  font-size: 0.85rem;
-  color: #e74c3c;
-  max-width: 400px;
-  word-break: break-all;
-}
-
-.retry-btn {
-  margin-top: 16px;
-  padding: 10px 32px;
-  border-radius: 8px;
-  font-size: 0.95rem;
+.download-toast-text {
+  font-size: 0.75rem;
+  color: #999;
+  margin-top: 6px;
 }
 </style>

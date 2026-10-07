@@ -64,6 +64,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path frontend/src-tauri/resources/backend
           Copy-Item -Path backend/dist/shiyu-backend.exe -Destination frontend/src-tauri/resources/backend/shiyu-backend.exe
           Copy-Item -Path backend/config.yaml -Destination frontend/src-tauri/resources/backend/config.yaml
+          # 模型清单 (固定 revision + SHA-256) 必须随包分发
+          New-Item -ItemType Directory -Force -Path frontend/src-tauri/resources/backend/config
+          Copy-Item -Path backend/config/models.json -Destination frontend/src-tauri/resources/backend/config/models.json
 
       # --- Copy backend resources for Tauri: macOS ---
       - name: Copy backend resources (macOS)
@@ -74,6 +77,9 @@ jobs:
           mkdir -p frontend/src-tauri/resources/backend
           cp backend/dist/shiyu-backend frontend/src-tauri/resources/backend/shiyu-backend
           cp backend/config.yaml frontend/src-tauri/resources/backend/config.yaml
+          # 模型清单 (固定 revision + SHA-256) 必须随包分发
+          mkdir -p frontend/src-tauri/resources/backend/config
+          cp backend/config/models.json frontend/src-tauri/resources/backend/config/models.json
 
       # --- Generate changelog from all commits since last tag ---
       - name: Generate release changelog

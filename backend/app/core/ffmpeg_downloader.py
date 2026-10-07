@@ -1,7 +1,7 @@
 """
 FFmpeg auto-downloader — downloads static ffmpeg binary on first use.
 
-Follows the same pattern as ``model_downloader.py``:
+与模型下载相同的原则 (见 ``model_download.py``):
   - Downloads to ``~/.shiyu/bin/``
   - Runs in background thread
   - Provides status for frontend progress display

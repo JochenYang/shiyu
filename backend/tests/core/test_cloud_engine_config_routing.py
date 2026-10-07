@@ -12,9 +12,10 @@ decision logic (auth header resolution, request_mode validation,
 URL-sniffing back-compat helper) so they're fast, deterministic,
 and don't require a real audio file.
 """
+import json
+
 import pytest
 from unittest.mock import patch
-
 from app.core.cloud_engine import (
     _resolve_auth_header,
     _is_dashscope_url,
@@ -143,3 +144,112 @@ def test_transcribe_cloud_routes_openai_url_to_whisper_by_default():
         cloud_engine.transcribe_cloud("/tmp/a.wav")
     assert m_wh.called
     assert not m_ds.called
+
+
+# ── 配置持久化: 不得静默丢字段 ──────────────────────────────────────
+
+
+@pytest.fixture
+def config_file(tmp_path, monkeypatch):
+    """把云端配置指向临时文件, 不碰用户真实 ~/.shiyu/config.json。"""
+    from app.core import cloud_engine
+
+    path = tmp_path / "config.json"
+    monkeypatch.setattr(cloud_engine, "CONFIG_FILE", path)
+    return path
+
+
+def test_load_keeps_unknown_engine_fields(config_file):
+    """磁盘上的 request_mode / auth_header 等字段必须原样读出。
+
+    回归: 旧实现用白名单只取 api_url/api_key/model/enabled,
+    导致 request_mode 丢失后 transcribe_cloud 静默回落到 whisper 模式,
+    任何 chat_completions 型服务都无法配置成功。
+    """
+    from app.core import cloud_engine
+
+    config_file.write_text(json.dumps({
+        "engine": {
+            "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "api_key": "sk-test",
+            "model": "qwen3-asr-flash",
+            "enabled": True,
+            "request_mode": "chat_completions",
+            "auth_header": {"name": "api-key", "value_template": "{api_key}"},
+        }
+    }, ensure_ascii=False), encoding="utf-8")
+
+    cfg = cloud_engine.load_engine_config()
+    assert cfg["request_mode"] == "chat_completions"
+    assert cfg["auth_header"]["name"] == "api-key"
+
+
+def test_save_does_not_wipe_unknown_engine_fields(config_file):
+    """保存表单四字段时, 磁盘上其它字段必须保留。"""
+    from app.core import cloud_engine
+
+    config_file.write_text(json.dumps({
+        "engine": {
+            "api_url": "https://x/v1", "api_key": "sk-old", "model": "m",
+            "enabled": True, "request_mode": "chat_completions",
+            "display_name": "DashScope",
+            "auth_header": {"name": "api-key", "value_template": "{api_key}"},
+        }
+    }, ensure_ascii=False), encoding="utf-8")
+
+    # 旧前端只传四个字段
+    cloud_engine.save_engine_config(
+        api_url="https://x/v1", api_key="", model="m", enabled=True)
+
+    saved = json.loads(config_file.read_text(encoding="utf-8"))["engine"]
+    assert saved["request_mode"] == "chat_completions"
+    assert saved["display_name"] == "DashScope"
+    assert saved["auth_header"]["name"] == "api-key"
+    # 空 key 不得清掉已有密钥
+    assert saved["api_key"] == "sk-old"
+
+
+def test_save_updates_request_mode_when_given(config_file):
+    """显式传入 request_mode 时必须写入磁盘。"""
+    from app.core import cloud_engine
+
+    config_file.write_text(json.dumps({"engine": {}}, ensure_ascii=False),
+                           encoding="utf-8")
+    cloud_engine.save_engine_config(
+        api_url="https://x/v1", api_key="sk", model="m", enabled=True,
+        request_mode="chat_completions", display_name="DashScope")
+
+    saved = json.loads(config_file.read_text(encoding="utf-8"))["engine"]
+    assert saved["request_mode"] == "chat_completions"
+    assert saved["display_name"] == "DashScope"
+
+
+def test_llm_correction_save_keeps_unknown_fields(config_file):
+    """LLM 修正配置同样不得丢字段。"""
+    from app.core import cloud_engine
+
+    config_file.write_text(json.dumps({
+        "llm_correction": {
+            "enabled": False, "provider": "openai", "api_key": "sk-llm",
+            "api_url": "https://api.openai.com/v1", "model": "gpt-4o",
+            "custom_flag": True,
+        }
+    }, ensure_ascii=False), encoding="utf-8")
+
+    cloud_engine.save_llm_correction_config(
+        enabled=False, provider="openai", api_url="https://api.openai.com/v1",
+        api_key="", model="gpt-4o")
+
+    saved = json.loads(config_file.read_text(encoding="utf-8"))["llm_correction"]
+    assert saved["custom_flag"] is True
+    assert saved["api_key"] == "sk-llm"
+
+
+def test_load_tolerates_corrupt_config(config_file):
+    """损坏的配置文件回退到默认值, 不抛异常。"""
+    from app.core import cloud_engine
+
+    config_file.write_text("{ not json", encoding="utf-8")
+    cfg = cloud_engine.load_engine_config()
+    assert cfg["api_url"] == ""
+    assert cfg["enabled"] is False

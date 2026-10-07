@@ -112,12 +112,16 @@ def tokens_to_char_times(
     """
     if not tokens or not timestamps or len(tokens) != len(timestamps):
         return None
-    try:
-        raw, token_sizes = decode_token_bytes(tokens)
-        text = raw.decode("utf-8")
-    except (UnicodeDecodeError, TypeError):
+
+    raw, token_sizes = decode_token_bytes(tokens)
+    if not raw:
         return None
 
+    # 逐字节定位非法序列并丢弃它, 而不是整段放弃。
+    # 模型偶尔会吐出一个无法与相邻字节组成合法 UTF-8 的孤立字节 (实测:
+    # 一段 68 字的解码里有 1 个多余字节), 若因此返回 None, 整个 28 秒的长段
+    # 就会失去逐字符时间而无法断句。丢弃这 1 个字节既保住文本又保住时间。
+    text, bad_offsets = _decode_utf8_dropping_invalid(raw)
     if not text:
         return None
 
@@ -139,10 +143,45 @@ def tokens_to_char_times(
                 lo = mid + 1
         return min(lo, len(cum) - 1)
 
-    # 字符 → 起始字节 offset → token → 时间戳
+    # 字符 → 起始字节 offset → token → 时间戳; 被丢弃的字节不参与映射
     char_times: List[float] = []
     offset = 0
     for ch in text:
+        while offset in bad_offsets:
+            offset += 1
+        if offset >= len(raw):
+            return None
         char_times.append(float(timestamps[token_of(offset)]))
         offset += len(ch.encode("utf-8"))
     return char_times, text
+
+
+def _decode_utf8_dropping_invalid(raw: bytes) -> Tuple[str, set]:
+    """解码 UTF-8, 丢弃无法构成合法字符的字节。
+
+    Args:
+        raw: 字节流。
+
+    Returns:
+        (text, bad_offsets): 解码文本, 以及被丢弃字节的下标集合。
+        若整个字节流都无法解码则返回 ``("", set())``。
+    """
+    bad_offsets: set = set()
+    chunks: List[str] = []
+    index = 0
+    length = len(raw)
+    while index < length:
+        for size in (4, 3, 2, 1):
+            if index + size > length:
+                continue
+            try:
+                chunks.append(raw[index : index + size].decode("utf-8"))
+            except UnicodeDecodeError:
+                continue
+            index += size
+            break
+        else:
+            # 当前位置无论取多长都不合法: 丢弃这一个字节继续
+            bad_offsets.add(index)
+            index += 1
+    return "".join(chunks), bad_offsets

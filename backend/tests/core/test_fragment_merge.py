@@ -1,159 +1,142 @@
 """
-跨段碎片合并测试 (pipeline.SubtitlePipeline._merge_fragments).
+段间去重与清理测试 (pipeline.SubtitlePipeline._dedup_segments)。
 
-背景: ASR 分段 (Zipformer CTC / VAD) 常把句子切碎在词中间
-("通过改" + "变整个游戏"), 且可能输出纯标点段 (孤立 ".").
-v2.2 在 _stage_correct 前做碎片合并 + 孤立段过滤 + 段间子串去重,
-避免碎片段被标点规则补上错误句号 (如 "通过改。").
+背景: 引擎现在在已测量的词边界上做 DP 断句并输出最终字幕行。因此 pipeline
+**不再**按长度合并相邻段 —— 那会把引擎断好的句子重新拼回去 (实测 3 行被拼成
+1 行 4.6s)。本文件覆盖保留下来的清理逻辑: 空段/纯标点段过滤、ASR 重复识别
+产物的去重、以及「绝不合并」这一不变式。
 """
 from app.core.pipeline import PipelineContext, SubtitlePipeline
 
 
-def _merge(segments):
-    return SubtitlePipeline._merge_fragments(segments)
+def _dedup(segments):
+    return SubtitlePipeline._dedup_segments(segments)
 
 
-class TestFragmentMerge:
-    def test_merges_cjk_fragments_without_space(self):
-        """中文碎片直接拼接: '通过改' + '变整个游戏' → '通过改变整个游戏'."""
+class TestNoLengthMerging:
+    """核心不变式: 相邻段不因长度/时长而被合并。"""
+
+    def test_short_adjacent_segments_are_kept_separate(self):
+        """两段短句相邻且无标点 → 仍然保持两段 (旧版会合并成一段)。"""
         segs = [
-            {"start": 1.6, "end": 6.7, "text": "我们从添加效果开始，我们可以通过改"},
+            {"start": 0.0, "end": 1.0, "text": "对我做了介绍"},
+            {"start": 1.0, "end": 2.0, "text": "那么我想说的是"},
+        ]
+        out = _dedup(segs)
+        assert len(out) == 2
+        assert [s["text"] for s in out] == ["对我做了介绍", "那么我想说的是"]
+
+    def test_dp_segmented_captions_survive_pipeline(self):
+        """引擎 DP 断句的 3 行不被合并回 1 行 (回归: 曾把 3 行拼成 4.6s 一行)。"""
+        segs = [
+            {"start": 0.01, "end": 1.45, "text": "对我做了介绍"},
+            {"start": 1.45, "end": 3.53, "text": "那么我想说的是呢大家如果"},
+            {"start": 3.53, "end": 4.65, "text": "对我的研究感兴趣呢"},
+        ]
+        out = _dedup(segs)
+        assert len(out) == 3
+        assert out[0]["start"] == 0.01
+        assert out[-1]["end"] == 4.65
+
+    def test_cjk_fragments_are_not_joined(self):
+        """词中间被切断的相邻段不再自动拼接 (由引擎断句负责)。"""
+        segs = [
+            {"start": 1.6, "end": 6.7, "text": "我们可以通过改"},
             {"start": 6.7, "end": 8.5, "text": "变整个游戏的时间尺度来实现"},
         ]
-        out = _merge(segs)
-        assert len(out) == 1
-        assert out[0]["text"] == "我们从添加效果开始，我们可以通过改变整个游戏的时间尺度来实现"
-        assert out[0]["start"] == 1.6
-        assert out[0]["end"] == 8.5
-
-    def test_terminal_punctuation_prevents_merge(self):
-        """prev 以句号/问号/感叹号/省略号结尾 → 视为完整句, 不合并."""
-        for terminal in ["。", "？", "！", "…"]:
-            segs = [
-                {"start": 0.0, "end": 2.0, "text": f"这是第一句{terminal}"},
-                {"start": 2.0, "end": 4.0, "text": "这是第二句"},
-            ]
-            assert len(_merge(segs)) == 2, f"terminal={terminal}"
-
-    def test_merge_stops_at_duration_limit(self):
-        """合并后时长超过 8s → 保持独立段."""
-        segs = [
-            {"start": 0.0, "end": 8.0, "text": "第一段没有终止标点"},
-            {"start": 8.0, "end": 25.0, "text": "第二段很长但合并超时"},
-        ]
-        out = _merge(segs)
+        out = _dedup(segs)
         assert len(out) == 2
 
-    def test_merge_stops_at_char_limit(self):
-        """合并后字符数超过 32 → 保持独立段 (避免超长字幕)."""
-        segs = [
-            {"start": 0.0, "end": 4.0, "text": "这是一个很长的没有终止标点的完整句子内容"},
-            {"start": 4.0, "end": 6.0, "text": "下一段内容也很长，这里还有更多"},
-        ]
-        out = _merge(segs)
-        assert len(out) == 2
+    def test_input_is_not_mutated(self):
+        segs = [{"start": 0.0, "end": 1.0, "text": "第一句"},
+                {"start": 1.0, "end": 2.0, "text": "第二句"}]
+        before = [dict(s) for s in segs]
+        _dedup(segs)
+        assert segs == before
 
-    def test_dedups_in_segment_repeated_phrase(self):
-        """段内连续重复短语 (ASR 整句重复识别) 被清理."""
-        segs = [
-            {"start": 0.0, "end": 7.0, "text":
-             "包括我们的计时器，如果我们移除我们的计时器，如果我们移除玩家的碰撞体"},
-        ]
-        out = _merge(segs)
-        assert out[0]["text"] == "包括我们的计时器，如果我们移除玩家的碰撞体"
 
-    def test_filters_lone_punctuation_segments(self):
-        """孤立标点段 (如 ".") 被过滤, 不影响相邻段合并."""
+class TestCleanup:
+    """保留的清理能力。"""
+
+    def test_filters_empty_and_lone_punctuation_segments(self):
         segs = [
-            {"start": 0.0, "end": 1.0, "text": "正常内容"},
-            {"start": 1.0, "end": 1.3, "text": "."},
-            {"start": 1.3, "end": 2.0, "text": "后续内容"},
+            {"start": 0.0, "end": 1.0, "text": ""},
+            {"start": 1.0, "end": 2.0, "text": "   "},
+            {"start": 2.0, "end": 3.0, "text": "."},
+            {"start": 3.0, "end": 4.0, "text": "有内容"},
         ]
-        out = _merge(segs)
-        assert len(out) == 1
-        assert out[0]["text"] == "正常内容后续内容"
+        out = _dedup(segs)
+        assert [s["text"] for s in out] == ["有内容"]
 
     def test_dedups_repeated_phrase_at_next_head(self):
-        """ASR 重叠识别: prev 尾部短语重复出现在 curr 开头附近 → 删除重复.
-        残余 "将 timescale" (11 字) 超豁免阈值, 不合并, 保持独立段."""
-        segs = [
-            {"start": 0.0, "end": 7.0, "text": "你死了之后，我们将修改时间尺度输入 engine"},
-            {"start": 7.0, "end": 9.0, "text": "将修改时间尺度输入 engine timescale"},
-        ]
-        out = _merge(segs)
-        assert len(out) == 2
-        # 重复短语被删除, 只保留残余
-        assert out[0]["text"] == "你死了之后，我们将修改时间尺度输入 engine"
-        assert out[1]["text"] == "将 timescale"
+        """ASR 重叠识别: 前段尾部短语重复出现在后段开头 → 整段被判定为重复而丢弃。
 
-    def test_short_dedup_tail_merges_with_exemption(self):
-        """去重残余 <=8 字 (重复句尾巴) → 允许合并到 36 字, 不独立成碎片."""
+        该短段几乎全部由重复内容构成 (9/11 字重叠), 因此被整段丢弃 —— 这是
+        期望行为: 内容是前段的重复, 保留会产出重复字幕。
+        """
         segs = [
-            {"start": 0.0, "end": 6.0, "text": "你死了之后，我们将修改时间尺度输入 engine"},
-            {"start": 6.0, "end": 8.0, "text": "将修改时间尺度输入 engine ts"},
+            {"start": 0.0, "end": 3.0, "text": "将修改时间尺度输入 engine"},
+            {"start": 3.0, "end": 3.9, "text": "输入 engine timescale"},
         ]
-        out = _merge(segs)
+        out = _dedup(segs)
         assert len(out) == 1
-        assert out[0]["text"] == "你死了之后，我们将修改时间尺度输入 engine将 ts"
+        assert out[0]["text"] == "将修改时间尺度输入 engine"
+
+    def test_partial_overlap_keeps_the_new_tail(self):
+        """后段大部分是新内容时, 只去掉重复的那一小段, 新内容保留。"""
+        segs = [
+            {"start": 0.0, "end": 3.0, "text": "这一段说的是把模型下载下来"},
+            {"start": 3.0, "end": 6.0, "text": "把模型下载下来以后我们还要做校验和断句处理"},
+        ]
+        out = _dedup(segs)
+        assert len(out) == 2
+        assert "校验和断句处理" in out[1]["text"]
+        # 重复部分已去掉, 不该原样再出现一次
+        assert out[1]["text"].count("把模型下载下来") == 0
 
     def test_drops_duplicate_short_segment(self):
-        """规则 A: ASR 整句重复识别的短段 (如 0.86s 的
-        '将修改时间尺度输入 engine timescale') 与相邻段高度重叠 → 整段丢弃."""
+        """整句重复识别的短段被丢弃。"""
         segs = [
-            {"start": 13.9, "end": 21.1, "text": "脚本再打印出你死了之后我们将修改时间尺度输入 en gine"},
-            {"start": 21.1, "end": 21.9, "text": "将修改时间尺度输入 engine timescale"},
+            {"start": 0.0, "end": 3.0, "text": "将修改时间尺度输入 engine timescale"},
+            {"start": 3.0, "end": 3.9, "text": "输入 engine timescale"},
         ]
-        out = _merge(segs)
+        out = _dedup(segs)
         assert len(out) == 1
-        assert out[0]["text"] == "脚本再打印出你死了之后我们将修改时间尺度输入 en gine"
+
+    def test_dedups_in_segment_repeated_phrase(self):
+        """段内连续重复短语被清理。"""
+        segs = [{"start": 0.0, "end": 3.0, "text": "我们的计时器如果我们移除我们的计时器如果我们移除"}]
+        out = _dedup(segs)
+        assert out[0]["text"] == "我们的计时器如果我们移除"
 
     def test_keeps_short_segment_without_overlap(self):
-        """规则 A 不误伤: 短段与相邻段无重叠 → 保留并正常合并."""
+        """不与前段重叠的短段保留 (不再被长度规则吞掉)。"""
         segs = [
-            {"start": 0.0, "end": 4.0, "text": "这是一个完整的句子内容"},
-            {"start": 4.0, "end": 4.6, "text": "然后我们继续"},
+            {"start": 0.0, "end": 3.0, "text": "前面一整句话在这里结束"},
+            {"start": 3.0, "end": 3.8, "text": "好"},
         ]
-        out = _merge(segs)
-        assert len(out) == 1
-        assert out[0]["text"] == "这是一个完整的句子内容然后我们继续"
+        out = _dedup(segs)
+        assert len(out) == 2
+        assert out[1]["text"] == "好"
 
-    def test_merges_very_short_segment_into_prev(self):
-        """规则 B: 极短段 (< 1.5s) 读不完, 强制并入前段 (豁免长度上限)."""
-        segs = [
-            {"start": 107.7, "end": 112.4, "text": "free 意味着移除那个节点，所以我们在这里访问玩家"},
-            {"start": 112.4, "end": 112.9, "text": "获取 collision"},
-        ]
-        out = _merge(segs)
-        assert len(out) == 1
-        assert out[0]["text"] == "free 意味着移除那个节点，所以我们在这里访问玩家获取 collision"
-
-    def test_ascii_join_uses_space(self):
-        """英文词相邻 → 空格连接."""
-        segs = [
-            {"start": 0.0, "end": 2.0, "text": "the engine"},
-            {"start": 2.0, "end": 4.0, "text": "timescale is set"},
-        ]
-        out = _merge(segs)
-        assert out[0]["text"] == "the engine timescale is set"
-
-    def test_empty_and_punct_only_input(self):
-        """空输入 / 全标点段 → 空结果."""
-        assert _merge([]) == []
-        assert _merge([{"start": 0, "end": 1, "text": "..."}]) == []
+    def test_empty_input(self):
+        assert _dedup([]) == []
 
 
-class TestPipelineMergeIntegration:
-    def test_stage_correct_merges_fragments_before_correction(self):
-        """_stage_correct 中碎片先合并再修正, 完整句尾标点阻断合并."""
+class TestPipelineIntegration:
+    """_stage_correct 用去重而非合并。"""
+
+    def test_stage_correct_keeps_engine_segmentation(self):
         ctx = PipelineContext(
+            skip_asr=True,
             raw_segments=[
-                {"start": 0.0, "end": 4.0, "text": "我们可以通过改"},
-                {"start": 4.0, "end": 8.0, "text": "变整个游戏。"},
-                {"start": 8.0, "end": 12.0, "text": "你死了之后"},
+                {"start": 0.0, "end": 1.0, "text": "我们可以通过改"},
+                {"start": 1.0, "end": 2.0, "text": "变整个游戏"},
             ],
+            engines_results={},
             enable_deterministic_correction=False,
             enable_punctuation=False,
+            enable_validate=False,
         )
         SubtitlePipeline(ctx)._stage_correct()
-        texts = [s["text"] for s in ctx.corrected_segments]
-        assert texts == ["我们可以通过改变整个游戏。", "你死了之后"]
+        assert len(ctx.corrected_segments) == 2

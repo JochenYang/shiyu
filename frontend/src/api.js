@@ -129,17 +129,74 @@ export async function getEngines() {
  * Get model download/loading status.
  * @returns {Promise<Object>} { status, progress, error, engine_loaded, model_path, model_size_mb }
  */
-export async function getModelStatus() {
-  const res = await fetch(`${API_BASE}/model/status`);
+/**
+ * 列出模型清单与安装状态 (只读, 不触发下载)。
+ * @returns {Promise<Object>} { models: [{id,name,engine,description,languages,installed,sizeBytes,...}], defaultModelID, job, jobs }
+ */
+export async function getModels() {
+  const res = await fetch(`${API_BASE}/models`);
+  if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 /**
- * Trigger or retry model download. Resets error and starts fresh download.
- * @returns {Promise<Object>} { status, progress, error }
+ * 开始下载并安装模型 (非阻塞, 立即返回任务状态)。
+ * @param {string} modelId - 清单中的模型 id
+ * @param {string} source - "auto" (国内镜像优先) 或 "official" (仅官方源)
  */
-export async function restartModelDownload() {
-  const res = await fetch(`${API_BASE}/model/download`, { method: "POST" });
+export async function installModel(modelId, source = "auto") {
+  const formData = new FormData();
+  formData.append("source", source);
+  const res = await fetch(`${API_BASE}/models/${encodeURIComponent(modelId)}/install`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/**
+ * 移除模型 (删除其全部文件)。
+ * @param {string} modelId - 清单中的模型 id
+ */
+export async function removeModel(modelId) {
+  const res = await fetch(`${API_BASE}/models/${encodeURIComponent(modelId)}/remove`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/**
+ * 设置默认识别模型 (持久化到用户配置)。
+ * @param {string} modelId
+ */
+export async function setDefaultModel(modelId) {
+  const res = await fetch(`${API_BASE}/models/${encodeURIComponent(modelId)}/default`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/**
+ * 取消一个运行中的下载任务 (残余保留, 重试可继续)。
+ * @param {string} jobId
+ */
+export async function cancelModelJob(jobId) {
+  const res = await fetch(`${API_BASE}/models/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/**
+ * 列出所有下载任务状态。
+ */
+export async function getModelJobs() {
+  const res = await fetch(`${API_BASE}/models/jobs`);
+  if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
@@ -166,14 +223,13 @@ export async function setLogLevel(level) {
 }
 
 /**
- * Get cloud engine settings from backend.
- * @returns {Promise<Object>} { api_url, model, has_key, enabled }
+/**
+ * 云端多配置: 取全部配置 (脱敏) 与激活 id。
+ * @returns {Promise<Object>} { engines: [{id, api_url, model, has_key, enabled, request_mode, display_name}], active }
  */
-export async function getEngineSettings() {
-  const res = await fetch(`${API_BASE}/settings/engine`);
-  if (!res.ok) {
-    throw new Error(await res.text());
-  }
+export async function getEngineConfigs() {
+  const res = await fetch(`${API_BASE}/settings/engines`);
+  if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
@@ -223,21 +279,15 @@ export async function saveLlmCorrectionSettings(settings) {
 }
 
 /**
- * Save cloud engine configuration to backend.
- * @param {Object} settings - { api_url, api_key, model, enabled }
+ * 云端多配置: 整体保存配置列表与激活项。
+ * @param {Object} payload - { engines: [{id?, api_url, api_key, model, enabled, request_mode, display_name}], active? }
  */
-export async function saveEngineSettings(settings) {
-  const formData = new FormData();
-  formData.append("api_url", settings.api_url || "");
-  formData.append("api_key", settings.api_key || "");
-  formData.append("model", settings.model || "whisper-1");
-  formData.append("enabled", settings.enabled ? "true" : "false");
-  const res = await fetch(`${API_BASE}/settings/engine`, {
+export async function saveEngineConfigsApi(payload) {
+  const res = await fetch(`${API_BASE}/settings/engines`, {
     method: "POST",
-    body: formData,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
-  if (!res.ok) {
-    throw new Error(await res.text());
-  }
+  if (!res.ok) throw new Error(await res.text());
   return res.json();
 }

@@ -16,7 +16,7 @@ class Segment:
     text: str
     # 可选: 逐字符开始时间 (秒, len == len(text)); 仅 zipformer 整段输出时
     # 由 sherpa-onnx 逐 token 时间戳重建, 供细切时精确分配, 其他引擎为 None
-    # 注意: 仅为内部中间态 (zipformer _result_to_segments → _post_process),
+    # 注意: 仅为内部中间态 (sherpa_engine._result_to_segments → caption_builder),
     # to_dict() 不含该字段, 不下发到 API/前端
     char_times: List[float] = None  # type: ignore
 

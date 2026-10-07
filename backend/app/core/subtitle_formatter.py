@@ -40,6 +40,16 @@ def _format_ass_time(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
+def _strip_leading_punct(text: str) -> str:
+    """去掉行首的句读标点。
+
+    逐行字幕接续上一行时, CORRECT 阶段的段首连词规则可能在行首留
+    逗号 ("…，" + "，然后…"), 观感差且不影响语义 —— 标点只在行尾
+    有意义。已生成的旧 SRT 重新导出时也走这里, 无需重新转录。
+    """
+    return text.lstrip("，、；：,;:.。！？!？… ")
+
+
 def _split_long_lines(text: str, max_length: int = 40, max_lines: int = 2) -> str:
     """将长文本切分为多行字幕（行间用 \\N 连接）。
 
@@ -97,7 +107,7 @@ def generate_srt(segments: List[SubtitleSegment],
     """
     lines = []
     for i, seg in enumerate(segments, 1):
-        text = seg.text
+        text = _strip_leading_punct(seg.text)
         if len(text) > max_line_length:
             text = _split_long_lines(text, max_line_length, max_line_count)
         lines.append(str(i))
@@ -115,9 +125,8 @@ def generate_lrc(segments: List[SubtitleSegment]) -> str:
     lines = []
     for seg in segments:
         time_tag = _format_lrc_time(seg.start)
-        lines.append(f"{time_tag}{seg.text}")
+        lines.append(f"{time_tag}{_strip_leading_punct(seg.text)}")
     return "\n".join(lines)
-
 
 def generate_ass(segments: List[SubtitleSegment],
                  title: str = "Subtitle",
@@ -147,8 +156,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for seg in segments:
         start = _format_ass_time(seg.start)
         end = _format_ass_time(seg.end)
-        # Escape ASS special chars
-        text = seg.text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+        # Escape ASS special chars (行首句读标点先清理, 与 SRT/LRC 一致)
+        text = _strip_leading_punct(seg.text).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
         event_lines.append(
             f"Dialogue: 0,{start},{end},{style_name},,0,0,0,,{text}"
         )
@@ -162,76 +171,29 @@ def _join_text(prev_text: str, curr_text: str) -> str:
     return prev_text + sep + curr_text
 
 
-def segments_from_transcription(segments_raw: List[Dict],
-                                 merge_gap: float = 0.5) -> List[SubtitleSegment]:
-    """Convert raw transcription segments to SubtitleSegment objects.
+def segments_from_transcription(segments_raw: List[Dict]) -> List[SubtitleSegment]:
+    """把流水线输出的原始段转成 SubtitleSegment。
 
-    merge_gap=0.5 re-joins nearby short segments into natural subtitle
-    events (especially important for mixed Chinese-English speech where
-    CTC splitting can be too granular).
+    这里**不再合并相邻段**。字幕行已由引擎在已测量的词边界上断好 (见
+    ``caption_builder``), 格式化层再按「间隔小就拼起来」合并会把断句结果
+    重新打回一整行 —— 实测 3 行 (0.01-1.11 / 1.45-2.87 / 2.89-4.65) 被拼成
+    一个 4.65 秒的单条字幕。
 
-    Also merges segments that are too short (< 1.5s) to be readable
-    on screen, even if they exceed the 80-char combined limit.
+    Args:
+        segments_raw: ``[{"start": float, "end": float, "text": str}, ...]``
+
+    Returns:
+        ``SubtitleSegment`` 列表, 顺序与时间均与输入一致 (仅剔除空文本)。
     """
     result = []
     for seg in segments_raw:
-        s = SubtitleSegment(
-            start=seg.get("start", 0.0),
-            end=seg.get("end", 0.0),
-            text=seg.get("text", "").strip()
-        )
-        if s.text:
-            result.append(s)
-
-    # Multi-pass merge: keep merging while any segment is too short
-    if len(result) > 1 and merge_gap > 0:
-        MIN_READABLE_DURATION = 1.5  # seconds — anything shorter is unreadable
-        MAX_COMBINED_LEN = 80  # max combined text length
-
-        # First pass: merge if gap small AND combined text <= 80 chars
-        for _ in range(10):  # cap iterations to avoid infinite loop
-            merged = [result[0]]
-            changed = False
-            for curr in result[1:]:
-                prev = merged[-1]
-                gap = curr.start - prev.end
-                prev_duration = prev.end - prev.start
-
-                # Normal merge: small gap AND text not too long
-                if gap <= merge_gap and len(prev.text) + len(curr.text) < MAX_COMBINED_LEN:
-                    prev.end = curr.end
-                    if curr.text and curr.text not in prev.text:
-                        prev.text = _join_text(prev.text, curr.text)
-                    changed = True
-                else:
-                    merged.append(curr)
-            result = merged
-            if not changed:
-                break
-
-        # Second pass: merge SHORT segments with their neighbor
-        # (but stop once a segment reaches MAX_COMBINED_LEN or MIN_READABLE_DURATION)
-        for _ in range(5):
-            merged = [result[0]]
-            changed = False
-            for curr in result[1:]:
-                prev = merged[-1]
-                gap = curr.start - prev.end
-                prev_duration = prev.end - prev.start
-                prev_len = len(prev.text)
-
-                # Merge prev into curr if prev is too short and prev hasn't grown too long
-                if prev_duration < MIN_READABLE_DURATION and gap <= merge_gap * 2:
-                    # Cap: don't let prev exceed MAX_COMBINED_LEN
-                    if prev_len < MAX_COMBINED_LEN:
-                        prev.end = curr.end
-                        if curr.text and curr.text not in prev.text:
-                            prev.text = _join_text(prev.text, curr.text)
-                        changed = True
-                        continue  # don't append curr, it's merged
-                merged.append(curr)
-            result = merged
-            if not changed:
-                break
-
+        text = (seg.get("text") or "").strip()
+        if text:
+            result.append(
+                SubtitleSegment(
+                    start=seg.get("start", 0.0),
+                    end=seg.get("end", 0.0),
+                    text=text,
+                )
+            )
     return result

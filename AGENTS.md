@@ -6,13 +6,14 @@
 
 ## 项目概述
 
-**时语 Shiyu Subtitle** 是一款基于 Tauri + Vue 3 + SenseVoice-Small 的极速、轻量级、100% 离线本地 AI 字幕生成与精修桌面应用。项目定位为创作者、开发者和极客提供纯粹的本地字幕体验。
+**时语 Shiyu Subtitle** 是一款基于 Tauri + Vue 3 + sherpa-onnx 的极速、轻量级、100% 离线本地 AI 字幕生成与精修桌面应用。项目定位为创作者、开发者和极客提供纯粹的本地字幕体验。
 
 ### 核心特性
 
 - **100% 本地离线**：无需云端 API，音视频数据不上传
-- **多 ASR 引擎**：Zipformer-CTC-zh (主走)、Paraformer-large (CIF 边界更准, 可选)、SenseVoice-Small (多语言备选)、Cloud (OpenAI 兼容 API)
-- **智能断句**：三级分段策略（句子→逗号→硬切），自研智能验算词典
+- **清单式模型管理**：模型由 `backend/config/models.json` 声明（固定 revision + 逐文件 SHA-256），支持下载/续传/校验/移除
+- **多 ASR 引擎**：Zipformer-CTC-zh（主走中文，逐 token 时间戳最细）、SenseVoice-Small（中英日韩粤，轻量）、FireRedASR2-CTC（20+ 方言）、Cloud（OpenAI 兼容 API）
+- **测量驱动断句**：在引擎逐 token 时间戳还原的**已测量词边界**上做最小代价 DP 切分，不用字符数比例插值
 - **CTC 峰值补偿**：-150ms 时间戳偏移补偿，对齐声音波形
 - **现代 UI**：深色磨砂玻璃微动效界面，波形同步预览
 - **静默后台守护**：后端打包为 PyInstaller 单文件，无需 Python 运行时
@@ -25,12 +26,37 @@ Tauri GUI (Vue 3 / Vite / Naive UI)
     ↕ 本地 Localhost HTTP API (FastAPI)
 Rust 进程控制器 (Tauri Core)
     ↕ 拉起/销毁
-PyInstaller 单文件后端 (FastAPI + ONNX Runtime)
+PyInstaller 单文件后端 (FastAPI + sherpa-onnx)
     ↕ ONNX 推理
-SenseVoice-Small / Zipformer-CTC-zh 模型 (~/.shiyu/models/)
+Zipformer / SenseVoice / FireRedASR2 模型 (~/.shiyu/models/)
 ```
 
 ---
+
+## 模型管理（清单式）
+
+模型**不在代码里硬编码**，全部由 `backend/config/models.json` 声明：每个模型带 `repository` + 固定 `revision`（40 位 commit，不用 `main`）、每个文件的精确字节数与 SHA-256。
+
+- `app/core/model_catalog.py` — 清单查询、路径安全（拒绝符号链接与越界）、可用性判断（只比大小，快）。**可用性查询永远不触发下载。**
+- `app/core/model_download.py` — `.part` 暂存 → HTTP Range 续传 → SHA-256 校验 → 原子替换；下载前查磁盘余量；多镜像共用同一份校验值；`install` 与 `remove` 对称。
+- `app/core/sherpa_engine.py` — 所有本地模型共用一条推理路径，区别只在 sherpa-onnx 工厂方法、工厂参数组装与 token→字符时间的映射方式；多文件模型（Qwen3-ASR 的 conv_frontend+encoder+decoder+tokenizer）由 `_factory_args` 按文件名特征映射，不在代码里写死路径。
+
+新增模型只改清单，不动代码。API：`GET /models`、`POST /models/{id}/install`、`POST /models/{id}/remove`、`POST /models/jobs/{id}/cancel`。
+
+---
+
+## 字幕断句
+
+断句在**已测量的词边界**上做最小代价 DP，而不是按字符数比例切分：
+
+- `app/core/text_units.py` — `protected_ranges`（`0.1`/`1/30`/`5GHz`/`C++` 等数值与标识符不被标点清理破坏）、`display_length`（ASCII 记半宽）、`clean_generated_text`
+- `app/core/semantic_breaks.py` — `phrase_partition`（DP 代价：段尾虚词加罚、段首虚词加罚、真实停顿减罚、句读减罚、引导词减罚）、`coordinated_ranges`（并列结构整体保留）
+- `app/core/caption_builder.py` — 把逐字符时间戳经 jieba 词边界聚成测量词，再交给 DP 切分；**时间戳全部来自测量值，长度不匹配时直接报错而不是猜测**
+
+时间信号来源：Zipformer 的 byte-level BPE token 经 `bbpe_map` 还原到逐字符；SenseVoice / FireRedASR2-CTC 的 token 本身即字符。
+
+---
+
 
 ## 目录结构
 
@@ -41,37 +67,37 @@ shiyu/
 │   │   ├── main.py             # FastAPI 应用入口, REST API 定义
 │   │   └── core/               # 后端核心模块
 │   │       ├── engine_base.py          # 引擎统一抽象基类
-│   │       ├── engine_registry.py      # 引擎注册中心
-│   │       ├── sensevoice_engine.py    # SenseVoice ONNX 推理引擎
-│   │       ├── zipformer_engine.py     # Zipformer-CTC-zh (sherpa-onnx)
-│   │       ├── paraformer_engine.py    # Paraformer-large (sherpa-onnx)
 │   │       ├── cloud_engine.py         # 云端 OpenAI/DashScope 引擎
-│   │       ├── pipeline.py             # 字幕生成流水线编排器 (4 阶段)
-│   │       ├── audio_processor.py      # 音频预处理 (fbank/LFR/CMVN)
-│   │       ├── model_downloader.py     # 模型自动下载
+│   │       ├── pipeline.py             # 字幕生成流水线编排器
+│   │       ├── audio_processor.py      # 音频抽取 (ffmpeg)
+│   │       ├── model_catalog.py        # 模型清单 (pinned revision + SHA-256)
+│   │       ├── model_download.py       # 校验下载 / 续传 / 原子发布 / 安装移除
+│   │       ├── sherpa_engine.py        # sherpa-onnx 统一推理路径 (所有本地模型)
+│   │       ├── caption_builder.py      # 逐字符时间 → 测量词 → 字幕行
+│   │       ├── semantic_breaks.py      # 最小代价 DP 断句
+│   │       ├── text_units.py           # 功能性写法保护 + 显示宽度
 │   │       ├── ffmpeg_downloader.py    # FFmpeg 自动下载
-│   │       ├── vad_detector.py         # Silero-VAD 语音活动检测
-│   │       ├── asr_corrector.py        # 确定性 ASR 修正 (智能验算词典)
-│   │       ├── punctuation.py          # 标点恢复 (Rule + NN stub)
+│   │       ├── asr_corrector.py        # 确定性 ASR 修正 (验算词典)
+│   │       ├── punctuation.py          # 标点恢复 (规则版)
 │   │       ├── subtitle_formatter.py   # SRT/LRC/ASS 格式化
-│   │       ├── subtitle_validator.py   # 字幕校验器
-│   │       ├── text_splitter.py        # 文本切分工具
+│   │       ├── text_splitter.py        # 停顿阈值等共享常量
 │   │       ├── itn.py                  # 逆文本归一化 (中文数字→阿拉伯)
-│   │       ├── post_process.py         # 统一后处理管线
+│   │       ├── bbpe_map.py             # byte-level BPE → 逐字符时间
 │   │       └── config_loader.py        # YAML 配置加载
+│   ├── config/
+│   │   └── models.json         # 模型清单 (下载地址/校验值/大小)
 │   ├── run_server.py           # 后端启动入口 (uvicorn)
 │   ├── build.py                # PyInstaller 打包脚本
 │   ├── config.yaml             # 后端配置文件
 │   ├── requirements.txt        # Python 依赖
 │   └── tests/                  # 测试目录
 │       └── core/
+│           ├── test_model_management.py   # 清单/下载/校验/安装移除/取消
+│           ├── test_caption_rules.py      # 文本单元/测量词/DP 断句
+│           ├── test_engine_routing.py     # 引擎路由与端点
 │           ├── test_pipeline_v2.py
-│           ├── test_zipformer_engine.py
 │           ├── test_audio_extraction.py
-│           ├── test_cloud_engine_config_routing.py
-│           ├── test_cloud_engine_errors.py
-│           ├── test_zipformer_e2e_real.py
-│           └── test_zipformer_engine.py
+│           └── test_cloud_engine_*.py
 ├── frontend/                   # Vue 3 前端
 │   ├── src/
 │   │   ├── main.js             # Vue 入口
@@ -87,10 +113,6 @@ shiyu/
 │   │   └── tauri.conf.json     # Tauri 配置
 │   ├── package.json
 │   └── vite.config.js
-├── models/                     # 模型文件 (开发环境)
-│   └── sensevoice-small/
-│       ├── config.yaml
-│       └── tokens.json
 ├── .github/workflows/
 │   └── release.yml             # CI/CD 发布工作流
 └── AGENTS.md                   # 本文档
@@ -119,10 +141,7 @@ shiyu/
 |------|---------|------|
 | Web 框架 | FastAPI 0.104+ | REST API 服务 |
 | ASGI 服务器 | Uvicorn 0.24+ | HTTP 服务 |
-| 推理引擎 | onnxruntime 1.16+ | ONNX 模型推理 |
-| 音频处理 | librosa 0.10+ | 音频加载 |
-| 音频特征 | kaldi-native-fbank 1.1 | fbank 特征提取 |
-| 语音识别 | sherpa-onnx 1.10+ | Zipformer/Paraformer 引擎 |
+| 推理引擎 | sherpa-onnx 1.13+ | 本地 ASR 模型推理 (统一路径) |
 | 字幕格式 | pysubs2 1.6+ | SRT/LRC/ASS 生成 |
 | 配置 | PyYAML 6.0+ | YAML 配置解析 |
 | 打包 | PyInstaller | 单文件可执行程序 |
@@ -144,20 +163,26 @@ shiyu/
 
 ### 引擎列表
 
-| 引擎标识符 | 类名 | 类型 | 语言 | 说明 |
-|-----------|------|------|------|------|
-| `zipformer_local` | `ZipformerEngine` | 本地 | 中文 | 主走, sherpa-onnx, 350MB int8 |
-| `sensevoice_local` | `SenseVoiceEngine` | 本地 | zh/en/ja/ko/yue | 多语言备选, ONNX Runtime, 230MB |
-| `paraformer_local` | `ParaformerEngine` | 本地 | 中文 | 备选, CIF 边界 ±20ms, 232MB |
-| `cloud` | `CloudTranscriber` | 云端 | 多语言 | OpenAI/DashScope 兼容 API |
+引擎由 `backend/config/models.json` 的 `engine_name` 决定，注册时未安装的模型不会出现在可选列表中。
 
+| 引擎标识符 | 模型 | 语言 | 大小 (int8) |
+|-----------|------|------|------|
+| `zipformer_local` | Zipformer-CTC-zh | 中文 | 350MB |
+| `sensevoice_local` | SenseVoice Small | zh/en/ja/ko/yue | 228MB |
+| `firered_local` | FireRedASR2-CTC | zh/en + 20+ 方言 | 740MB |
+| `qwen3_asr_local` | Qwen3-ASR-0.6B | 中英日韩粤 | 941MB |
+| `cloud` / `cloud:<id>` | 云端配置 (可多个并存) | 多语言 | — |
+
+对齐器 `qwen3-forced-aligner-0.6b` (1GB, 清单 `aligner` 节点) 不是 ASR 引擎:
+它拿「音频 + 已识别文本」产出逐词时间, 在 ASR 后由 pipeline 的 `_align_segments`
+自动为无逐字符时间的段补测量时间; 不出现在识别下拉, 但在模型面板可下载/移除。
 ### 流水线 (v2.0)
 
 字幕生成分为 4 个阶段：
 
-1. **ASR** — 主引擎转录 (Zipformer/SenseVoice/Paraformer)
-2. **CORRECT** — 确定性修正 + ITN + 标点恢复
-3. **VALIDATE** — 字幕校验 (轻量日志)
+1. **ASR** — 引擎转录，输出带逐字符时间戳的段
+2. **CORRECT** — 跨段碎片合并 + glossary 替换 + 确定性修正（含标点）
+3. **VALIDATE** — 时间戳自检（只记日志，不修改）
 4. **FORMAT** — SRT/LRC/ASS 格式化输出
 
 流水线通过 `PipelineContext` 传递中间结果，每个阶段独立可测，异常降级。
@@ -171,14 +196,9 @@ shiyu/
 ```yaml
 model:
   dir: "~/.shiyu/models"
-  onnx: "sensevoice-small/model.onnx"
-  tokens: "sensevoice-small/tokens.json"
 
 audio:
   sample_rate: 16000
-  n_mels: 80
-  lfr_m: 7        # Low Frame Rate 参数
-  lfr_n: 6
   max_duration: 300  # 秒, 超长则切分
 
 inference:
@@ -191,17 +211,22 @@ server:
   port: 11235
   cors_origins: ["http://localhost:1420", "tauri://localhost"]
 
+# key 必须与 config/models.json 的 engine_name 一致
 engines:
-  paraformer:
+  zipformer_local:
     enabled: true
-    model_dir: "~/.shiyu/models/paraformer-large"
     num_threads: 4
-  zipformer:
+    ctc_delay_sec: 0.15
+  sensevoice_local:
     enabled: true
-    model_dir: "~/.shiyu/models/zipformer-ctc-zh"
-  sensevoice:
+    num_threads: 4
+  firered_local:
     enabled: true
-    model_dir: "~/.shiyu/models/sensevoice-small"
+    num_threads: 4
+  qwen3_asr_local:
+    enabled: true
+    num_threads: 4
+    ctc_delay_sec: 0.0
 ```
 
 ### 云端配置 (`~/.shiyu/config.json`)
@@ -276,7 +301,7 @@ GitHub Actions 工作流位于 `.github/workflows/release.yml`：
 | 测试文件 | 覆盖内容 |
 |---------|---------|
 | `test_pipeline_v2.py` | 4 阶段流水线 (ASR/CORRECT/VALIDATE/FORMAT) |
-| `test_zipformer_engine.py` | 引擎导入安全、is_available 路径、配置解析、结果转换、E2E |
+| `test_model_management.py` | 清单完整性、路径安全、续传/校验/原子发布、安装移除、取消 |
 | `test_audio_extraction.py` | ffmpeg 错误处理、输出验证 |
 | `test_cloud_engine_*.py` | 云端引擎配置路由、错误处理 |
 
@@ -309,7 +334,7 @@ GitHub Actions 工作流位于 `.github/workflows/release.yml`：
 - **最小正确**：不改无关文件、不顺手重构、不增加当前不需要的抽象
 - **不变性**：流水线每阶段不修改输入 segments，返回新对象或浅拷贝
 - **降级**：任何阶段异常不中断流水线，降级到上一个稳定状态
-- **引擎可插拔**：所有引擎实现 `BaseTranscriber` 接口，`main.py` 中通过 `engine_registry` 统一注册
+- **引擎可插拔**：所有引擎实现 `BaseTranscriber` 接口，`main.py` 按模型清单注册
 
 ---
 
@@ -321,17 +346,16 @@ GitHub Actions 工作流位于 `.github/workflows/release.yml`：
 
 | 模型 | 路径 | 大小 | 来源 |
 |------|------|------|------|
-| SenseVoice-Small | `~/.shiyu/models/sensevoice-small/` | ~230MB | ModelScope / HF Mirror |
-| Zipformer-CTC-zh | `~/.shiyu/models/zipformer-ctc-zh/` | ~350MB | sherpa-onnx 模型 |
-| Paraformer-large | `~/.shiyu/models/paraformer-large/` | ~232MB | sherpa-onnx 模型 |
-| Silero-VAD | `~/.shiyu/models/silero-vad/` | ~20MB | PyPI / HF Mirror |
-| 标点模型 | `~/.shiyu/models/punc_ct-transformer/` | ~50MB | ModelScope (stub) |
+| Zipformer-CTC-zh | `~/.shiyu/models/zipformer-ctc-zh/` | 350MB | HuggingFace (pinned) |
+| SenseVoice-Small | `~/.shiyu/models/sensevoice-small/` | 228MB | HuggingFace (pinned) |
+| FireRedASR2-CTC | `~/.shiyu/models/fire-red-asr2-ctc/` | 740MB | HuggingFace (pinned) |
+| Qwen3-ASR-0.6B | `~/.shiyu/models/qwen3-asr-0.6b/` | 941MB | HuggingFace (pinned) |
 
 ### 模型下载策略
 
-- 首次启动自动下载（后台线程，非阻塞）
-- 多源降级：ModelScope → HF Mirror → GitHub Release
-- 下载进度通过 API `/model/status` 返回给前端
+- **不再自动下载**: 启动只报告安装状态, 下载必须由用户在「模型」面板显式发起
+- 多源降级：HF-Mirror → HuggingFace 官方 (同一份 SHA-256)
+- 下载进度通过 API `/models` 返回给前端 (含阶段、字节数、速度)
 - 从 Tauri 资源包中迁移（生产环境安装包内嵌）
 
 ---
@@ -365,10 +389,17 @@ GitHub Actions 工作流位于 `.github/workflows/release.yml`：
 |------|------|
 | v1.0 | 初始版本, SenseVoice 单引擎 |
 | v2.0 | 重构为多引擎体系, Zipformer 主走, 砍 FUSE/CLAUSE/LLM 阶段, 4 阶段流水线 |
-| v2.1 | Paraformer-CIF 接入 (CIF 边界精度更高), 引擎配置化；主走引擎经回归评估仍为 Zipformer-CTC |
+| v2.1 | Paraformer-CIF 接入, 引擎配置化；主走引擎经回归评估仍为 Zipformer-CTC |
+| v2.2 | 模型层改为清单式管理 (pinned revision + SHA-256 + 断点续传 + 安装/移除)；本地模型统一走 sherpa-onnx；断句改为在已测量词边界上做最小代价 DP 切分 |
+| v2.3 | 新增 Qwen3-ASR-0.6B (多文件模型, `sherpa_engine._factory_args` 按文件名映射工厂参数)；云端配置改为合并写入, 不再静默丢掉 `request_mode`/`auth_header` 等字段。Whisper 评估后未纳入：sherpa-onnx 的 Whisper 导出缺 cross-attention, 拿不到逐 token 时间戳 |
+| v2.4 | 强制对齐器接入 (`aligner` 清单节点 + `forced_aligner.py`, onnxruntime+tokenizers+librosa mel, 不引 transformers)；无逐字符时间的段由 pipeline `_align_segments` 自动补测量时间；修复 DP 行级 char_times 丢失 (v2.2 起) 与下载器嵌套路径；云端配置多化 (`engines` 列表 + `active_engine`, 引擎下拉同时显示)；设置页新增「关于」页 (仓库地址/问题反馈) |
 
 ### 废弃功能
 
 - Bcut (必剪) 和 Jianying (剪映) 免费 ASR 引擎 (2026 年 5 月移除，API 不可达)
 - LLM 修正层 (owner 决策，太慢)
-- 基于 VAD 的单独断句阶段 (sherpa-onnx 自带 CTC 分段 + Silero-VAD 冗余)
+- Paraformer 引擎与其 232MB 模型 (无验证收益，且从未接入下载器)
+- 标点 NN 后端与其约 50MB 下载链 (`is_available()` 恒为 False，从未生效)
+- Silero-VAD 与运行期 `pip install` 路径 (逐字符测量时间戳已覆盖其作用)
+- 自研 SenseVoice ONNX 推理 + fbank/LFR/CMVN 预处理 (改由 sherpa-onnx 原生实现)
+- 云端 CTC 时间戳精修 (依赖已在 v2.2 删除的 `ctc_aligner`，实际永远返回 None)

@@ -11,12 +11,11 @@ Cloud transcription engine supporting both:
 import base64
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 
 import requests
 
@@ -86,29 +85,165 @@ _DASHSCOPE_MAX_B64_BYTES = int(9.5 * 1024 * 1024)
 
 
 def load_engine_config() -> Dict[str, Any]:
-    """Load cloud engine config from ~/.shiyu/config.json"""
+    """Load the ACTIVE cloud engine config from ~/.shiyu/config.json.
+
+    支持多配置并存 (v2.4):
+      * ``engines``: 配置列表, 每项 {id, api_url, api_key, model, enabled,
+        request_mode, display_name, auth_header}
+      * ``active_engine``: 当前激活配置的 id
+      * ``engine``: 历史单配置字段, 保留为激活项的镜像 (旧代码/旧前端兼容)
+
+    读取顺序: active_engine 命中 engines 列表 → 该项; 否则回落到
+    历史 ``engine`` 字段; 都没有 → 默认空配置。返回激活项的**全部**
+    字段 (不只已知键) —— 白名单式读取会把 ``request_mode`` 等
+    静默丢掉, 而转录路由正靠它决定走 whisper 还是 chat_completions。
+    """
     defaults = {"api_url": "", "api_key": "", "model": "", "enabled": False}
     if not CONFIG_FILE.exists():
         return dict(defaults)
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        cfg = data.get("engine", {})
-        result = dict(defaults)
-        result.update({k: cfg[k] for k in result if k in cfg})
-        return result
     except (json.JSONDecodeError, IOError):
         return dict(defaults)
 
+    engines = data.get("engines")
+    active_id = data.get("active_engine")
+    if isinstance(engines, list) and active_id:
+        for item in engines:
+            if isinstance(item, dict) and item.get("id") == active_id:
+                result = dict(defaults)
+                result.update(item)
+                return result
 
-def save_engine_config(api_url: str, api_key: str, model: str, enabled: bool) -> None:
-    """Save cloud engine config to ~/.shiyu/config.json"""
+    # 回落: 历史 engine 字段 (旧配置文件没有 engines 列表)
+    cfg = data.get("engine")
+    if not isinstance(cfg, dict):
+        return dict(defaults)
+    result = dict(defaults)
+    result.update(cfg)
+    return result
+
+
+def list_engine_configs() -> List[Dict[str, Any]]:
+    """全部云端配置 (含未启用的), 每项带 id。
+
+    首次迁移: 磁盘上只有历史 ``engine`` 字段时, 把它包装成列表第一项,
+    不改写磁盘 (写入时才落 engines), 保证只读路径无副作用。
+    """
+    if not CONFIG_FILE.exists():
+        return []
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+    engines = data.get("engines")
+    items: List[Dict[str, Any]] = []
+    if isinstance(engines, list):
+        for item in engines:
+            if isinstance(item, dict) and item.get("id"):
+                items.append(dict(item))
+    if not items:
+        cfg = data.get("engine")
+        if isinstance(cfg, dict) and (cfg.get("api_url") or cfg.get("api_key") or cfg.get("model")):
+            legacy = dict(cfg)
+            legacy["id"] = "cloud"
+            items.append(legacy)
+    return items
+
+
+def _new_engine_id() -> str:
+    import uuid
+
+    return f"cloud-{uuid.uuid4().hex[:8]}"
+
+
+def save_engine_configs(items: List[Dict[str, Any]], active_id: Optional[str] = None) -> None:
+    """整体写入云端配置列表与激活项, 并把激活项镜像到历史 ``engine`` 字段。
+
+    旧代码 (transcribe_cloud 等) 只读 ``engine``; 镜像保证它们无需改动
+    也始终读到激活配置。镜像只复制已知字段, 不携带 id。
+    """
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {}
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    data["engine"] = {"api_url": api_url, "api_key": api_key, "model": model, "enabled": enabled}
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+
+    clean: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        if not entry.get("id"):
+            entry["id"] = _new_engine_id()
+        clean.append(entry)
+
+    data["engines"] = clean
+    if active_id is None and clean:
+        active_id = clean[0]["id"]
+    if active_id and not any(e.get("id") == active_id for e in clean):
+        active_id = clean[0]["id"] if clean else None
+    data["active_engine"] = active_id
+
+    # 镜像激活项到历史 engine 字段 (旧读取路径兼容)
+    mirror: Dict[str, Any] = {}
+    if active_id:
+        for e in clean:
+            if e.get("id") == active_id:
+                mirror = {k: v for k, v in e.items() if k != "id"}
+                break
+    if mirror:
+        data["engine"] = mirror
+
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp.replace(CONFIG_FILE)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass  # Windows may not support chmod
+
+def save_engine_config(
+    api_url: str,
+    api_key: str,
+    model: str,
+    enabled: bool,
+    request_mode: Optional[str] = None,
+    display_name: Optional[str] = None,
+) -> None:
+    """Save cloud engine config to ~/.shiyu/config.json
+
+    只覆盖表单传回的字段, 保留磁盘上已有的其它字段
+    (``request_mode``/``display_name``/``auth_header`` 等)。
+    整个字典直接赋值会把用户在界面上看不到的字段全部抹掉。
+
+    ``request_mode`` 与 ``display_name`` 传 None 时保留原值;
+    传空字符串时同样保留原值 (避免旧前端把配置清空)。
+    """
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+    existing = data.get("engine")
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update({"api_url": api_url, "model": model, "enabled": enabled})
+    # 空 key 不覆盖已有密钥, 与 LLM 修正配置保持一致
+    merged["api_key"] = api_key if api_key else merged.get("api_key", "")
+    if request_mode:
+        merged["request_mode"] = request_mode
+    if display_name:
+        merged["display_name"] = display_name
+    data["engine"] = merged
     tmp = CONFIG_FILE.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -173,17 +308,23 @@ def save_llm_correction_config(enabled: bool, provider: str, api_url: str,
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     data: Dict[str, Any] = {}
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    existing = data.get("llm_correction", {})
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+    existing = data.get("llm_correction")
+    existing = existing if isinstance(existing, dict) else {}
     resolved_key = api_key if api_key else existing.get("api_key", "")
-    data["llm_correction"] = {
+    merged = dict(existing)
+    merged.update({
         "enabled": enabled,
         "provider": provider,
         "api_url": api_url,
         "api_key": resolved_key,
         "model": model,
-    }
+    })
+    data["llm_correction"] = merged
     tmp = CONFIG_FILE.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -653,163 +794,6 @@ def _transcribe_dashscope_payload_impl(compressed_path: str, api_url: str, api_k
     return text
 
 
-def _refine_timestamps_with_ctc(audio_path: str, full_text: str,
-                                 sample_rate: int,
-                                 original_segments: list) -> list:
-    """Refine segment timestamps using SenseVoice CTC forced alignment.
-
-    When SenseVoice model is available, uses CTC Viterbi alignment to get
-    accurate frame-level timestamps for the DashScope-transcribed text.
-    Falls back to original segments if model or alignment fails.
-
-    Args:
-        audio_path: Path to the audio file.
-        full_text: Full transcription text from DashScope.
-        sample_rate: Audio sample rate.
-        original_segments: Original segments to fall back on.
-
-    Returns:
-        Refined segment list with improved timestamps, or None on failure.
-    """
-    import logging
-    import numpy as np
-    _log = logging.getLogger("shiyu")
-
-    # Try to load SenseVoice model + SentencePiece
-    try:
-        # 1. Load audio
-        import librosa
-        waveform, sr = librosa.load(audio_path, sr=sample_rate, mono=True)
-        audio_duration = len(waveform) / sr
-
-        # 2. Compute fbank features
-        from app.core.audio_processor import compute_fbank_kaldi, apply_lfr, apply_cmvn, load_cmvn
-        from app.core.model_downloader import get_model_dir
-
-        model_dir = get_model_dir()
-        if not os.path.exists(os.path.join(model_dir, "model.onnx")):
-            return None
-
-        # 3. Load SentencePiece for forced alignment
-        import sentencepiece as spm
-        sp_model = None
-        for fname in os.listdir(model_dir):
-            if fname.endswith(".bpe.model"):
-                sp_model = spm.SentencePieceProcessor()
-                sp_model.Load(os.path.join(model_dir, fname))
-                break
-        if sp_model is None:
-            return None
-
-        # 4. Load ONNX and run encoder
-        import onnxruntime as ort
-        session = ort.InferenceSession(
-            os.path.join(model_dir, "model.onnx"),
-            providers=["CPUExecutionProvider"]
-        )
-
-        # 5. Compute fbank
-        audio_cfg = {"n_mels": 80, "frame_length": 25, "frame_shift": 10}
-        fbank = compute_fbank_kaldi(waveform, sr,
-                                     n_mels=audio_cfg["n_mels"],
-                                     frame_length=audio_cfg["frame_length"],
-                                     frame_shift=audio_cfg["frame_shift"])
-        lfr_features = apply_lfr(fbank, m=7, n=6)
-        cmvn_path = os.path.join(model_dir, "am.mvn")
-        if os.path.exists(cmvn_path):
-            cmvn = load_cmvn(cmvn_path)
-            features = apply_cmvn(lfr_features, cmvn)
-        else:
-            features = lfr_features
-        features = features[np.newaxis, :, :].astype(np.float32)
-        input_len = np.array([features.shape[1]], dtype=np.int32)
-
-        # Language = auto (id 0), text_norm = withitn (id 14)
-        lang_id = np.array([0], dtype=np.int64)
-        text_norm = np.array([14], dtype=np.int64)
-
-        input_names = [inp.name for inp in session.get_inputs()]
-        onnx_inputs = {
-            input_names[0]: features,
-            input_names[1]: input_len,
-            input_names[2]: lang_id,
-            input_names[3]: text_norm,
-        }
-        outputs = session.run(None, onnx_inputs)
-        logits = outputs[0][0]  # [T, V]
-
-        # 6. Run forced alignment
-        try:
-            from app.core.ctc_aligner import align_text_to_timestamps
-        except ModuleNotFoundError:
-            # ctc_aligner 已移除 (v2.2), 回退原始 segments
-            return None
-        char_timestamps = align_text_to_timestamps(
-            logits, full_text, sp_model,
-            frame_to_sec=0.06, ctc_delay_sec=0.15
-        )
-
-        if not char_timestamps:
-            return None
-
-        # 7. Split text into subtitle segments
-        is_cjk = text_splitter.is_mostly_cjk(full_text)
-        max_len = text_splitter.DEFAULT_MAX_CHARS if is_cjk else text_splitter.DEFAULT_MAX_CHARS_EN  # Phase 1: 引用 text_splitter 共享常量
-        sub_texts = text_splitter.split_text_for_subtitles(full_text, max_len, is_cjk)
-        if not sub_texts:
-            return None
-
-        # 8. Map segments to aligned timestamps
-        # Build char-index → timestamp lookup
-        char_map = []
-        for ct in char_timestamps:
-            if ct["char"].strip():
-                char_map.append((ct["char"], ct["start"], ct["end"]))
-
-        # Walk through sub_texts sequentially, accumulating character positions
-        segments = []
-        char_pos = 0
-        for sub in sub_texts:
-            seg_chars = list(sub)
-            seg_len = len(seg_chars)
-            if seg_len == 0:
-                continue
-            end_pos = min(char_pos + seg_len, len(char_map))
-            if end_pos <= char_pos:
-                continue
-            start_sec = char_map[char_pos][1]
-            end_sec = char_map[end_pos - 1][2]
-            # Enforce minimum 0.5s duration
-            if end_sec - start_sec < 0.5:
-                end_sec = start_sec + 0.5
-            segments.append({
-                "start": round(start_sec, 3),
-                "end": round(end_sec, 3),
-                "text": sub
-            })
-            char_pos = end_pos
-
-        if segments:
-            # Fix boundaries: ensure no overlap
-            for i in range(len(segments) - 1):
-                if segments[i]["end"] < segments[i + 1]["start"]:
-                    segments[i]["end"] = segments[i + 1]["start"]
-                elif segments[i]["end"] > segments[i + 1]["start"]:
-                    segments[i]["end"] = segments[i + 1]["start"]
-            # Clamp last segment duration
-            if segments:
-                segments[-1]["end"] = min(
-                    max(segments[-1]["end"], segments[-1]["start"] + 0.5),
-                    audio_duration
-                )
-            _log.info(f"[CTC Align] Refined {len(segments)} segments with forced alignment")
-            return segments
-
-    except Exception as e:
-        _log.warning(f"[CTC Align] Failed, falling back to original: {e}")
-    return None
-
-
 def _find_energy_dip(
     waveform, target_idx: int, sample_rate: int,
     window_sec: float = 1.5, hop_length: int = 512
@@ -941,11 +925,6 @@ def _transcribe_dashscope(audio_path: str, language: str, api_url: str, api_key:
 
     full_text = " ".join(accumulated_text)
 
-    # Refine timestamps with CTC forced alignment if SenseVoice model available
-    refined = _refine_timestamps_with_ctc(audio_path, full_text, sr, all_segments)
-    if refined:
-        all_segments = refined
-
     # Fallback: if chunking produced no segments but we have text, create single segment
     if not all_segments and full_text.strip():
         all_segments = [{"start": 0.0, "end": audio_duration, "text": full_text}]
@@ -1057,10 +1036,11 @@ from .engine_base import BaseTranscriber, TranscribeResult, Segment
 
 
 class CloudTranscriber(BaseTranscriber):
-    """Adapter wrapping cloud engine as a BaseTranscriber.
+    """Adapter wrapping a cloud engine config as a BaseTranscriber.
 
-    Supports standard Whisper API (OpenAI-compatible) and DashScope chat_completions.
-    Cloud engines don't need local chunk merging - they return full transcripts.
+    支持多配置并存 (v2.4): 每个配置注册为一个引擎实例,
+    引擎名 = ``cloud`` (激活项) 或 ``cloud:<id>`` (其余),
+    ``transcribe`` 读绑定配置而不是全局激活项。
     """
 
     name = "cloud"
@@ -1069,9 +1049,9 @@ class CloudTranscriber(BaseTranscriber):
     is_local = False
 
     def __init__(self, **kwargs):
+        self.engine_id = kwargs.get("engine_id")  # None → 跟随全局激活项
         # Backward-compat: accept legacy use_chunk_merger kwarg, but ignore
         # Cloud engines return full transcripts with timestamps built-in.
-        pass
 
     def transcribe(
         self,
@@ -1079,11 +1059,7 @@ class CloudTranscriber(BaseTranscriber):
         language: str = "auto",
         **kwargs,
     ) -> TranscribeResult:
-        config = load_engine_config()
-        api_url = config["api_url"].rstrip("/")
-        api_key = config["api_key"]
-        model = (config.get("model") or "").strip()
-        request_mode = (config.get("request_mode") or "whisper").lower().strip()
+        config = self._bound_config()
 
         if not api_url or not api_key:
             raise ValueError("Cloud engine not configured.")
@@ -1106,9 +1082,20 @@ class CloudTranscriber(BaseTranscriber):
                  for s in segments]
         return TranscribeResult(segments=typed)
 
+    def _bound_config(self) -> Dict[str, Any]:
+        """本实例绑定的配置: 有 engine_id 时取该项, 否则取全局激活项。"""
+        if self.engine_id:
+            for item in list_engine_configs():
+                if item.get("id") == self.engine_id:
+                    result = {"api_url": "", "api_key": "", "model": "", "enabled": False}
+                    result.update(item)
+                    return result
+            raise ValueError(f"Cloud engine config not found: {self.engine_id}")
+        return load_engine_config()
+
     def is_available(self) -> Tuple[bool, str]:
         """Check if cloud API is configured."""
-        config = load_engine_config()
+        config = self._bound_config()
         if config.get("enabled") and config.get("api_url") and config.get("api_key"):
             return True, ""
         return False, "Cloud API not configured (api_url + api_key required)"

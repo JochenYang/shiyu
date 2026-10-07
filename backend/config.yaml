@@ -1,27 +1,19 @@
 # Subtitle Assistant Configuration
-# Model paths are resolved relative to model.dir
-model:
-  dir: "~/.shiyu/models"          # base dir for all model files
-  onnx: "sensevoice-small/model.onnx"
-  tokens: "sensevoice-small/tokens.json"
-  model_config: "sensevoice-small/config.yaml"
+# 模型由 backend/config/models.json 清单管理, 下载到 ~/.shiyu/models/<directory>/
 
-# Audio preprocessing
+# Model root (清单里的相对目录都挂在这里)
+model:
+  dir: "~/.shiyu/models"
+
+# Audio preprocessing (sherpa-onnx 内部处理 fbank, 这里只保留重采样目标)
 audio:
-  cmvn_file: "../models/sensevoice-small/am.mvn"
   sample_rate: 16000
-  n_mels: 80
-  frame_length: 25      # ms
-  frame_shift: 10       # ms
-  lfr_m: 7              # low frame rate factor
-  lfr_n: 6
   max_duration: 300     # seconds, split if longer
 
 # Inference settings
 inference:
   language: "auto"      # auto, zh, en, ja, ko, yue
   use_itn: true         # inverse text normalization
-  batch_size: 1
   device: "cpu"         # cpu or cuda
 
 # Server settings
@@ -33,29 +25,30 @@ server:
 # Output defaults
 output:
   default_format: "srt"   # srt, lrc, ass
-  max_line_length: 40     # chars per subtitle line
-  max_line_count: 2       # max lines per subtitle event
   # 字幕时间偏移 (秒) 由前端用户调, 走 API subtitle_offset_sec 参数
-  # 不用 config.yaml, 避免每次调都要重启后端
 
-# ASR engine registry (zipformer 主走)
-# - zipformer: 主走, sherpa-onnx Zipformer-CTC-zh int8 (350MB), CTC 字符级对齐
-# - paraformer: 备选, sherpa-onnx Paraformer-large int8 (232MB), CIF 显式 token 边界准
-# - sensevoice: 多语言备选 (zh/en/ja/ko/yue 5 语言)
-# - cloud: 云端 OpenAI 兼容 API (用户自己填 endpoint + key)
+# ASR engine registry — key 必须与 config/models.json 的 engine_name 一致
+# 每个本地模型都走 sherpa-onnx, 只有线程数与 CTC 补偿可调。
+# - zipformer_local: 主走, 中文 CTC, 逐 token 时间戳最细
+# - sensevoice_local: 多语言备选 (zh/en/ja/ko/yue)
+# - firered_local: 可选, 中文 + 英语 + 20 余种方言
+# - qwen3_asr_local: 中英日韩粤, 无逐 token 时间戳, 需配合对齐器
 engines:
-  paraformer:
-    enabled: true   # 备选 — CIF 显式 token 边界准
-    model_dir: "~/.shiyu/models/paraformer-large"
-    num_threads: 4
-  zipformer:
-    enabled: true   # 主走 — CTC int8 字符级对齐
-    model_dir: "~/.shiyu/models/zipformer-ctc-zh"
+  zipformer_local:
+    enabled: true
     num_threads: 4
     # CTC 峰值滞后补偿 (秒): CTC 发射 token 晚于实际发音约 100-200ms,
     # 字幕时间戳整体滞后. 0 = 关闭; 若发现字幕提前可调小 (如 0.10).
     ctc_delay_sec: 0.15
-  sensevoice:
-    enabled: true   # 多语言备选
-    model_dir: "~/.shiyu/models/sensevoice-small"
-    device: "cpu"
+  sensevoice_local:
+    enabled: true
+    num_threads: 4
+    ctc_delay_sec: 0.15
+  firered_local:
+    enabled: true
+    num_threads: 4
+    ctc_delay_sec: 0.15
+  qwen3_asr_local:
+    enabled: true
+    num_threads: 4
+    ctc_delay_sec: 0.0

@@ -1,12 +1,13 @@
 # Subtitle Assistant - Python Backend Dependencies
-# Core inference
+# Core inference (sherpa-onnx 提供全部本地 ASR 模型推理)
+sherpa-onnx>=1.13.0
 onnxruntime>=1.16.0
+tokenizers>=0.20.0   # 强制对齐器分词 (Rust 实现, 7.8MB, 不引 transformers)
 numpy>=1.24.0
 
 # Audio processing
 librosa>=0.10.0
 soundfile>=0.12.0
-kaldi-native-fbank>=1.1
 
 # Web framework
 fastapi>=0.104.0
@@ -16,21 +17,15 @@ python-multipart>=0.0.6
 # Subtitle generation
 pysubs2>=1.6.0
 
+# 断句: 在已测量的词边界上做最小代价切分 (HMM=False 确定性模式)
+jieba>=0.42.1
+
 # Config & utils
 pyyaml>=6.0.1
 pydantic>=2.5.0
 
-# Model download
-requests>=2.28.0
-
-# FFmpeg wrapper (optional, we use subprocess mainly)
-ffmpeg-python>=0.2.0
-
 # Traditional → Simplified Chinese conversion (dynamic import in engines)
 zhconv>=1.2.0
 
-# CTC forced alignment (loaded by sensevoice_engine, optional)
-sentencepiece>=0.2.0
-
-# Paraformer (阿里达摩院) ASR engine - ONNX only, no funasr/torch dependency
-# Uses onnxruntime directly (model_quant.onnx from ModelScope)
+# FFmpeg wrapper (optional, we use subprocess mainly)
+ffmpeg-python>=0.2.0

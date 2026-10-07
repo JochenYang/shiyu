@@ -50,6 +50,9 @@ models/sensevoice-small/model.onnx
 *.log
 *.tmp
 
+# 临时验证脚本与下载物 (不入库)
+.devtmp/
+
 # Repo progress (handoff artifacts)
 repo/
 tasks

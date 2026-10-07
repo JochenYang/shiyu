@@ -809,10 +809,13 @@ class ASRDeterministicCorrector:
                 # 仅在"前段不以标点结尾"时插入逗号
                 # 即：当前段是前段句子的延续才连接
                 if prev_text and not re.search(r'[。！？.!?]$', prev_text.strip()):
-                    text = text.replace(conj, "，" + conj, 1)
+                    # 前段以逗号/分号等软标点结尾时不再加前置逗号:
+                    # 字幕是逐行显示的, "…，\n，然后…" 行首逗号是观感 bug
+                    # (实测主人导出的 SRT 有 9 行行首逗号)。
+                    if not re.search(r'[，、；;:,]$', prev_text.strip()):
+                        text = text.replace(conj, "，" + conj, 1)
                 # 若前段已有句号（或这是第一段），保持"所以"原样
                 break
-
         trimmed = text.strip()
 
         # ── Rule 2: 段尾语气词 → 问号/感叹号 ──

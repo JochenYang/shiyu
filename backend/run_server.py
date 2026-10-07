@@ -81,14 +81,20 @@ def main():
 
     host = args.host or server_cfg["host"]
     port = args.port or server_cfg["port"]
+    # 告知应用层实际绑定地址, 使启动日志与实际监听一致
+    os.environ["SHIYU_BOUND_HOST"] = host
+    os.environ["SHIYU_BOUND_PORT"] = str(port)
+    print("=" * 50)
+    print("时语 Shiyu Backend")
+    # 模型不再写死在 config.yaml 里, 由 config/models.json 清单管理
+    from app.core import model_catalog
 
-    print(f"=" * 50)
-    print(f"时语 Shiyu Backend")
-    print(f"Model: {config['model']['onnx_path']}")
+    print(f"Model root: {config['model']['dir']}")
+    installed = [e["id"] for e in model_catalog.availability() if e["installed"]]
+    print(f"Installed models: {', '.join(installed) if installed else '(none — 请在应用内下载)'}")
     print(f"Listening: http://{host}:{port}")
     print(f"Log File: {log_file}")
-    print(f"=" * 50)
-
+    print("=" * 50)
     uvicorn.run(
         "app.main:app",
         host=host,

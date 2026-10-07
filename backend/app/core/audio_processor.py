@@ -1,21 +1,14 @@
 """
-Audio Preprocessing for SenseVoice ONNX inference.
-Steps:
-  1. Load audio via librosa (supports video via ffmpeg extraction)
-  2. Compute fbank using kaldi_native_fbank (matches SenseVoice training)
-  3. Apply LFR (Low Frame Rate) stacking with left-context padding
-  4. Apply CMVN (Cepstral Mean and Variance Normalization) from am.mvn
+音频抽取 — 从视频/音频文件得到可供识别的 16kHz 单声道波形。
+
+职责只限于「拿到音频」: fbank / LFR / CMVN 特征由 sherpa-onnx 内部完成,
+本模块不再自己算特征 (旧的 SenseVoice 自研 ONNX 路径已移除)。
 """
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-import numpy as np
-import librosa
-import kaldi_native_fbank as knf
-
-
 def _run_hidden(cmd, **kwargs):
     """Run subprocess without flashing a console window on Windows."""
     opts = dict(kwargs)
@@ -162,131 +155,5 @@ def extract_audio_from_video(video_path: str, output_wav: str = None, sample_rat
     return output_wav
 
 
-def load_audio(audio_path: str, sample_rate: int = 16000) -> np.ndarray:
-    """Load audio file, resample to target rate, return mono float32 array."""
-    arr, sr = librosa.load(audio_path, sr=sample_rate, mono=True)
-    return arr.astype(np.float32)
-
-
-def compute_fbank_kaldi(waveform: np.ndarray,
-                        sample_rate: int = 16000,
-                        n_mels: int = 80,
-                        frame_length: int = 25,
-                        frame_shift: int = 10,
-                        dither: float = 1.0) -> np.ndarray:
-    """Compute fbank using kaldi_native_fbank (matches SenseVoice training).
-
-    Args:
-        waveform: 1-D float32 array, range [-1.0, 1.0]
-        sample_rate: Target sample rate
-        n_mels: Number of mel bins
-        frame_length: Frame length in ms
-        frame_shift: Frame shift in ms
-        dither: Dithering factor
-
-    Returns:
-        fbank: [n_frames, n_mels] float32 array
-    """
-    opts = knf.FbankOptions()
-    opts.frame_opts.samp_freq = sample_rate
-    opts.frame_opts.dither = dither
-    opts.frame_opts.window_type = "hamming"
-    opts.frame_opts.frame_shift_ms = float(frame_shift)
-    opts.frame_opts.frame_length_ms = float(frame_length)
-    opts.mel_opts.num_bins = n_mels
-    opts.energy_floor = 0
-    opts.frame_opts.snip_edges = True
-    opts.mel_opts.debug_mel = False
-
-    # Scale waveform to int16 range (SenseVoice convention)
-    scaled_waveform = waveform * (1 << 15)
-
-    fbank_fn = knf.OnlineFbank(opts)
-    fbank_fn.accept_waveform(sample_rate, scaled_waveform.tolist())
-    frames = fbank_fn.num_frames_ready
-    mat = np.empty([frames, n_mels], dtype=np.float32)
-    for i in range(frames):
-        mat[i, :] = fbank_fn.get_frame(i)
-    return mat
-
-
-def apply_lfr(fbank: np.ndarray, lfr_m: int = 7, lfr_n: int = 6) -> np.ndarray:
-    """Apply Low Frame Rate (LFR) stacking with left-context padding.
-
-    Matches SenseVoice official implementation:
-    - Left padding: tile the first frame (lfr_m-1)//2 times
-    - Stack lfr_m consecutive frames, advance by lfr_n
-    - Right pad last frame if needed
-
-    Args:
-        fbank: [n_frames, n_mels]
-        lfr_m: Number of frames to stack
-        lfr_n: Frame skip rate
-
-    Returns:
-        [n_out_frames, lfr_m * n_mels]
-    """
-    T = fbank.shape[0]
-    T_lfr = int(np.ceil(T / lfr_n))
-    # Left-context padding: repeat first frame
-    left_padding = np.tile(fbank[0], ((lfr_m - 1) // 2, 1))
-    padded = np.vstack((left_padding, fbank))
-    T_padded = padded.shape[0]
-
-    stacked = []
-    for i in range(T_lfr):
-        start = i * lfr_n
-        if lfr_m <= T_padded - start:
-            stacked.append(padded[start:start + lfr_m].reshape(1, -1))
-        else:
-            # Process last LFR frame with right padding
-            frame = padded[start:].reshape(-1)
-            num_padding = lfr_m - (T_padded - start)
-            for _ in range(num_padding):
-                frame = np.hstack((frame, padded[-1]))
-            stacked.append(frame)
-
-    return np.vstack(stacked).astype(np.float32)
-
-
-def load_cmvn(cmvn_file: str) -> np.ndarray:
-    """Load CMVN from Kaldi-format am.mvn file.
-
-    Returns:
-        cmvn: [2, dim] array where cmvn[0]=means (AddShift), cmvn[1]=vars (Rescale)
-    """
-    means_list = []
-    vars_list = []
-    with open(cmvn_file, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    for i in range(len(lines)):
-        line_item = lines[i].split()
-        if line_item[0] == "<AddShift>":
-            line_item = lines[i + 1].split()
-            if line_item[0] == "<LearnRateCoef>":
-                means_list = list(line_item[3:(len(line_item) - 1)])
-        elif line_item[0] == "<Rescale>":
-            line_item = lines[i + 1].split()
-            if line_item[0] == "<LearnRateCoef>":
-                vars_list = list(line_item[3:(len(line_item) - 1)])
-    means = np.array(means_list, dtype=np.float64)
-    vars_ = np.array(vars_list, dtype=np.float64)
-    return np.array([means, vars_])
-
-
-def apply_cmvn(features: np.ndarray, cmvn: np.ndarray) -> np.ndarray:
-    """Apply CMVN: (features + means) * vars.
-
-    Args:
-        features: [n_frames, dim]
-        cmvn: [2, dim] from load_cmvn
-
-    Returns:
-        Normalized features [n_frames, dim]
-    """
-    frame, dim = features.shape
-    means = np.tile(cmvn[0:1, :dim], (frame, 1))
-    vars_ = np.tile(cmvn[1:2, :dim], (frame, 1))
-    return (features + means) * vars_
 
 

@@ -1,28 +1,19 @@
 """
-Punctuation Restoration — Rule-based + NN-based (stub).
-
-参照剪映 Pro (JianyingPro) PunctuationCtTransformer 模型设计:
-  - 剪映用一个独立的 CT-Transformer 网络对 ASR 纯文本恢复标点,
-    效果显著优于纯规则 (句号/问号/逗号恢复准确率提升约 20-30%)。
-  - 本模块按"抽象 + 后端可替换"模式实现:
-      * PunctuationBase   抽象基类, 统一接口 (Rule/NN 都遵循)
-      * RulePunctuation   纯规则版, 4 类启发式, 总是可用 (兜底)
-      * NNPunctuation     ONNX 推理版, 当前是 stub, 等主人确认后接入
-      * get_punctuation_engine() 工厂方法, NN 可用就用 NN, 否则用 Rule
+标点恢复 — 规则版 (确定性, 离线, 零模型依赖)。
 
 设计取舍:
-  - 抽象类用 ABC + abstractmethod, 保持依赖注入的可能性
-  - 默认 is_available() = True (Rule 总是可用)
-  - NNPunctuation.is_available() = False (stub 模式, 主流程自动降级到 Rule)
-  - Rule 版在 4 类启发式上做"够用即可"的判断:
-      * 段尾语气词 → 问号 / 感叹号
-      * 中文连词前后清理 + 加逗号
-      * 段首语气词 → 后面加逗号
-      * 纯英文段末 → 加句号
-  - 默认**不**补 句号 (避免对长段过度补点), 由 caller 决定是否补
+  * ``RulePunctuation`` 用 4 类启发式补标点, 总是可用, 不依赖任何模型:
+      - 段尾语气词 → 问号 / 感叹号
+      - 中文连词前后清理 + 加逗号
+      - 段首语气词 → 后面加逗号
+      - 纯英文段末 → 加句号
+  * 默认**不**补句号 (避免对长段过度补点), 由调用方决定
+  * ``get_punctuation_engine()`` 保留工厂形状, 但只返回规则版 ——
+    曾经预留的 CT-Transformer ONNX 后端从未实现 (``is_available()`` 恒为
+    False), 却仍然驱动了一条约 50MB 的下载链, 已一并移除
 
-不实际下载任何模型。onnxruntime 已在 requirements.txt, 主人在确认后
-可下载 PUNCT_MODEL_ID 对应 ONNX 权重, 在 NNPunctuation.load() 中接入。
+断句职责不在这里: 字幕行的边界由 ``caption_builder`` 在已测量的词边界上
+用最小代价切分决定, 本模块只负责文本内的标点。
 """
 import logging
 import re
@@ -31,13 +22,6 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── 模型下载预留 (不实际下载) ─────────────────────────────────
-# 阿里达摩院中文标点恢复 CT-Transformer (ModelScope)
-# 实际加载逻辑 (ONNX Runtime + 自带 tokenizer) 在主人确认后接入
-PUNCT_MODEL_ID = (
-    "damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
-)
-PUNCT_DIR = "punc_ct-transformer"
 
 # ── 端点标点 / 软语气词 / 触发集合 ─────────────────────────────
 _QUESTION_ENDS = {"吗", "呢"}
@@ -234,71 +218,6 @@ class RulePunctuation(PunctuationBase):
 
 
 # ──────────────────────────────────────────────────────────────
-# NN 版后端 (stub)
-# ──────────────────────────────────────────────────────────────
-
-
-class NNPunctuation(PunctuationBase):
-    """NN 版标点恢复 — 当前为 stub, 等主人确认后接入 PunctuationCtTransformer。
-
-    实际加载流程 (后续实现):
-      1. 从 ModelScope / HF Mirror 下载 ONNX 权重到 ``PUNCT_DIR``
-      2. 用 ``onnxruntime.InferenceSession`` 加载
-      3. 自带中文 BPE tokenizer (类似 SenseVoice)
-      4. 对每段文本做 char-level 推理, 输出每个位置的概率分布
-      5. 取 argmax 还原为标点序列
-
-    推理与 funasr 解耦 (直接用 onnxruntime), 这样:
-      * 不引入 funasr 大依赖
-      * 与现有 SenseVoice 引擎共存
-      * 模型小, 适合 CPU 推理
-
-    当前 stub 行为:
-      * ``is_available()`` 恒返回 ``False``
-      * ``punctuate()`` 直接降级到 ``RulePunctuation()``
-      * ``load()`` 永远是 False (未实现)
-    """
-
-    def __init__(self, model_path: Optional[str] = None):
-        self._model_path = model_path
-        self._session: Optional[object] = None  # onnxruntime.InferenceSession
-        self._tokenizer: Optional[object] = None
-        self._loaded: bool = False
-
-    def is_available(self) -> bool:
-        """当前 stub 模式恒返回 False, 主流程会自动降级到 Rule。"""
-        return False
-
-    def load(self) -> bool:
-        """预留: 实际加载 ONNX 权重 + tokenizer。
-
-        Returns:
-            True 表示加载成功, False 表示加载失败 (主流程会降级到 Rule)。
-
-        实现策略 (后续):
-          * 检查 model_path 是否存在
-          * 用 onnxruntime.InferenceSession 加载
-          * 加载 char vocab (内置, 无需外部文件)
-          * 缓存到 self._session / self._tokenizer
-        """
-        # 当前 stub: 不实际加载
-        return False
-
-    def punctuate(self, text: str) -> str:
-        """stub 模式: 降级到 RulePunctuation。
-
-        后续实现: 调用 self._session.run() 做推理, 输出带标点文本。
-        """
-        if not text:
-            return text
-        return RulePunctuation().punctuate(text)
-
-    def punctuate_segments(self, segments: List[Dict]) -> List[Dict]:
-        """stub 模式: 走基类默认实现 (即逐段调 punctuate, 降级到 Rule)。"""
-        return super().punctuate_segments(segments)
-
-
-# ──────────────────────────────────────────────────────────────
 # 工厂方法
 # ──────────────────────────────────────────────────────────────
 
@@ -307,25 +226,12 @@ _ENGINE_CACHE: Optional[PunctuationBase] = None
 
 
 def get_punctuation_engine() -> PunctuationBase:
-    """工厂方法: NN 可用就用 NN, 否则用 Rule。
+    """返回标点恢复后端 (当前只有规则版)。
 
     带进程级缓存 (单例), 避免每次调用都新建对象。
-
-    Returns:
-        一个 ``PunctuationBase`` 实例。当前 NN 是 stub, 所以返回 RulePunctuation。
     """
     global _ENGINE_CACHE
-    if _ENGINE_CACHE is not None:
-        return _ENGINE_CACHE
-
-    nn = NNPunctuation()
-    if nn.is_available():
-        logger.info("[Punctuation] Using NNPunctuation backend")
-        _ENGINE_CACHE = nn
-    else:
-        logger.info(
-            "[Punctuation] NN unavailable, using RulePunctuation (fallback)"
-        )
+    if _ENGINE_CACHE is None:
         _ENGINE_CACHE = RulePunctuation()
     return _ENGINE_CACHE
 

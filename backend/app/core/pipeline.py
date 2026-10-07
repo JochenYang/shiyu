@@ -17,9 +17,9 @@ v2.0 简化:
     - VALIDATE 改为轻量日志 (不独立 stage)
 
 最终 4 阶段:
-    1. ASR         主引擎转录 (Zipformer 主走 / Paraformer 备选 / SenseVoice 多语言备选)
-    2. CORRECT     glossary 替换 + 确定性修正 (内部含标点) + ITN
-    3. VALIDATE    字幕校验 (轻量日志)
+    1. ASR         引擎转录 (本地模型统一走 sherpa_engine, 输出逐字符时间戳)
+    2. CORRECT     跨段碎片合并 + glossary 替换 + 确定性修正 (内部含标点)
+    3. VALIDATE    时间戳自检 (轻量日志)
     4. FORMAT      SRT/LRC/ASS 格式化
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ class PipelineStage(Enum):
     FORMAT = "format"
 
 
-# 主引擎: Zipformer-CTC-zh (CTC int8, 350MB); paraformer 备选 (CIF 边界准); sensevoice 多语言备选
+# 默认引擎: 清单默认模型对应的 engine_name (见 config/models.json)
 PRIMARY_ENGINE = "zipformer_local"
 
 
@@ -187,6 +187,12 @@ class SubtitlePipeline:
         if self.ctx.engines_results:
             primary_name = next(iter(self.ctx.engines_results))
             primary_segs = self.ctx.engines_results[primary_name]
+            # 无逐字符时间的段 (Qwen3-ASR 等不返回 token 时间戳的模型):
+            # 用本地强制对齐器补上测量时间, 断句才不会退化成整段一行。
+            # 对齐器未安装或对齐失败时保持原样 (宁可不细切, 不编时间)。
+            if any(not getattr(s, "char_times", None) for s in primary_segs):
+                primary_segs = self._align_segments(primary_segs)
+                self.ctx.engines_results[primary_name] = primary_segs
             self.ctx.raw_segments = [self._seg_to_dict(s) for s in primary_segs]
             self.ctx.engine_meta = {
                 "engines": list(self.ctx.engines_results.keys()),
@@ -196,7 +202,49 @@ class SubtitlePipeline:
             self.ctx.raw_segments = []
             self.ctx.engine_meta = {"engines": [], "primary": None}
 
-        self._compute_duration()
+    def _align_segments(self, segments):
+        """对无 char_times 的段用强制对齐器补逐字符时间。
+
+        逐段送对齐器 (每段文本短, 精度高); 任一段失败只丢该段的
+        细切能力, 不中断转录。
+        """
+        try:
+            from app.core.forced_aligner import get_aligner
+
+            aligner = get_aligner()
+            ok, reason = aligner.is_available()
+            if not ok:
+                logger.info("[Pipeline:ASR] 对齐器不可用 (%s), 保持原段", reason)
+                return segments
+        except ImportError:
+            return segments
+
+        import librosa
+
+        try:
+            audio, sr = librosa.load(self.ctx.audio_path, sr=16000, mono=True)
+        except Exception as e:
+            logger.warning("[Pipeline:ASR] 对齐器读音频失败: %s", e)
+            return segments
+
+        from app.core.engine_base import Segment
+
+        aligned: list = []
+        for seg in segments:
+            if getattr(seg, "char_times", None):
+                aligned.append(seg)
+                continue
+            try:
+                times = aligner.char_times_for(audio, seg.text, sr)
+            except Exception as e:
+                logger.warning("[Pipeline:ASR] 对齐失败 (保留原段): %s", e)
+                times = None
+            if times and len(times) == len(seg.text):
+                aligned.append(Segment(start=seg.start, end=seg.end,
+                                       text=seg.text, char_times=times))
+            else:
+                aligned.append(seg)
+        return aligned
 
     def _compute_duration(self) -> None:
         """从音频文件计算总时长."""
@@ -216,38 +264,21 @@ class SubtitlePipeline:
 
     # ── Stage 2: Correct ───────────────────────────────────────────
 
-    # 跨段碎片合并常量:
-    # 段尾出现这些字符时视为完整句子, 不与下段合并
-    _FRAGMENT_TERMINALS = frozenset("。！？…!?")
-    # 合并后最大时长 (秒) / 最大字符数 (兜底), 超过则保持独立段.
-    # v2.2: 12s/60 字过宽会把多句串成 40+ 字长字幕, 收紧到 8s/32 字
-    _MERGE_MAX_DURATION = 8.0
-    _MERGE_MAX_CHARS = 32
-    # 去重后的短残余段 (重复句尾巴, <=8 字) 允许合并到 36 字,
-    # 避免 "shi" / "timescale" 这类小残余独立成碎片段
-    _DUP_TAIL_MAX_CHARS = 8
-    _MERGE_MAX_CHARS_EXEMPT = 36
-    # 极短段 (< 1.5s) 强制并入前段时, 合并后字符上限 (内容优先于长度)
-    _SHORT_SEG_MERGE_CHARS = 40
-    # 空/纯标点段 (无字幕内容, 如孤立 ".") 过滤
+    # 无字幕内容的纯标点段 (孤立 "." 之类) 过滤
     _PUNCT_ONLY_CHARS = frozenset("。，、；：？！….,;:!?\"'()（） ")
 
     @staticmethod
-    def _merge_fragments(segments: List[Dict]) -> List[Dict]:
-        """跨段碎片合并 + 孤立段过滤.
+    def _dedup_segments(segments: List[Dict]) -> List[Dict]:
+        """段间去重与清理 (不做长度合并).
 
-        ASR 分段 (Zipformer CTC / VAD) 常把句子切碎在词中间
-        (如 "通过改" + "变整个游戏"), 且可能输出纯标点段 (孤立 ".").
-        本方法:
-          1. 过滤空段与纯标点段
+        引擎已在测量词边界上完成语义断句, 因此这里**不再**按长度把相邻段拼回去
+        —— 那会撤销引擎的断句结果。只保留针对 ASR 重复识别产物的清理:
+
+          1. 过滤空段与纯标点段 (孤立 ".")
           2. 规则 A: 丢弃与相邻段高度重叠的短段 (ASR 整句重复识别)
-          3. 段间子串去重: 前段尾部 >=6 字短语若重复出现在后段
-             开头 1/3 内 (ASR 重叠识别), 从后段删除, 避免合并后重复
-          4. 规则 B: 极短段 (< 1.5s) 读不完, 强制并入前段 (豁免长度/时长)
-          5. 相邻段 prev 不以终止标点结尾 (。！？…!?) 且合并后
-             时长 <= _MERGE_MAX_DURATION、字符 <= _MERGE_MAX_CHARS → 合并
-          6. 拼接: prev 尾与 curr 头都是 ASCII 字母数字时加空格, 否则直拼
-          7. 合并完成后清理段内连续重复短语 (ASR 整句重复识别)
+          3. 段间子串去重: 前段尾部 >=6 字短语若重复出现在后段开头 1/3 内,
+             从后段删除 (ASR 重叠识别)
+          4. 段内连续重复短语清理
 
         Returns:
             新段列表 (不修改入参).
@@ -268,9 +299,9 @@ class SubtitlePipeline:
             # 单段也要做段内连续重复清理 (ASR 整句重复识别)
             return SubtitlePipeline._clean_in_segment_dups(cleaned)
 
-        merged: List[Dict] = [cleaned[0]]
+        deduped: List[Dict] = [cleaned[0]]
         for seg in cleaned[1:]:
-            prev = merged[-1]
+            prev = deduped[-1]
             prev_text = prev["text"]
             curr_text = seg["text"]
             seg_duration = seg["end"] - seg["start"]
@@ -292,7 +323,7 @@ class SubtitlePipeline:
                         break
                 if longest >= 8 and longest / len(curr_text) >= 0.35:
                     logger.debug(
-                        "[MergeFragments] drop duplicate short segment: %r", curr_text
+                        "[DedupSegments] drop duplicate short segment: %r", curr_text
                     )
                     continue
 
@@ -302,59 +333,18 @@ class SubtitlePipeline:
                 tail = prev_text[-n:]
                 pos = curr_text.find(tail)
                 if 0 <= pos <= len(curr_text) // 3:
-                    deduped = (curr_text[:pos] + curr_text[pos + n:]).strip()
-                    if deduped:
-                        curr_text = deduped
+                    shortened = (curr_text[:pos] + curr_text[pos + n:]).strip()
+                    if shortened:
+                        curr_text = shortened
                     break
 
             if not curr_text:
                 continue  # 后段完全重复 → 丢弃
 
-            # 规则 B: 极短段 (< 1.5s) 读不完, 强制并入 prev (豁免时长上限);
-            # 合并后超过 _SHORT_SEG_MERGE_CHARS 则不并入, 留给普通合并逻辑
-            # (避免把整句长段与碎片硬拼成超长字幕)
-            if seg_duration < 1.5:
-                combined_chars = len(prev_text) + len(curr_text)
-                if combined_chars <= SubtitlePipeline._SHORT_SEG_MERGE_CHARS:
-                    need_space = (
-                        prev_text[-1].isascii() and prev_text[-1].isalnum()
-                        and curr_text[0].isascii() and curr_text[0].isalnum()
-                    )
-                    prev["text"] = prev_text + (" " if need_space else "") + curr_text
-                    prev["end"] = seg["end"]
-                    continue
-
-            if prev_text[-1] in SubtitlePipeline._FRAGMENT_TERMINALS:
-                merged.append(dict(seg, text=curr_text))
-                continue
-
-            combined_duration = seg["end"] - prev["start"]
-            combined_chars = len(prev_text) + len(curr_text)
-            # 去重后的短残余段 (重复句尾巴) 允许少量超额, 避免独立碎片段;
-            # 普通合并仍受 _MERGE_MAX_CHARS 约束
-            char_limit = (
-                SubtitlePipeline._MERGE_MAX_CHARS_EXEMPT
-                if len(curr_text) <= SubtitlePipeline._DUP_TAIL_MAX_CHARS
-                else SubtitlePipeline._MERGE_MAX_CHARS
-            )
-            if (
-                combined_duration > SubtitlePipeline._MERGE_MAX_DURATION
-                or combined_chars > char_limit
-            ):
-                merged.append(dict(seg, text=curr_text))
-                continue
-
-            # ASCII 字母数字相邻 → 空格连接 (英文词级), 否则直拼 (中文)
-            need_space = (
-                prev_text[-1].isascii() and prev_text[-1].isalnum()
-                and curr_text[0].isascii() and curr_text[0].isalnum()
-            )
-            prev["text"] = prev_text + (" " if need_space else "") + curr_text
-            prev["end"] = seg["end"]
+            deduped.append(dict(seg, text=curr_text))
 
         # 段内连续重复短语清理: ASR 偶发把同一短语识别两遍
-        # (如 "…我们的计时器，如果我们移除我们的计时器，如果我们移除…")
-        return SubtitlePipeline._clean_in_segment_dups(merged)
+        return SubtitlePipeline._clean_in_segment_dups(deduped)
 
     @staticmethod
     def _clean_in_segment_dups(segments: List[Dict]) -> List[Dict]:
@@ -383,8 +373,9 @@ class SubtitlePipeline:
             成功后本层不再跑独立 punctuation, 避免双标点;
             deterministic 关闭或异常降级时, 仍由本层补标点
         """
-        # 先跨段碎片合并 (ASR 分段常把句子切碎在词中间), 再应用 glossary
-        source = self._merge_fragments(list(self.ctx.raw_segments or []))
+        # 先做段间去重 (ASR 重复识别产物), 再应用 glossary。
+        # 注意: 这里不按长度合并相邻段 —— 引擎已在测量词边界上断好句。
+        source = self._dedup_segments(list(self.ctx.raw_segments or []))
 
         if not source:
             self.ctx.corrected_segments = []
@@ -433,18 +424,26 @@ class SubtitlePipeline:
 
     # ── Stage 3: Validate ──────────────────────────────────────────
     def _stage_validate(self) -> None:
-        """字幕校验 + 日志."""
+        """把修正后的段落到 final_segments, 并记录一次时间戳自检。
+
+        校验只记录不修改: 字幕修复由断句阶段负责, 这里仅当发现非法区间
+        (负时长/时间倒序) 时打日志, 方便定位上游问题。
+        """
         segments = self.ctx.corrected_segments or []
         self.ctx.final_segments = segments
 
         if not self.ctx.enable_validate or not segments:
             return
 
-        try:
-            from app.core.subtitle_validator import log_validation_report
-            log_validation_report(segments, source="pipeline")
-        except Exception as e:
-            logger.warning("[Pipeline:Validate] failed: %s", e)
+        previous_end = 0.0
+        for index, seg in enumerate(segments):
+            start, end = seg.get("start", 0.0), seg.get("end", 0.0)
+            if end <= start or start < previous_end - 0.05:
+                logger.warning(
+                    "[Pipeline:Validate] 第 %d 段时间戳异常: %.3f-%.3f (%r)",
+                    index, start, end, (seg.get("text") or "")[:20],
+                )
+            previous_end = max(previous_end, end)
 
     # ── Stage 4: Apply offset (主人手动微调字幕时间) ─────────────
     def _stage_apply_offset(self) -> None:
