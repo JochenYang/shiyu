@@ -137,6 +137,10 @@ class SubtitlePipeline:
             getter = get_engine
 
         self.ctx.engines_results = {}
+        # 逐个记录引擎被跳过的原因, 供 API 回报真实失败原因
+        # (以前不管什么原因都只说一句 「No ASR engine available」,
+        #  豆包的导入错误就是这样被掩盖的)
+        skip_reasons: list = []
 
         for engine_name in engines:
             try:
@@ -146,6 +150,7 @@ class SubtitlePipeline:
                     "[Pipeline:ASR] engine '%s' not available: %s, skipping",
                     engine_name, e,
                 )
+                skip_reasons.append(f"{engine_name}: 引擎未注册 ({e})")
                 continue
 
             try:
@@ -155,12 +160,14 @@ class SubtitlePipeline:
                     "[Pipeline:ASR] '%s' is_available() raised: %s, skipping",
                     engine_name, e,
                 )
+                skip_reasons.append(f"{engine_name}: 可用性检查异常 ({e})")
                 continue
             if not avail:
                 logger.info(
                     "[Pipeline:ASR] '%s' not available (%s), skipping",
                     engine_name, reason,
                 )
+                skip_reasons.append(f"{engine_name}: {reason}")
                 continue
 
             try:
@@ -182,6 +189,7 @@ class SubtitlePipeline:
                     "[Pipeline:ASR] %s transcribe failed: %s",
                     engine_name, e,
                 )
+                skip_reasons.append(f"{engine_name}: 转录失败 ({e})")
 
         # raw_segments = 第一个成功引擎的结果 (向后兼容)
         if self.ctx.engines_results:
@@ -197,10 +205,12 @@ class SubtitlePipeline:
             self.ctx.engine_meta = {
                 "engines": list(self.ctx.engines_results.keys()),
                 "primary": primary_name,
+                "skipped": skip_reasons,
             }
         else:
             self.ctx.raw_segments = []
-            self.ctx.engine_meta = {"engines": [], "primary": None}
+            self.ctx.engine_meta = {"engines": [], "primary": None,
+                                   "skipped": skip_reasons}
 
     def _align_segments(self, segments):
         """对无 char_times 的段用强制对齐器补逐字符时间。

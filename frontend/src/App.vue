@@ -35,8 +35,10 @@ onBeforeUnmount(() => {
 });
 
 function _onGlobalError(e) {
-  const msg = e?.message || e?.reason || '';
-  // Suppress Tauri invoke errors (runtime IPC noise, not actionable)
+  // reason 可能是 Error 对象或任意非字符串值 (Promise reject 什么都有),
+  // 直接 .includes 会报 "msg.includes is not a function" 掩盖真正的错误
+  const raw = e?.message ?? e?.reason ?? '';
+  const msg = typeof raw === 'string' ? raw : String(raw?.message || raw);
   if (msg.includes('invoke') || msg.includes('__TAURI__')) {
     console.warn('[Tauri IPC]', msg);
     e.preventDefault?.();

@@ -60,6 +60,7 @@ def _chunk_boundaries(samples: np.ndarray) -> List[Tuple[int, int]]:
     参照 SubPop: 避免在人声中间拦腰截断; 无重叠无间隙, 块偏移即绝对时间。
     """
     chunk = CHUNK_SECONDS * RATE
+    quiet = RATE // 10          # 100ms 一个候选窗
     bounds: List[Tuple[int, int]] = []
     cursor = 0
     while cursor < len(samples):
@@ -183,18 +184,22 @@ class DoubaoCloudEngine(BaseTranscriber):
             raise DoubaoCloudError(reason)
         # is_available() 已把 KEY 与版本补齐, 这里不再重复读配置
 
-        from .audio_processor import extract_audio_for_transcribe
-        import soundfile as sf
+        # 与 cloud_engine 一致: 直接用 librosa 读音频并重采样到 16kHz。
+        # (不依赖 main.py 的私有辅助函数 —— 这里曾因导入不存在的
+        #  extract_audio_for_transcribe 导致整个豆包引擎报错。)
+        import librosa
 
-        wav16k = extract_audio_for_transcribe(Path(audio_path))
-        audio, sr = sf.read(wav16k, dtype="float32", always_2d=False)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        if sr != RATE:
-            import librosa
-
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=RATE)
-
+        try:
+            audio, sr = librosa.load(audio_path, sr=RATE, mono=True)
+        except Exception as e:
+            # 上层应已把视频抽成音频; 读不了就明确报错而不是抛原始异常
+            raise DoubaoCloudError(
+                f"无法读取音频文件: {type(e).__name__}。请确认文件是音频,"
+                "或已安装 ffmpeg 以从视频中抽取音轨。"
+            ) from e
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.size == 0:
+            raise DoubaoCloudError("音频为空, 无内容可识别。")
         segments: List[Segment] = []
         for start_sample, end_sample in _chunk_boundaries(audio):
             chunk = audio[start_sample:end_sample]
@@ -205,7 +210,9 @@ class DoubaoCloudEngine(BaseTranscriber):
             value = self._transcribe_chunk(chunk, duration)
             segments.extend(self._parse_result(value, duration, offset))
 
-        return TranscribeResult(segments=self._finish(segments))
+        # 豆包已给出真实词尾时间, 不需要 sherpa 的 _finish (那是 CTC 后处理);
+        # 段已按块顺序生成, 时间天然递增。
+        return TranscribeResult(segments=segments, language=language)
 
     def _transcribe_chunk(self, chunk: np.ndarray, duration: float) -> Dict[str, Any]:
         """提交一个 60s 块并轮询到完成。提交即计费, 绝不自动重试。"""

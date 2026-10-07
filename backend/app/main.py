@@ -225,6 +225,19 @@ def _resolve_engines_list(config=None, engine_mode: str = "local") -> list:
 # v2.0: _apply_llm_correction removed (LLM layer dropped, owner decision #2)
 # Module-level _llm_status / _llm_corrected flags kept for UI backward-compat
 # (always "skipped" / False now)
+def _engine_failure_detail(ctx) -> str:
+    """把 「所有引擎都失败」展开成真实原因。
+
+    以前只返回一句笼统的 "No ASR engine available", 把豆包引擎导入
+    错误这类可修复原因完全掩盖了 —— 用户看不到为何失败。
+    """
+    skipped = ((getattr(ctx, "engine_meta", None) or {}).get("skipped") or [])
+    if not skipped:
+        return (
+            "没有可用的识别引擎。请在「设置 → 模型」下载一个本地模型，"
+            "或在「设置 → 云端」配置云端服务。"
+        )
+    return "识别失败：" + "；".join(str(s) for s in skipped)
 
 
 def _extract_audio_for_transcribe(file_path: Path, audio_config: dict = None) -> str:
@@ -506,9 +519,7 @@ async def transcribe_file(
         ctx = SubtitlePipeline(ctx).run()
 
         if not ctx.engines_results:
-            raise HTTPException(
-                500, "No ASR engine available or all engines failed to transcribe"
-            )
+            raise HTTPException(500, _engine_failure_detail(ctx))
 
         return PlainTextResponse(ctx.output_content)
 
@@ -570,9 +581,7 @@ async def transcribe_json(
         ctx = SubtitlePipeline(ctx).run()
 
         if not ctx.engines_results:
-            raise HTTPException(
-                500, "No ASR engine available or all engines failed to transcribe"
-            )
+            raise HTTPException(500, _engine_failure_detail(ctx))
 
         return {
             "filename": file.filename,
@@ -655,9 +664,7 @@ async def transcribe_local(
         ctx = SubtitlePipeline(ctx).run()
 
         if not ctx.engines_results:
-            raise HTTPException(
-                500, "No ASR engine available or all engines failed to transcribe"
-            )
+            raise HTTPException(500, _engine_failure_detail(ctx))
 
         return {
             "content": ctx.output_content,
