@@ -223,19 +223,26 @@ export async function setLogLevel(level) {
 }
 
 /**
-/**
  * 云端多配置: 取全部配置 (脱敏) 与激活 id。
  * @returns {Promise<Object>} { engines: [{id, api_url, model, has_key, enabled, request_mode, display_name}], active }
  */
 export async function getEngineConfigs() {
-  const res = await fetch(`${API_BASE}/settings/engines`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/**
+ * 内置云端 provider 清单 (含 base_url/模型/认证头预填信息)。
+ * @returns {Promise<Object>} { providers: [{id, name, api_url, request_mode, models, auth_header, note}] }
+ */
+export async function getProviders() {
+  const res = await fetch(`${API_BASE}/settings/providers`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 /**
  * Apply LLM correction to transcription segments.
- * @param {Array} segments - [{start, end, text}, ...]
  * @param {string} engineMode - "local" or "cloud"
  * @returns {Promise<{segments: Array, llm_corrected: boolean}>}
  */

@@ -471,6 +471,16 @@
             <!-- 云端: 多配置并存 (v2.4) -->
             <template v-if="currentSettingsTab === 'cloud'">
               <div class="setting-item col">
+                <div class="setting-label">服务商（选好后只需填 KEY）</div>
+                <select class="log-level-select"
+                  :value="editingEngine.provider || 'custom'"
+                  @change="onProviderChange($event.target.value)">
+                  <option v-for="p in providers" :key="p.id" :value="p.id">
+                    {{ p.name }}{{ p.note ? ' — ' + p.note : '' }}
+                  </option>
+                </select>
+              </div>
+              <div class="setting-item col">
                 <div class="setting-label">云端配置（可添加多个，同时显示在引擎下拉）</div>
                 <select class="log-level-select" v-model="editingEngineId">
                   <option v-for="e in engineConfigs" :key="e.id" :value="e.id">
@@ -505,7 +515,12 @@
               </div>
               <div class="setting-item col">
                 <div class="setting-label">模型名</div>
-                <n-input v-model:value="editingEngine.model" placeholder="whisper-1" />
+                <!-- 有预置清单时下拉, 自定义时手填 -->
+                <select v-if="editingModels.length" class="log-level-select"
+                  v-model="editingEngine.model">
+                  <option v-for="m in editingModels" :key="m" :value="m">{{ m }}</option>
+                </select>
+                <n-input v-else v-model:value="editingEngine.model" placeholder="whisper-1" />
               </div>
               <div class="setting-item col">
                 <div class="setting-label">请求模式</div>
@@ -651,6 +666,7 @@ import {
   openModelFolder,
   setLogLevel,
   getEngineConfigs,
+  getProviders,
   saveEngineConfigsApi,
   getEngines,
   getLlmCorrectionSettings,
@@ -722,7 +738,7 @@ const format = ref("srt");
 const language = ref("zh");
 
 const resultSegments = ref([]);
-// 生成字幕时实际用的引擎; 切换后不同则提示可重新生成 (问题 2)
+const providers = ref([]);                 // 内置 provider 清单 (后端 /settings/providers)
 const lastGeneratedEngine = ref("");
 const canRegenerate = computed(() =>
   !!lastGeneratedEngine.value &&
@@ -893,9 +909,43 @@ const editingEngine = computed(() => {
                     request_mode: "whisper", display_name: "" };
 });
 
+// 当前编辑配置对应 provider 的预置模型清单 (空 = 自定义, 手填)
+const editingModels = computed(() => {
+  const pid = editingEngine.value.provider || "custom";
+  const p = providers.value.find(x => x.id === pid);
+  return p ? p.models || [] : [];
+});
+
+// 切换 provider: 预填 base_url / 请求模式 / 默认模型 / 认证头,
+// 用户只需填 KEY。已填的 KEY 保留 (换 provider 时清空 KEY 才合理,
+// 但为避免误清用户在其他 provider 的 KEY, 只在 KEY 为空时预填)。
+function onProviderChange(pid) {
+  const p = providers.value.find(x => x.id === pid);
+  const cur = engineConfigs.value.find(e => e.id === editingEngineId.value);
+  if (!p || !cur) return;
+  cur.provider = p.id;
+  cur.api_url = p.api_url || "";
+  cur.request_mode = p.request_mode || "whisper";
+  if (p.models && p.models.length) {
+    cur.model = p.models[0];
+  }
+  cur.auth_header = p.auth_header ? JSON.parse(JSON.stringify(p.auth_header)) : null;
+  if (!cur.api_key && p.id !== "custom") {
+    cur.api_key = "";   // 显式清空, 提示用户这是新 provider 的 KEY
+  }
+}
+
+async function fetchProviders() {
+  try {
+    const data = await getProviders();
+    providers.value = data.providers || [];
+  } catch {
+    providers.value = [];   // 后端未就绪: provider 下拉空, 不阻塞设置页
+  }
+}
 function _blankEngine() {
-  return { id: "", api_url: "", api_key: "", model: "", enabled: true,
-           request_mode: "whisper", display_name: "", has_key: false };
+  return { id: "", provider: "custom", api_url: "", api_key: "", model: "", enabled: true,
+           request_mode: "whisper", display_name: "", has_key: false, auth_header: null };
 }
 
 async function fetchEngineConfigs() {
@@ -1019,7 +1069,8 @@ onMounted(async () => {
     }
   }
 
-  // Sync cloud engine configs (multi, v2.4) from backend
+  // Sync cloud engine configs (multi) + builtin providers from backend
+  await fetchProviders();
   try {
     await fetchEngineConfigs();
   } catch {

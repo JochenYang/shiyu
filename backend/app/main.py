@@ -728,6 +728,14 @@ def _masked_engine(item: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+@app.get("/settings/providers")
+async def list_providers():
+    """内置云端 provider 清单 (前端据此预填 base_url/模型/认证头)。"""
+    from app.core.cloud_engine import BUILTIN_PROVIDERS
+
+    return {"providers": BUILTIN_PROVIDERS}
+
+
 @app.get("/settings/engines")
 async def list_engine_settings():
     """全部云端配置 (脱敏) 与激活 id。"""

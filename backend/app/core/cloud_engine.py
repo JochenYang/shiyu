@@ -24,6 +24,73 @@ from . import text_splitter
 
 CONFIG_FILE = Path.home() / ".shiyu" / "config.json"
 
+# ── 内置云端 provider 清单 (v2.5) ────────────────────────────────
+#
+# 用户只需选 provider + 填 KEY; base_url / request_mode / 默认模型
+# 全部预填 (可改)。这五家实测都在 OpenAI 兼容协议上提供 ASR 模型:
+#   * whisper 模式 = POST {base}/audio/transcriptions (multipart)
+#   * chat 模式    = POST {base}/chat/completions + input_audio(base64)
+# 豆包/腾讯/讯飞的语音是独立签名或 WebSocket 协议, 不在此清单,
+# 用「自定义」入口 (若该厂商有兼容网关) 或等待专用适配器。
+#
+# auth_header 仅 MiMo 需要 (认证头是 api-key: <key> 而非 Bearer);
+# 其余留空表示默认 Authorization: Bearer <key>。
+BUILTIN_PROVIDERS = [
+    {
+        "id": "openai",
+        "name": "OpenAI",
+        "api_url": "https://api.openai.com/v1",
+        "request_mode": "whisper",
+        "models": ["whisper-1", "gpt-4o-transcribe"],
+        "auth_header": None,
+        "note": "支持 25MB 音频; whisper-1 有 verbose_json 时间戳",
+    },
+    {
+        "id": "groq",
+        "name": "Groq",
+        "api_url": "https://api.groq.com/openai/v1",
+        "request_mode": "whisper",
+        "models": ["whisper-large-v3-turbo", "whisper-large-v3"],
+        "auth_header": None,
+        "note": "10MB 上限; 速度快, 有免费额度",
+    },
+    {
+        "id": "siliconflow",
+        "name": "SiliconFlow 硅基流动",
+        "api_url": "https://api.siliconflow.cn/v1",
+        "request_mode": "whisper",
+        "models": ["FunAudioLLM/SenseVoiceSmall"],
+        "auth_header": None,
+        "note": "10MB 上限; 国内直连, SenseVoice 中文效果好",
+    },
+    {
+        "id": "dashscope",
+        "name": "阿里云 DashScope (Qwen-ASR)",
+        "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "request_mode": "chat_completions",
+        "models": ["qwen3-asr-flash"],
+        "auth_header": None,
+        "note": "单次 5 分钟音频; base64 走 chat 接口, 无时间戳",
+    },
+    {
+        "id": "mimo",
+        "name": "小米 MiMo",
+        "api_url": "https://api.xiaomimimo.com/v1",
+        "request_mode": "chat_completions",
+        "models": ["mimo-v2.5-asr"],
+        "auth_header": {"name": "api-key", "value_template": "{api_key}"},
+        "note": "认证头特殊 (api-key), 已自动配置",
+    },
+    {
+        "id": "custom",
+        "name": "自定义",
+        "api_url": "",
+        "request_mode": "whisper",
+        "models": [],
+        "auth_header": None,
+        "note": "任何 OpenAI 兼容端点; 高级项可改认证头",
+    },
+]
 
 def _friendly_http_error(resp, endpoint: str, mode: str) -> RuntimeError:
     """Build a user-readable error from a non-2xx HTTP response.
