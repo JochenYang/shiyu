@@ -58,7 +58,8 @@
         <!-- 引擎选择器 -->
         <div class="engine-selector" v-if="engines.length > 0">
           <label class="engine-label">识别引擎</label>
-          <select v-model="selectedEngine" class="engine-select" :disabled="isProcessing">
+          <select v-model="selectedEngine" class="engine-select" :disabled="isProcessing"
+            @change="onEngineChange">
             <option v-for="eng in engines" :key="eng.name" :value="eng.name">
               {{ eng.display_name }}{{ eng.available ? '' : ' ⚠️ 不可用' }}
             </option>
@@ -491,6 +492,9 @@
                 </select>
                 <div class="setting-row">
                   <button class="secondary-btn small-btn" @click="onAddEngineConfig">+ 新增配置</button>
+                  <button class="secondary-btn small-btn" @click="onDuplicateEngineConfig">
+                    复制当前（换个模型）
+                  </button>
                   <button v-if="engineConfigs.length > 1" class="secondary-btn small-btn danger-btn"
                     @click="onDeleteEngineConfig">删除当前</button>
                   <button v-if="activeEngineId !== editingEngineId" class="secondary-btn small-btn"
@@ -517,12 +521,16 @@
               </div>
               <div class="setting-item col">
                 <div class="setting-label">模型名</div>
-                <!-- 有预置清单时下拉, 自定义时手填 -->
-                <select v-if="editingModels.length" class="log-level-select"
-                  v-model="editingEngine.model">
-                  <option v-for="m in editingModels" :key="m" :value="m">{{ m }}</option>
-                </select>
-                <n-input v-else v-model:value="editingEngine.model" placeholder="whisper-1" />
+                <!-- 有预置清单时给候选, 但仍可手填任意模型名
+                     (新模型上线、微调版、provider 新增型号) -->
+                <n-input v-model:value="editingEngine.model"
+                  :placeholder="editingModels[0] || 'whisper-1'" />
+                <div v-if="editingModels.length" class="setting-row model-presets">
+                  <button v-for="m in editingModels" :key="m"
+                    class="secondary-btn small-btn"
+                    :class="{ 'preset-active': editingEngine.model === m }"
+                    @click="editingEngine.model = m">{{ m }}</button>
+                </div>
               </div>
               <div class="setting-item col">
                 <div class="setting-label">请求模式</div>
@@ -978,6 +986,23 @@ function onAddEngineConfig() {
   editingEngineId.value = fresh.id;
 }
 
+/**
+ * 复制当前配置: 同一 provider 加第二个模型的主路径。
+ *
+ * 端点/KEY/认证头全部沿用（同厂商同密钥）, 只把模型名留空让用户选或
+ * 手填 —— 否则用户得重选 provider、重填一遍 KEY 才能加第二个模型。
+ */
+function onDuplicateEngineConfig() {
+  const cur = engineConfigs.value.find(e => e.id === editingEngineId.value);
+  if (!cur) return;
+  const copy = JSON.parse(JSON.stringify(cur));
+  copy.id = `new-${Date.now()}`;   // 临时 id, 后端保存时重新分配
+  copy.model = "";                 // 换模型是本操作的目的
+  copy.display_name = "";          // 显示名按新模型重新起
+  engineConfigs.value.push(copy);
+  editingEngineId.value = copy.id;
+  message.info("已复制配置，请选择或填写模型名");
+}
 function onDeleteEngineConfig() {
   if (engineConfigs.value.length <= 1) return;
   const idx = engineConfigs.value.findIndex(e => e.id === editingEngineId.value);
@@ -1595,14 +1620,31 @@ async function fetchEngines() {
     const data = await getEngines();
     if (data && data.engines && data.engines.length > 0) {
       engines.value = data.engines;
-      // Migrate selected engine: if current selection not in list, pick first
-      if (!data.engines.some(e => e.name === selectedEngine.value)) {
-        selectedEngine.value = data.engines[0].name;
+      // 默认模型优先: 首选与 defaultModelID 对应的引擎
+      // (models.engine_name 就是 /engines 的 name)
+      const defaultEngine = models.value.find(
+        (m) => m.id === defaultModelID.value
+      )?.engine_name;
+      const has = (name) => data.engines.some((e) => e.name === name);
+      if (defaultEngine && has(defaultEngine) && !engineTouched.value) {
+        selectedEngine.value = defaultEngine;
+      } else if (!has(selectedEngine.value)) {
+        // 当前选择不在列表 (模型被移除等): 退回默认, 再退回第一项
+        selectedEngine.value =
+          defaultEngine && has(defaultEngine)
+            ? defaultEngine
+            : data.engines[0].name;
       }
     }
   } catch {
     // Backend may not have /engines endpoint (old version)
   }
+}
+
+/** 用户手动改过引擎下拉后, 不再被默认模型自动覆盖。 */
+const engineTouched = ref(false);
+function onEngineChange() {
+  engineTouched.value = true;
 }
 
 /** 拉取模型清单与当前下载任务 (只读, 不触发任何下载)。 */
@@ -1658,6 +1700,13 @@ async function onSetDefaultModel(model) {
   try {
     await setDefaultModel(model.id);
     defaultModelID.value = model.id;
+    // 立即同步主界面引擎下拉: 设为默认却还要手动再选一次是反直觉的。
+    // engine_name 为空的是对齐器这类非识别资产, 不动当前选择。
+    const target = model.engine_name;
+    if (target && engines.value.some((e) => e.name === target)) {
+      selectedEngine.value = target;
+      engineTouched.value = false;
+    }
     message.success(`已将 ${model.name} 设为默认模型`);
   } catch (err) {
     message.error("设置失败: " + (err.message || err));
@@ -2317,6 +2366,16 @@ function fmtTimeSrt(sec) {
   gap: 8px;
   margin-top: 8px;
 }
+
+/* 模型候选按钮: 点一下填入, 高亮当前选中的 */
+.model-presets {
+  flex-wrap: wrap;
+}
+.preset-active {
+  border-color: #1fbc5b !important;
+  color: #1fbc5b !important;
+}
+
 .primary-btn,
 .secondary-btn {
   padding: 8px 16px;

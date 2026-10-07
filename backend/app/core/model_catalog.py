@@ -261,6 +261,9 @@ def availability(root: Optional[Path] = None) -> List[Dict]:
                 "id": model_id,
                 "name": spec["name"],
                 "engine": spec["engine"],
+                # 引擎注册名: 前端把「默认模型」同步到主界面引擎下拉时用
+                # (与 /engines 的 name 一致; engine 字段是工厂类型, 对不上)
+                "engine_name": spec.get("engine_name", ""),
                 "description": spec.get("description", ""),
                 "languages": spec.get("languages", []),
                 "installed": installed,
@@ -286,6 +289,9 @@ def availability(root: Optional[Path] = None) -> List[Dict]:
                 "id": spec["id"],
                 "name": spec["name"],
                 "engine": "forced_aligner",
+                # 对齐器不对应可选的识别引擎, engine_name 留空;
+                # 前端据此不把它当 ASR 模型处理
+                "engine_name": "",
                 "description": spec.get("description", ""),
                 "languages": [],
                 "installed": installed,

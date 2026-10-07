@@ -847,8 +847,21 @@ async def save_engine_settings(body: dict):
         entry = dict(raw)
         eid = entry.get("id")
         key = (entry.get("api_key") or "").strip()
-        if not key and eid and eid in old_by_id:
-            entry["api_key"] = old_by_id[eid].get("api_key", "")
+        if not key:
+            # 1) 同 id 的旧密钥 (前端掩码回显)
+            if eid and eid in old_by_id:
+                entry["api_key"] = old_by_id[eid].get("api_key", "")
+            else:
+                # 2) 同 provider 的已存密钥: 复制配置加第二个模型时
+                # API 端点与 KEY 都相同, 不该让用户重填
+                provider = entry.get("provider")
+                same = next(
+                    (i for i in old_by_id.values()
+                     if provider and i.get("provider") == provider
+                     and i.get("api_key")),
+                    None,
+                )
+                entry["api_key"] = (same or {}).get("api_key", "")
         else:
             entry["api_key"] = key
         clean.append(entry)
