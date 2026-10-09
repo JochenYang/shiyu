@@ -205,7 +205,12 @@ def _resolve_engines_list(config=None, engine_mode: str = "local") -> list:
     行为:
       1. ``engine_mode='cloud'`` → ``['cloud']`` (OpenAI 兼容云端 API)
       2. ``engine_mode`` 命中已注册的本地引擎 → ``[该引擎]``
-      3. 其他值 (默认 'local') → 清单默认模型对应的引擎
+      3. 其他值 (默认 'local') → **用户默认模型**对应的引擎;
+         它未安装时退回其他已安装的本地引擎
+
+    只挑「已安装」的引擎: 注册表里所有模型都会登记 (含未下载的),
+    若只看注册表, 用户删掉默认模型后就会选中它并直接失败, 而不是
+    退到另一个可用模型。
 
     Returns:
         引擎名列表, 例如 ``['zipformer_local']``。
@@ -215,12 +220,31 @@ def _resolve_engines_list(config=None, engine_mode: str = "local") -> list:
     if engine_mode in _transcriber_registry:
         return [engine_mode]
 
-    default_engine = model_catalog.model_spec(model_catalog.DEFAULT_MODEL_ID)["engine_name"]
-    if default_engine in _transcriber_registry:
-        return [default_engine]
-    # 默认模型尚未注册 (未下载): 退回第一个已注册的本地引擎, 没有则空列表
-    return [name for name in _transcriber_registry if name != "cloud"]
+    def _installed(name: str) -> bool:
+        entry = _transcriber_registry.get(name) or {}
+        try:
+            return bool(entry["instance"].is_available()[0])
+        except Exception:
+            return False
 
+    # 用用户保存的默认模型 (default_model_id), 不是清单常量 ——
+    # 否则用户在设置里换了默认模型也不生效
+    default_engine = model_catalog.model_spec(
+        model_catalog.default_model_id()
+    ).get("engine_name")
+    if default_engine and _installed(default_engine):
+        return [default_engine]
+
+    # 默认模型未安装: 退回其他已安装的本地引擎 (保持注册顺序)
+    fallback = [n for n in _transcriber_registry
+                if n != "cloud" and _installed(n)]
+    if fallback:
+        return fallback
+    # 一个都没装: 若默认引擎已注册 (只是未安装) 就报它, 让错误信息
+    # 指明缺哪个模型; 否则返回空列表, 让端点报「没有可用引擎」
+    if default_engine and default_engine in _transcriber_registry:
+        return [default_engine]
+    return []
 
 # v2.0: _apply_llm_correction removed (LLM layer dropped, owner decision #2)
 # Module-level _llm_status / _llm_corrected flags kept for UI backward-compat

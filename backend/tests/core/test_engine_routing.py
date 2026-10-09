@@ -13,11 +13,28 @@ import pytest
 from fastapi import UploadFile
 from fastapi.testclient import TestClient
 
-def _register(monkeypatch, names=("zipformer_local", "sensevoice_local", "firered_local")):
-    """把 main 的引擎注册表替换成给定的一组引擎名。"""
+def _register(monkeypatch, names=("zipformer_local", "sensevoice_local", "firered_local"),
+              not_installed=()):
+    """把 main 的引擎注册表替换成给定的一组引擎名。
+
+    实例带 ``is_available()``: 路由只挑已安装的引擎, 用裸 ``object()``
+    会让所有引擎都被判为未安装, 测不出真实行为。``not_installed`` 里的
+    名字模拟「已注册但模型没下载」。
+    """
     import app.main as main
 
-    registry = {name: {"cls": object, "kwargs": {}, "instance": object()} for name in names}
+    class _Stub:
+        def __init__(self, available):
+            self._available = available
+
+        def is_available(self):
+            return (self._available, "" if self._available else "模型未安装")
+
+    registry = {
+        name: {"cls": object, "kwargs": {},
+               "instance": _Stub(name not in not_installed)}
+        for name in names
+    }
     monkeypatch.setattr(main, "_transcriber_registry", registry)
     return main
 
@@ -34,22 +51,51 @@ class TestResolveEnginesList:
         for engine in ("zipformer_local", "sensevoice_local", "firered_local"):
             assert main._resolve_engines_list(None, engine) == [engine]
 
-    def test_default_mode_uses_catalog_default_engine(self, monkeypatch):
-        """默认模式用清单默认模型对应的引擎, 而不是硬编码的引擎名。"""
+    def test_default_mode_uses_user_default_model(self, monkeypatch):
+        """默认模式用用户保存的默认模型 (default_model_id), 不是清单常量。
+
+        回归: 曾用清单常量 DEFAULT_MODEL_ID, 用户在设置里换了默认
+        模型也不生效。
+        """
         from app.core import model_catalog
 
-        main = _register(monkeypatch)
-        expected = model_catalog.model_spec(model_catalog.DEFAULT_MODEL_ID)["engine_name"]
-        assert main._resolve_engines_list(None, "local") == [expected]
+        monkeypatch.setattr(model_catalog, "default_model_id",
+                            lambda: "qwen3-asr-0.6b")
+        main = _register(monkeypatch, names=("zipformer_local", "qwen3_asr_local"))
+        assert main._resolve_engines_list(None, "local") == ["qwen3_asr_local"]
 
-    def test_unknown_mode_falls_back_to_catalog_default(self, monkeypatch):
+    def test_unknown_mode_falls_back_to_default_model(self, monkeypatch):
+        from app.core import model_catalog
+
+        monkeypatch.setattr(model_catalog, "default_model_id",
+                            lambda: "zipformer-ctc-zh")
         main = _register(monkeypatch)
         assert main._resolve_engines_list(None, "some_future_engine") == ["zipformer_local"]
 
-    def test_unregistered_default_model_falls_back_to_available_local(self, monkeypatch):
-        """默认模型未下载时退回已注册的本地引擎, 而不是返回空列表。"""
-        main = _register(monkeypatch, names=("sensevoice_local",))
+    def test_uninstalled_default_falls_back_to_installed_local(self, monkeypatch):
+        """默认模型没下载时退回其他**已安装**的本地引擎。
+
+        回归: 用户删掉默认模型后, 旧逻辑仍选中它并直接失败, 而不是
+        退到另一个可用模型。
+        """
+        from app.core import model_catalog
+
+        monkeypatch.setattr(model_catalog, "default_model_id",
+                            lambda: "zipformer-ctc-zh")
+        main = _register(monkeypatch,
+                         names=("zipformer_local", "sensevoice_local"),
+                         not_installed=("zipformer_local",))
         assert main._resolve_engines_list(None, "local") == ["sensevoice_local"]
+
+    def test_all_uninstalled_still_names_default_model(self, monkeypatch):
+        """一个都没装时仍报出默认引擎名, 让错误信息指明缺哪个模型。"""
+        from app.core import model_catalog
+
+        monkeypatch.setattr(model_catalog, "default_model_id",
+                            lambda: "zipformer-ctc-zh")
+        main = _register(monkeypatch, names=("zipformer_local",),
+                         not_installed=("zipformer_local",))
+        assert main._resolve_engines_list(None, "local") == ["zipformer_local"]
 
     def test_no_local_engine_registered_returns_empty(self, monkeypatch):
         """一个本地模型都没下载时返回空列表, 让端点明确报错。"""
@@ -164,12 +210,15 @@ class TestTranscribeEndpoints:
         assert capture_pipeline["ctx"].engines == ["zipformer_local"]
         assert capture_pipeline["ctx"].enable_deterministic_correction is True
 
-    def test_transcribe_file_defaults_to_catalog_default(self, capture_pipeline):
-        """不传 engine_mode 时落到清单默认模型的引擎。"""
+    def test_transcribe_file_defaults_to_default_model(self, capture_pipeline,
+                                                       monkeypatch):
+        """不传 engine_mode 时落到用户默认模型的引擎。"""
         from app.core import model_catalog
 
         import app.main as main
 
+        monkeypatch.setattr(model_catalog, "default_model_id",
+                            lambda: "zipformer-ctc-zh")
         asyncio.run(main.transcribe_file(
             file=self._upload(),
             language="auto",
@@ -177,8 +226,7 @@ class TestTranscribeEndpoints:
             glossary="{}",
             subtitle_offset_sec=0.0,
         ))
-        expected = model_catalog.model_spec(model_catalog.DEFAULT_MODEL_ID)["engine_name"]
-        assert capture_pipeline["ctx"].engines == [expected]
+        assert capture_pipeline["ctx"].engines == ["zipformer_local"]
 
     def test_transcribe_json_uses_sensevoice_engine_mode(self, capture_pipeline):
         import app.main as main
