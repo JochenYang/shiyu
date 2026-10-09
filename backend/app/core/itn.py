@@ -15,7 +15,6 @@ Inverse Text Normalization (ITN) — 剪映 GrowVoiceITN 简化版。
   一万        → 10000
 """
 import logging
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +27,47 @@ _CN_UNITS = {
     "十": 10, "百": 100, "千": 1000,
     "万": 10000, "亿": 100000000,
 }
+
+# 口语固定搭配: 这里的"数字"字不表示数量, 整体保持原样。
+# 例: "说一下" 不是 "说1下"; "一直" 不是 "1直"。
+# "一" 既可作数词也可作构词成分, 单靠上下文无法完全判定, 因此用词表
+# 兜住高频搭配 (与主流 ITN 实现同一做法)。只收明确非数量的词。
+_NON_NUMERIC_WORDS = (
+    "一下", "一起", "一样", "一定", "一直", "一边", "一切", "一般",
+    "一些", "一点", "一同", "一贯", "一味", "一向", "一再", "一旦",
+    "一律", "一流", "一体", "一心", "一带", "一番", "一概", "一览",
+    "一晃", "一动", "一经", "一并", "一闪", "一语", "一应", "一见",
+    "一席", "一瞬", "一发", "一准", "一总", "一己", "一力", "一往",
+    "一斑", "一瞥", "十分",
+)
+
+# "十分" 后面跟这些字时确实表示数量 (十分钟 / 十分之一)
+_QUANTITY_AFTER_SHIFEN = "钟秒之"
+
+# 量词/时间词: 孤立数字字后接它们时确实是数量 ("一个人" → "1个人")。
+# 反之后面不是量词, 多半是成语或构词成分, 不该转:
+#   "四舍五入" 不是 "4舍5入"; "一模一样" 不是 "1模1样"。
+_MEASURE_WORDS = (
+    "个岁年月日天次只条张本台件位名句块片层页步米秒倍号"
+    "头匹辆艘架间套双对群批场顿杯瓶碗盘盒包袋桶箱"
+)
+
+def _non_numeric_word_len(text: str, start: int) -> int:
+    """start 处若是「数字字其实不表数量」的固定搭配, 返回其长度, 否则 0。"""
+    for word in _NON_NUMERIC_WORDS:
+        if not text.startswith(word, start):
+            continue
+        end = start + len(word)
+        if end >= len(text):
+            return len(word)
+        nxt = text[end]
+        # 后面紧跟数字 → 其实还是数词 ("一点五" = 1.5)
+        if nxt in _CN_DIGIT_VAL:
+            continue
+        if word == "十分" and nxt in _QUANTITY_AFTER_SHIFEN:
+            continue
+        return len(word)
+    return 0
 
 
 def _is_year_pattern(text: str, start: int) -> int:
@@ -193,6 +233,13 @@ def itn_normalize(text: str) -> str:
     while i < n:
         ch = text[i]
 
+        # 固定搭配里的"数字"不表数量, 原样输出 (否则 "说一下" → "说1下")
+        non_num = _non_numeric_word_len(text, i)
+        if non_num:
+            result.append(text[i:i + non_num])
+            i += non_num
+            continue
+
         # ── "百分之 X" ──
         if text[i:i + 3] == "百分之":
             j = i + 3
@@ -279,8 +326,14 @@ def itn_normalize(text: str) -> str:
                 i += consumed
                 continue
 
-        # 兜底:单数字字符也转 (因为前面已经确认有数字)
-        result.append(str(_CN_DIGIT_VAL[ch]))
+        # 兜底: 孤立的数字字只有后接量词时才算数量。
+        # "一个人" → "1个人" (个是量词); 而 "四舍五入" 的 "四" 后跟
+        # "舍"(非量词) → 保持原样, 否则成语会被拆成数字。
+        after = text[i + 1] if i + 1 < n else ""
+        if after in _MEASURE_WORDS:
+            result.append(str(_CN_DIGIT_VAL[ch]))
+        else:
+            result.append(ch)
         i += 1
 
     normalized = "".join(result)

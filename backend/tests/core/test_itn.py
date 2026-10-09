@@ -58,3 +58,68 @@ class TestItnNormalize:
     def test_twenty_with_person(self):
         """十位数字后跟量词 (二十个人 → 20个人)."""
         assert itn_normalize("二十个人") == "20个人"
+
+
+class TestNonNumericCollocations:
+    """固定搭配里的"数字"字不表数量, 不能被 ITN 转换。
+
+    这是 ITN 的固有难点: "一" 既可作数词 ("一个人"), 也可作构词成分
+    ("说一下")。单靠上下文无法完全判定, 因此用词表兜住高频搭配。
+    曾出现 "说一下" → "说1下" 的误转。
+    """
+
+    def test_yixia(self):
+        assert itn_normalize("说一下") == "说一下"
+
+    def test_yixia_with_prefix(self):
+        assert itn_normalize("我们来说一下这个") == "我们来说一下这个"
+
+    def test_yi_series(self):
+        for word in ("一直", "一起", "一样", "一定", "一般", "一些", "一边"):
+            assert itn_normalize(word) == word
+
+    def test_shifen_means_very(self):
+        """"十分" 作"非常"解时不转 (十分感谢 ≠ 10分感谢)。"""
+        assert itn_normalize("十分感谢") == "十分感谢"
+
+    def test_shifen_with_time_unit_still_converts(self):
+        """"十分钟" 里的"十分"是数量, 仍要转。"""
+        assert itn_normalize("十分钟") == "10分钟"
+
+    def test_decimal_not_treated_as_collocation(self):
+        """"一点五" 是小数, 不能被"一点"的固定搭配规则挡住。"""
+        assert itn_normalize("一点五") == "1.5"
+
+    def test_quantity_still_converts(self):
+        """真实数量仍要转换, 修复不能回退已有能力。"""
+        assert itn_normalize("第一个") == "第1个"
+        assert itn_normalize("一个人") == "1个人"
+        assert itn_normalize("十个人") == "10个人"
+
+
+class TestIdiomsNotSplitIntoDigits:
+    """成语里的数字字不能被拆成阿拉伯数字。
+
+    孤立数字字只有后接量词时才算数量。"四舍五入"的"四"后跟"舍"
+    (非量词), 因此保持原样 —— 否则会输出 "4舍5入"。
+    """
+
+    def test_sishewuru(self):
+        assert itn_normalize("四舍五入") == "四舍五入"
+
+    def test_sishewuru_in_sentence(self):
+        assert itn_normalize("进行一个四舍五入") == "进行1个四舍五入"
+
+    def test_number_idioms(self):
+        for word in ("三心二意", "五花八门", "七上八下", "一模一样", "一见钟情"):
+            assert itn_normalize(word) == word
+
+    def test_measure_word_still_converts(self):
+        """后接量词时仍是数量, 不能因为成语规则而回退。"""
+        assert itn_normalize("一个人") == "1个人"
+        assert itn_normalize("第一个") == "第1个"
+        assert itn_normalize("一年") == "1年"
+
+    def test_plain_word_stays(self):
+        """非量词后接时保持原样 (一共 ≠ 1共)。"""
+        assert itn_normalize("一共") == "一共"
