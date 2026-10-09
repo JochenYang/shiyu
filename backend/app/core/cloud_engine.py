@@ -201,7 +201,7 @@ def load_engine_config() -> Dict[str, Any]:
         for item in engines:
             if isinstance(item, dict) and item.get("id") == active_id:
                 result = dict(defaults)
-                result.update(item)
+                result.update(_infer_provider(item))
                 return result
 
     # 回落: 历史 engine 字段 (旧配置文件没有 engines 列表)
@@ -209,8 +209,40 @@ def load_engine_config() -> Dict[str, Any]:
     if not isinstance(cfg, dict):
         return dict(defaults)
     result = dict(defaults)
-    result.update(cfg)
+    result.update(_infer_provider(cfg))
     return result
+
+def _infer_provider(item: Dict[str, Any]) -> Dict[str, Any]:
+    """补出配置里缺失的 provider 字段。
+
+    早期版本的配置只有 api_url 没有 provider, 而引擎路由靠 provider
+    判断: 豆包缺了它就会被当成通用 OpenAI 适配器, 每次调用都失败。
+    这里按 api_url 的主机名反查内置清单补上。
+
+    已知内置 provider 时连 request_mode 一并纠正 —— 否则豆包仍会以
+    chat/completions 发出请求。custom 不动, 它的模式由用户决定。
+    """
+    if item.get("provider"):
+        return item
+    api_url = (item.get("api_url") or "").strip()
+    if not api_url:
+        return item
+
+    def host(url: str) -> str:
+        # 比主机名而不是整串: 用户可能补了 /v1 之类的后缀
+        return url.split("//", 1)[-1].split("/", 1)[0].lower()
+
+    for provider in BUILTIN_PROVIDERS:
+        if provider.get("id") == "custom":
+            continue
+        base = (provider.get("api_url") or "").strip()
+        if base and host(base) == host(api_url):
+            filled = dict(item)
+            filled["provider"] = provider["id"]
+            if provider.get("request_mode"):
+                filled["request_mode"] = provider["request_mode"]
+            return filled
+    return item
 
 
 def list_engine_configs() -> List[Dict[str, Any]]:
@@ -231,11 +263,11 @@ def list_engine_configs() -> List[Dict[str, Any]]:
     if isinstance(engines, list):
         for item in engines:
             if isinstance(item, dict) and item.get("id"):
-                items.append(dict(item))
+                items.append(_infer_provider(dict(item)))
     if not items:
         cfg = data.get("engine")
         if isinstance(cfg, dict) and (cfg.get("api_url") or cfg.get("api_key") or cfg.get("model")):
-            legacy = dict(cfg)
+            legacy = _infer_provider(dict(cfg))
             legacy["id"] = "cloud"
             items.append(legacy)
     return items

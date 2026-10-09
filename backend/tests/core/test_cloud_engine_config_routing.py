@@ -318,3 +318,58 @@ class TestCloudTranscriberUnpacksConfig:
         })
         with pytest.raises(ValueError):
             eng.transcribe("a.wav")
+
+
+# ── provider 推断 (早期配置没有该字段) ───────────────────────────────
+
+
+def test_infer_provider_fills_doubao_from_url():
+    """只有 api_url 的豆包配置要能推断出 provider 与 request_mode。
+
+    早期版本的配置没有 provider, 引擎路由会退回通用 OpenAI 适配器,
+    把豆包当成 chat/completions 端点 —— 实测每次调用都失败。
+    """
+    from app.core.cloud_engine import _infer_provider
+
+    filled = _infer_provider({
+        "api_url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel",
+        "model": "doubao-asr-2.0",
+        "request_mode": "chat_completions",  # 磁盘上的旧值, 需要被纠正
+    })
+    assert filled["provider"] == "doubao"
+    assert filled["request_mode"] == "doubao"
+
+
+@pytest.mark.parametrize("api_url,expected", [
+    ("https://api.openai.com/v1", "openai"),
+    ("https://api.groq.com/openai/v1", "groq"),
+    ("https://api.siliconflow.cn/v1", "siliconflow"),
+    ("https://dashscope.aliyuncs.com/compatible-mode/v1", "dashscope"),
+    ("https://api.xiaomimimo.com/v1", "mimo"),
+])
+def test_infer_provider_recognises_builtins(api_url, expected):
+    from app.core.cloud_engine import _infer_provider
+
+    assert _infer_provider({"api_url": api_url})["provider"] == expected
+
+
+def test_infer_provider_leaves_unknown_alone():
+    """自定义端点不能被误归到某个内置 provider。"""
+    from app.core.cloud_engine import _infer_provider
+
+    item = {"api_url": "https://my-own-server.example/v1",
+            "request_mode": "whisper"}
+    filled = _infer_provider(dict(item))
+    assert "provider" not in filled
+    assert filled["request_mode"] == "whisper"
+
+
+def test_infer_provider_keeps_explicit_choice():
+    """已写明 provider 的配置不被改写。"""
+    from app.core.cloud_engine import _infer_provider
+
+    item = {"provider": "custom", "api_url": "https://api.openai.com/v1",
+            "request_mode": "chat_completions"}
+    filled = _infer_provider(dict(item))
+    assert filled["provider"] == "custom"
+    assert filled["request_mode"] == "chat_completions"
