@@ -828,7 +828,9 @@ onBeforeUnmount(() => {
 const PROJECT_INFO = {
   repo: "https://github.com/JochenYang/shiyu",
   issues: "https://github.com/JochenYang/shiyu/issues",
-  version: "v2.4",
+  // 发布版本号, 与 package.json / tauri.conf.json 一致 ——
+  // 用户报 issue 时说的是这个号, 不该用内部特性版本
+  version: "v1.2.0",
 };
 const appSettings = ref({
   autostart: false,

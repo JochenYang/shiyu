@@ -394,6 +394,14 @@ GitHub Actions 工作流位于 `.github/workflows/release.yml`：
 | v2.3 | 新增 Qwen3-ASR-0.6B (多文件模型, `sherpa_engine._factory_args` 按文件名映射工厂参数)；云端配置改为合并写入, 不再静默丢掉 `request_mode`/`auth_header` 等字段。Whisper 评估后未纳入：sherpa-onnx 的 Whisper 导出缺 cross-attention, 拿不到逐 token 时间戳 |
 | v2.4 | 强制对齐器接入 (`aligner` 清单节点 + `forced_aligner.py`, onnxruntime+tokenizers+librosa mel, 不引 transformers)；无逐字符时间的段由 pipeline `_align_segments` 自动补测量时间；修复 DP 行级 char_times 丢失 (v2.2 起) 与下载器嵌套路径；云端配置多化 (`engines` 列表 + `active_engine`, 引擎下拉同时显示)；设置页新增「关于」页 (仓库地址/问题反馈) |
 
+> 上表是内部特性版本 (代码注释里在用)；**发布版本**见 `package.json` / `tauri.conf.json`，
+> 两者不是同一套编号。首个发布版 1.2.0 对应上表 v2.4 及之后的全部工作。
+
+| 发布版 | 变更 |
+|------|------|
+| 1.0.0 / 1.1.0 | 早期发布 (对应上表 v1.x – v2.x) |
+| 1.2.0 | 豆包录音文件识别 2.0 云端引擎 (submit/query 两段式, 逐词毫秒时间戳)；剪辑软件导出 (FCPXML / 剪映草稿 / EDL, 每句独立片段可单独加效果)；长音频分块不再在块边界丢内容 (实测文字保留率 100%)；ITN 修复成语与固定搭配被拆成数字 (说一下 ≠ 说1下)；内置云端 provider 清单, 只需填 KEY；默认模型与引擎选择修复 (用用户设置、只挑已安装) |
+
 ### 废弃功能
 
 - Bcut (必剪) 和 Jianying (剪映) 免费 ASR 引擎 (2026 年 5 月移除，API 不可达)

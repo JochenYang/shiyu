@@ -98,17 +98,18 @@ graph TD
 
 ### Packaging and Releasing
 
-A GitHub Actions workflow (`.github/workflows/release.yml`) automates building installers for Windows (.exe), macOS (.dmg), and Linux (.deb).
+A GitHub Actions workflow (`.github/workflows/release.yml`) automates building installers for Windows (.exe) and macOS (.dmg).
 
 To trigger a release:
-1. Push your code to GitHub.
-2. Create and push a version tag:
+1. Bump the version in `frontend/package.json`, `frontend/src-tauri/tauri.conf.json` and `frontend/src-tauri/Cargo.toml`.
+2. Push your code to GitHub.
+3. Create and push a version tag:
    ```bash
-   git tag v1.1.0
-   git push origin v1.1.0
+   git tag v1.2.0
+   git push origin v1.2.0
    ```
-3. The runner will compile Rust (Tauri), build the Python backend into a PyInstaller onefile executable, bundle everything into native installers, and publish them as draft releases.
-4. The model is **auto-downloaded** at runtime on first launch — no model files are included in the installer.
+4. The runner will compile Rust (Tauri), build the Python backend into a PyInstaller onefile executable, bundle everything into native installers, and publish them as draft releases.
+5. Models are **not** bundled and **not** auto-downloaded — the user picks and downloads them in the 「模型」 panel, which verifies each file against a pinned SHA-256.
 
 > 💡 To build the backend executable locally for production testing:
 > ```bash
