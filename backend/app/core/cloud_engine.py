@@ -1148,6 +1148,13 @@ class CloudTranscriber(BaseTranscriber):
         **kwargs,
     ) -> TranscribeResult:
         config = self._bound_config()
+        # 从绑定配置里取出本次调用要用的字段。
+        # (这几行曾被一次编辑吞掉, 导致 transcribe 一调用就 NameError:
+        #  name 'api_url' is not defined)
+        api_url = (config.get("api_url") or "").rstrip("/")
+        api_key = config.get("api_key") or ""
+        model = (config.get("model") or "").strip()
+        request_mode = (config.get("request_mode") or "whisper").lower().strip()
 
         if not api_url or not api_key:
             raise ValueError("Cloud engine not configured.")

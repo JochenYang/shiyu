@@ -253,3 +253,68 @@ def test_load_tolerates_corrupt_config(config_file):
     cfg = cloud_engine.load_engine_config()
     assert cfg["api_url"] == ""
     assert cfg["enabled"] is False
+
+
+# ── CloudTranscriber.transcribe 配置解包 ──────────────────────────────
+
+
+class TestCloudTranscriberUnpacksConfig:
+    """transcribe 必须先从绑定配置里取出 api_url/api_key/model/
+    request_mode, 再按 request_mode 分派。
+
+    这几行曾被一次编辑吞掉, 导致每次调用都抛
+    NameError: name 'api_url' is not defined。当时没有任何测试真正
+    调用 transcribe (只测了纯函数), 所以没能拦住 —— 这些用例补上。
+    """
+
+    @staticmethod
+    def _engine(config):
+        from app.core.cloud_engine import CloudTranscriber
+
+        eng = CloudTranscriber(engine_id="test")
+        eng._bound_config = lambda: config
+        return eng
+
+    def test_whisper_mode_passes_unpacked_fields(self):
+        eng = self._engine({
+            "api_url": "https://api.groq.com/openai/v1", "api_key": "sk-x",
+            "model": "whisper-large-v3", "request_mode": "whisper",
+        })
+        with patch("app.core.cloud_engine._transcribe_whisper") as m:
+            m.return_value = ("srt", [{"start": 0.0, "end": 1.0, "text": "hi"}])
+            result = eng.transcribe("a.wav", "en")
+
+        assert m.called, "whisper 模式应分派到 _transcribe_whisper"
+        args = m.call_args[0]
+        assert args[2] == "https://api.groq.com/openai/v1"
+        assert args[3] == "sk-x"
+        assert args[4] == "whisper-large-v3"
+        assert result.segments[0].text == "hi"
+
+    def test_chat_completions_mode_dispatches(self):
+        eng = self._engine({
+            "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "api_key": "sk-y", "model": "qwen3-asr-flash",
+            "request_mode": "chat_completions",
+        })
+        with patch("app.core.cloud_engine._transcribe_dashscope") as m:
+            m.return_value = ("srt", [{"start": 0.0, "end": 1.0, "text": "嗨"}])
+            result = eng.transcribe("a.wav")
+
+        assert m.called, "chat_completions 模式应分派到 _transcribe_dashscope"
+        assert result.segments[0].text == "嗨"
+
+    def test_missing_credentials_raises(self):
+        """未配置时给出明确错误, 而不是 NameError。"""
+        eng = self._engine({"api_url": "", "api_key": "", "model": "",
+                            "request_mode": "whisper"})
+        with pytest.raises(ValueError):
+            eng.transcribe("a.wav")
+
+    def test_unknown_request_mode_raises(self):
+        eng = self._engine({
+            "api_url": "https://x/v1", "api_key": "sk", "model": "m",
+            "request_mode": "nonsense",
+        })
+        with pytest.raises(ValueError):
+            eng.transcribe("a.wav")

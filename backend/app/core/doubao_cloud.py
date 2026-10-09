@@ -17,7 +17,6 @@ import math
 import time
 import wave
 import uuid
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -177,7 +176,6 @@ class DoubaoCloudEngine(BaseTranscriber):
     # ── 识别 ────────────────────────────────────────────────────────
 
     def transcribe(self, audio_path: str, language: str = "auto", **kwargs) -> TranscribeResult:
-        import requests
 
         ok, reason = self.is_available()
         if not ok:
