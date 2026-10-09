@@ -13,6 +13,7 @@ soundfile>=0.12.0
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
+requests>=2.31.0      # 云端引擎 HTTP 调用 (cloud_engine / doubao_cloud)
 
 # Subtitle generation
 pysubs2>=1.6.0
